@@ -18,16 +18,18 @@ app.use(morgan('dev'));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Routes
+app.get('/', (req: Request, res: Response) => {
+    res.json({ message: 'Queue Backend API is running' });
+});
+
 app.use('/api', router);
 
 // Health Check
 app.get('/health', async (req: Request, res: Response) => {
+    console.log('Health check requested');
     let supabaseStatus = 'unknown';
     try {
-        const { data, error } = await supabase.from('test').select('*').limit(1);
-        // We expect an error if the table doesn't exist, but if we get a connection error, that's different.
-        // For now, just checking if the client is initialized is enough check for the code, 
-        // but a real DB check is better. Since we don't know the schema yet, we'll just check if client exists.
         if (supabase) {
             supabaseStatus = 'connected_client_initialized';
         }
@@ -45,11 +47,6 @@ app.get('/health', async (req: Request, res: Response) => {
 
 // Start Server
 app.listen(Number(port), '0.0.0.0', () => {
-    console.log(`⚡️[server]: Server is running at http://localhost:${port}`);
-});
-
-
-app.get('/', (req: Request, res: Response) => {
-    res.json({ message: 'Queue Backend API is running' });
+    console.log(`⚡️[server]: Server is running at http://0.0.0.0:${port}`);
 });
 
