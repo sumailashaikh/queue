@@ -52,7 +52,7 @@ export const createService = async (req: Request, res: Response) => {
                     name,
                     description,
                     duration_minutes,
-                    price: price || 0
+                    price: Number(price) || 0
                 }
             ])
             .select()
