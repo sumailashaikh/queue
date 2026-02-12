@@ -111,11 +111,15 @@ export const joinQueue = async (req: Request, res: Response) => {
             });
         }
 
-        // 1. Get current max position to determine new position
+        // Get current date in YYYY-MM-DD format
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // 1. Get current max position for TODAY to determine new position
         const { data: maxPosData, error: maxPosError } = await supabase
             .from('queue_entries')
             .select('position')
             .eq('queue_id', queue_id)
+            .eq('entry_date', todayStr) // Reset daily based on date column
             .order('position', { ascending: false })
             .limit(1);
 
@@ -136,11 +140,11 @@ export const joinQueue = async (req: Request, res: Response) => {
                     customer_name: customer_name || 'Guest',
                     status: 'waiting',
                     position: nextPosition,
-                    ticket_number
+                    ticket_number,
+                    entry_date: todayStr // Explicitly set the date
                 }
             ])
-            .select()
-            .single();
+            .select();
 
         if (error) throw error;
 
@@ -226,14 +230,19 @@ export const deleteQueue = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        const { error } = await supabase
+        const { error, count } = await supabase
             .from('queues')
-            .delete()
+            .delete({ count: 'exact' })
             .eq('id', id);
 
-        // Note: RLS will ensure only owner can delete.
-
         if (error) throw error;
+
+        if (count === 0) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'Queue not found or already deleted'
+            });
+        }
 
         res.status(200).json({
             status: 'success',
@@ -257,7 +266,10 @@ export const getMyQueues = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
         // Get queues where the business owner is ME
+        // We use a subquery/filter on the count to only show today's visitors in the list view
         const { data, error } = await supabase
             .from('queues')
             .select(`
@@ -266,7 +278,7 @@ export const getMyQueues = async (req: Request, res: Response) => {
                 queue_entries (count)
             `)
             .eq('businesses.owner_id', userId)
-            // Filtering by foreign table field requires !inner join usually
+            .eq('queue_entries.entry_date', todayStr)
             .order('created_at', { ascending: false });
 
         if (error) throw error;
@@ -294,20 +306,14 @@ export const getTodayQueue = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // Get start of today (UTC or local? Ideally UTC for consistency, or pass timezone)
-        // For simplicity, let's just get everything created > today at 00:00:00 UTC
-        const today = new Date();
-        today.setUTCHours(0, 0, 0, 0);
-        const todayIso = today.toISOString();
-
-        // 1. Check if user is owner of this queue's business
-        // RLS will handle data visibility, but let's be explicit in query for clarity
+        // Get current date in YYYY-MM-DD format
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
         const { data, error } = await supabase
             .from('queue_entries')
             .select('*')
             .eq('queue_id', id)
-            .gte('joined_at', todayIso)
+            .eq('entry_date', todayStr)
             .in('status', ['waiting', 'serving']) // Only active people
             .order('position', { ascending: true });
 

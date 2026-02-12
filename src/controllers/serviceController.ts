@@ -160,12 +160,19 @@ export const deleteService = async (req: Request, res: Response) => {
             }
         }
 
-        const { error } = await supabase
+        const { error, count } = await supabase
             .from('services')
-            .delete()
+            .delete({ count: 'exact' })
             .eq('id', id);
 
         if (error) throw error;
+
+        if (count === 0) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'Service not found or already deleted'
+            });
+        }
 
         res.status(200).json({
             status: 'success',
