@@ -93,7 +93,7 @@ export const createQueue = async (req: Request, res: Response) => {
 
 export const joinQueue = async (req: Request, res: Response) => {
     try {
-        const { queue_id, customer_name } = req.body;
+        const { queue_id, customer_name, phone, service_name } = req.body;
         const user_id = req.user?.id; // From authMiddleware
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -138,6 +138,8 @@ export const joinQueue = async (req: Request, res: Response) => {
                     queue_id,
                     user_id: user_id || null, // Allow null for guests
                     customer_name: customer_name || 'Guest',
+                    phone: phone || null,
+                    service_name: service_name || null,
                     status: 'waiting',
                     position: nextPosition,
                     ticket_number,
@@ -151,7 +153,7 @@ export const joinQueue = async (req: Request, res: Response) => {
         const entry = data[0];
 
         // Send Notification
-        const recipient = user_id ? `User-${user_id}` : `Guest-${customer_name}`;
+        const recipient = phone || (user_id ? `User-${user_id}` : `Guest-${customer_name}`);
         await notificationService.sendSMS(recipient, `You have joined the queue. Your ticket number is ${ticket_number}.`);
 
         res.status(201).json({
@@ -370,9 +372,10 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
         if (error) throw error;
 
         if (!data || data.length === 0) {
+            console.error(`Update failed for entry ${id}. No data returned. Possible RLS bypass or missing entry.`);
             return res.status(404).json({
                 status: 'error',
-                message: 'Entry not found or permission denied'
+                message: 'Entry not found or permission denied. Ensure you are the business owner.'
             });
         }
 
