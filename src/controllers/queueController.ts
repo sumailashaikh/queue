@@ -269,21 +269,29 @@ export const getMyQueues = async (req: Request, res: Response) => {
         }
 
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        console.log(`Fetching queues for user ${userId}, today is ${todayStr}`);
 
         // Get queues where the business owner is ME
-        // We use a subquery/filter on the count to only show today's visitors in the list view
+        // We fetch the count of entries. Filtering on queue_entries columns in the main query
+        // will filter out the parent 'queues' if no entries match.
+        // To show empty queues, we'll fetch them all first.
         const { data, error } = await supabase
             .from('queues')
             .select(`
                 *,
                 businesses!inner (id, owner_id, name),
-                queue_entries (count)
+                queue_entries(count)
             `)
             .eq('businesses.owner_id', userId)
-            .eq('queue_entries.entry_date', todayStr)
+            // Removed filters on queue_entries here to prevent hiding empty queues
             .order('created_at', { ascending: false });
 
         if (error) throw error;
+
+        console.log(`Found ${data?.length} queues for user ${userId}`);
+        if (data && data.length > 0) {
+            console.log(`First queue sample: ${data[0].name}, status: ${data[0].status}`);
+        }
 
         res.status(200).json({
             status: 'success',
@@ -310,6 +318,7 @@ export const getTodayQueue = async (req: Request, res: Response) => {
 
         // Get current date in YYYY-MM-DD format
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        console.log(`Fetching today's queue for id: ${id}, date: ${todayStr}`);
 
         const { data, error } = await supabase
             .from('queue_entries')
@@ -320,6 +329,8 @@ export const getTodayQueue = async (req: Request, res: Response) => {
             .order('position', { ascending: true });
 
         if (error) throw error;
+
+        console.log(`Found ${data?.length} active entries for queue ${id} today (${todayStr})`);
 
         // Note: If data is empty, it might be due to RLS if user is not owner. 
         // But our RLS "Business owners can see entries for their queues" allows this.
