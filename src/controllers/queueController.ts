@@ -422,3 +422,40 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
         });
     }
 };
+
+export const resetQueueEntries = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params; // queue_id
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // Get current date string (India Time)
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        console.log(`Resetting queue entries for queue ${id} on date ${todayStr} by user ${userId}`);
+
+        // Delete all entries for this queue today
+        const { error } = await supabase
+            .from('queue_entries')
+            .delete()
+            .eq('queue_id', id)
+            .eq('entry_date', todayStr);
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Queue reset successfully for today'
+        });
+
+    } catch (error: any) {
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+};
