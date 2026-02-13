@@ -290,7 +290,9 @@ export const getMyQueues = async (req: Request, res: Response) => {
 
         console.log(`Found ${data?.length} queues for user ${userId}`);
         if (data && data.length > 0) {
-            console.log(`First queue sample: ${data[0].name}, status: ${data[0].status}`);
+            data.forEach((q: any) => {
+                console.log(`Queue: ${q.name} | ID: ${q.id} | Entries Count: ${q.queue_entries?.[0]?.count || 0}`);
+            });
         }
 
         res.status(200).json({
@@ -329,6 +331,14 @@ export const getTodayQueue = async (req: Request, res: Response) => {
             .order('position', { ascending: true });
 
         if (error) throw error;
+
+        // DIAGNOSTIC: Check if ANY entries exist for this queue at all
+        const { count: totalCount } = await supabase
+            .from('queue_entries')
+            .select('*', { count: 'exact', head: true })
+            .eq('queue_id', id);
+
+        console.log(`Diagnostic: Queue ${id} has ${totalCount} TOTAL entries, but ${data?.length} match today (${todayStr}) and active status.`);
 
         console.log(`Found ${data?.length} active entries for queue ${id} today (${todayStr})`);
 

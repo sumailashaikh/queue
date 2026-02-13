@@ -16,7 +16,7 @@ router.get('/:id/today', requireAuth, getTodayQueue); // Dashboard View
 router.delete('/:id/entries/today', requireAuth, resetQueueEntries); // Clear entries
 
 // Customer entries
-router.put('/entries/:id/status', requireAuth, updateQueueEntryStatus); // Owner action
+router.patch('/entries/:id/status', requireAuth, updateQueueEntryStatus); // Owner action
 
 // Protected routes (User joining)
 router.post('/join', requireAuth, joinQueue);
