@@ -8,6 +8,7 @@ import appointmentRoutes from './appointmentRoutes';
 import analyticsRoutes from './analyticsRoutes';
 
 import serviceRoutes from './serviceRoutes';
+import adminRoutes from './adminRoutes';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -24,5 +25,6 @@ router.use('/businesses', businessRoutes);
 router.use('/appointments', appointmentRoutes);
 router.use('/services', serviceRoutes);
 router.use('/analytics', analyticsRoutes);
+router.use('/admin', adminRoutes);
 
 export default router;

@@ -54,3 +54,26 @@ export const requireAuth = async (req: any, res: Response, next: NextFunction) =
         res.status(500).json({ error: 'Internal Server Error' });
     }
 };
+export const requireAdmin = async (req: any, res: Response, next: NextFunction) => {
+    try {
+        if (!req.user) {
+            return res.status(401).json({ error: 'Authentication required' });
+        }
+
+        // Fetch user profile to check role
+        const { data: profile, error } = await supabase
+            .from('profiles')
+            .select('role')
+            .eq('id', req.user.id)
+            .single();
+
+        if (error || !profile || profile.role !== 'admin') {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+
+        next();
+    } catch (err) {
+        console.error('Admin Middleware Error:', err);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+};
