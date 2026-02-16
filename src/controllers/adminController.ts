@@ -95,3 +95,34 @@ export const getAllBusinesses = async (req: Request, res: Response) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 };
+
+/**
+ * Update a user's status (active, pending, blocked) and verification
+ */
+export const updateUserStatus = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const { status, is_verified } = req.body;
+
+        const updates: any = {};
+        if (status) updates.status = status;
+        if (is_verified !== undefined) updates.is_verified = is_verified;
+
+        const { data, error } = await supabase
+            .from('profiles')
+            .update(updates)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            message: 'User status updated successfully',
+            data
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
