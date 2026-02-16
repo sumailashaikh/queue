@@ -61,13 +61,16 @@ export const requireAdmin = async (req: any, res: Response, next: NextFunction) 
         }
 
         // Fetch user profile to check role
-        const { data: profile, error } = await supabase
+        // IMPORTANT: Use req.supabase (authenticated) instead of global supabase
+        // to ensure RLS allows reading the user's own profile.
+        const { data: profile, error } = await req.supabase
             .from('profiles')
             .select('role')
             .eq('id', req.user.id)
             .single();
 
         if (error || !profile || profile.role !== 'admin') {
+            console.log(`[AUTH] Admin access denied for user ${req.user.id}. Role: ${profile?.role}`);
             return res.status(403).json({ error: 'Admin access required' });
         }
 
