@@ -15,10 +15,10 @@ export const createAppointment = async (req: Request, res: Response) => {
             });
         }
 
-        if (!business_id || !start_time || !end_time) {
+        if (!business_id || !start_time) {
             return res.status(400).json({
                 status: 'error',
-                message: 'Business ID, Start Time, and End Time are required'
+                message: 'Business ID and Start Time are required'
             });
         }
 
@@ -32,8 +32,8 @@ export const createAppointment = async (req: Request, res: Response) => {
                     business_id,
                     service_id,
                     start_time,
-                    end_time,
-                    status: 'scheduled'
+                    end_time: end_time || new Date(new Date(start_time).getTime() + 30 * 60000).toISOString(),
+                    status: 'pending'
                 }
             ])
             .select()
