@@ -69,7 +69,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
                 // Create profile if missing
                 console.log('Profile missing, creating fallback...');
                 await supabase.from('profiles').insert([
-                    { id: user.id, full_name: 'New User', role: 'customer', phone: phone }
+                    { id: user.id, full_name: 'New User', role: 'customer', phone: phone, status: 'pending', is_verified: false }
                 ]);
             } else if (!profile.phone) {
                 // Update profile if phone is missing
