@@ -10,6 +10,6 @@ router.get('/my', requireAuth, getMyAppointments);
 
 // Owner
 router.get('/business', requireAuth, getBusinessAppointments);
-router.put('/:id/status', requireAuth, updateAppointmentStatus);
+router.patch('/:id/status', requireAuth, updateAppointmentStatus);
 
 export default router;
