@@ -6,6 +6,7 @@ const router = Router();
 
 // Public routes
 router.get('/', getAllQueues);
+router.post('/join', joinQueue); // Customers can join without login
 
 // Protected/Admin routes
 router.post('/', requireAuth, createQueue);
@@ -19,6 +20,6 @@ router.delete('/:id/entries/today', requireAuth, resetQueueEntries); // Clear en
 router.patch('/entries/:id/status', requireAuth, updateQueueEntryStatus); // Owner action
 
 // Protected routes (User joining)
-router.post('/join', requireAuth, joinQueue);
+// Moved to public routes to allow guest joining
 
 export default router;

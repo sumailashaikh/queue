@@ -146,12 +146,7 @@ export const deleteService = async (req: Request, res: Response) => {
         }
 
         // RLS should handle "Owners can delete their own services" logic
-        // But we need to ensure we don't just rely on ID if RLS isn't perfect
-        // For now, assume RLS works or add explicit check.
-        // Let's rely on RLS + business check implicitly via the delete policy if it existed.
-        // Actually, init_db.sql didn't have specific Service RLS for DELETE.
-        // Let's add verification.
-
+        // But we add an extra layer of verification for robustness
         const { data: service } = await supabase.from('services').select('business_id').eq('id', id).single();
         if (service) {
             const { data: business } = await supabase.from('businesses').select('owner_id').eq('id', service.business_id).single();

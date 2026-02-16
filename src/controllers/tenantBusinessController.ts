@@ -184,3 +184,40 @@ export const deleteBusiness = async (req: Request, res: Response) => {
         });
     }
 };
+
+export const getBusinessBySlug = async (req: Request, res: Response) => {
+    try {
+        const { slug } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        const { data, error } = await supabase
+            .from('businesses')
+            .select(`
+                *,
+                queues (*, services(*)),
+                services (*)
+            `)
+            .eq('slug', slug)
+            .single();
+
+        if (error) throw error;
+
+        if (!data) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'Business not found'
+            });
+        }
+
+        res.status(200).json({
+            status: 'success',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+};

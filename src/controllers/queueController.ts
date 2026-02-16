@@ -45,21 +45,28 @@ export const createQueue = async (req: Request, res: Response) => {
         }
 
         // Find the business owned by this user
-        // user might have multiple businesses testing, so take the latest one
-        const { data: business, error: businessError } = await supabase
+        // We use the same simple logic that works in getMyQueues
+        console.log(`[createQueue] Looking for business for owner: ${userId}`);
+        const { data: businesses, error: businessError } = await supabase
             .from('businesses')
             .select('id')
-            .eq('owner_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .single();
+            .eq('owner_id', userId);
 
-        if (businessError || !business) {
+        if (businessError) {
+            console.error('[createQueue] Business lookup error:', businessError);
+            return res.status(500).json({ status: 'error', message: businessError.message });
+        }
+
+        if (!businesses || businesses.length === 0) {
+            console.warn(`[createQueue] No business found for user: ${userId}`);
             return res.status(404).json({
                 status: 'error',
                 message: 'No business found for this user. Create a business first.'
             });
         }
+
+        const business = businesses[0];
+        console.log(`[createQueue] Found business: ${business.id}. Proceeding to create queue: ${name}`);
 
         const { data, error } = await supabase
             .from('queues')
@@ -280,6 +287,7 @@ export const getMyQueues = async (req: Request, res: Response) => {
             .select(`
                 *,
                 businesses!inner (id, owner_id, name),
+                services (*),
                 queue_entries(count)
             `)
             .eq('businesses.owner_id', userId)
@@ -288,11 +296,9 @@ export const getMyQueues = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        console.log(`Found ${data?.length} queues for user ${userId}`);
+        console.log(`[getMyQueues] User: ${userId} | Found ${data?.length} queues`);
         if (data && data.length > 0) {
-            data.forEach((q: any) => {
-                console.log(`Queue: ${q.name} | ID: ${q.id} | Entries Count: ${q.queue_entries?.[0]?.count || 0}`);
-            });
+            console.log(`[getMyQueues] Sample Business Owner: ${data[0].businesses.owner_id}`);
         }
 
         res.status(200).json({
@@ -332,13 +338,6 @@ export const getTodayQueue = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        // DIAGNOSTIC: Check if ANY entries exist for this queue at all
-        const { count: totalCount } = await supabase
-            .from('queue_entries')
-            .select('*', { count: 'exact', head: true })
-            .eq('queue_id', id);
-
-        console.log(`Diagnostic: Queue ${id} has ${totalCount} TOTAL entries, but ${data?.length} match today (${todayStr}) and active status.`);
 
         console.log(`Found ${data?.length} active entries for queue ${id} today (${todayStr})`);
 

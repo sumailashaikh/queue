@@ -33,6 +33,7 @@ export const requireAuth = async (req: any, res: Response, next: NextFunction) =
 
         // Attach user to request object
         req.user = user;
+        console.log(`[AUTH] Authenticated user: ${user.id}`);
 
         // Create an authenticated Supabase client for this request
         // This is CRITICAL for RLS to work properly

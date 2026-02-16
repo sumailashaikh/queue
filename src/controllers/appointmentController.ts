@@ -124,7 +124,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
             .from('appointments')
             .select(`
                 *,
-                profiles (full_name, id),
+                profiles (full_name, id, phone),
                 services (name, duration_minutes)
             `)
             .in('business_id', businessIds)
