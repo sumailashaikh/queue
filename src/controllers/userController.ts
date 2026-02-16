@@ -47,6 +47,7 @@ export const updateProfile = async (req: Request, res: Response) => {
         const updates: any = {};
         if (full_name !== undefined) updates.full_name = full_name;
         if (role !== undefined) updates.role = role;
+        if (req.body.phone !== undefined) updates.phone = req.body.phone;
 
         const { data, error } = await supabase
             .from('profiles')
