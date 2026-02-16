@@ -56,34 +56,59 @@ export const verifyOtp = async (req: Request, res: Response) => {
         const user = data.user;
         const session = data.session;
 
-        // Check if user exists in profiles, if not create one? 
+        // Check if user exists in profiles, if not create one
         if (user) {
-            // Check if profile exists
+            console.log(`[AUTH] Checking profile for user: ${user.id}`);
             const { data: profile, error: profileError } = await supabase
                 .from('profiles')
-                .select('*')
+                .select('id')
                 .eq('id', user.id)
                 .single();
 
             if (!profile || profileError) {
-                // Create profile if missing
-                console.log('Profile missing, creating fallback...');
-                await supabase.from('profiles').insert([
-                    { id: user.id, full_name: 'New User', role: 'customer', phone: phone, status: 'pending', is_verified: false }
-                ]);
-            } else if (!profile.phone) {
-                // Update profile if phone is missing
+                console.log('[AUTH] Profile missing or error, creating/upserting profile...');
+                const { error: insertError } = await supabase.from('profiles').upsert([
+                    {
+                        id: user.id,
+                        full_name: 'New User',
+                        role: 'customer',
+                        phone: phone,
+                        status: 'pending',
+                        is_verified: false,
+                        created_at: new Date().toISOString()
+                    }
+                ], { onConflict: 'id' });
+
+                if (insertError) {
+                    console.error('[AUTH] Failed to create/upsert profile:', insertError);
+                } else {
+                    console.log('[AUTH] Profile created/upserted successfully');
+                }
+            } else {
+                // Update phone if missing
                 await supabase.from('profiles')
                     .update({ phone: phone })
-                    .eq('id', user.id);
+                    .eq('id', user.id)
+                    .is('phone', null);
             }
         }
+
+        if (!user) {
+            return res.status(401).json({ status: 'error', message: 'Authentication failed' });
+        }
+
+        // Fetch the final profile to return with the user object
+        const { data: finalProfile } = await supabase
+            .from('profiles')
+            .select('*')
+            .eq('id', user.id)
+            .single();
 
         res.status(200).json({
             status: 'success',
             message: 'Login successful',
             data: {
-                user: user,
+                user: { ...user, ...finalProfile },
                 session: session
             }
         });

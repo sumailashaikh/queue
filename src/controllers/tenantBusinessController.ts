@@ -15,6 +15,25 @@ export const createBusiness = async (req: Request, res: Response) => {
             });
         }
 
+        // SAFETY: Ensure profile exists before creating business (prevents FK violation)
+        const { data: profile } = await supabase
+            .from('profiles')
+            .select('id')
+            .eq('id', userId)
+            .single();
+
+        if (!profile) {
+            console.log(`[BUSINESS] Profile missing for user ${userId}, creating fallback...`);
+            await supabase.from('profiles').upsert([{
+                id: userId,
+                full_name: 'New Owner',
+                role: 'owner',
+                status: 'active',
+                is_verified: true,
+                created_at: new Date().toISOString()
+            }], { onConflict: 'id' });
+        }
+
         if (!name || !slug) {
             return res.status(400).json({
                 status: 'error',
