@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
+import { isBusinessOpen } from '../utils/timeUtils';
 
 export const getAllQueues = async (req: Request, res: Response) => {
     try {
@@ -100,7 +101,7 @@ export const createQueue = async (req: Request, res: Response) => {
 
 export const joinQueue = async (req: Request, res: Response) => {
     try {
-        const { queue_id, customer_name, phone, service_name } = req.body;
+        const { queue_id, customer_name, phone, service_ids } = req.body; // Array of Service IDs
         const user_id = req.user?.id; // From authMiddleware
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -121,6 +122,23 @@ export const joinQueue = async (req: Request, res: Response) => {
         // Get current date in YYYY-MM-DD format
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
+        // 0. Get Queue and Business info for notification
+        const { data: queueInfo, error: queueInfoError } = await supabase
+            .from('queues')
+            .select('*, businesses(name, open_time, close_time, is_closed)')
+            .eq('id', queue_id)
+            .single();
+
+        if (queueInfoError) throw queueInfoError;
+
+        // Check Business Hours
+        if (queueInfo?.businesses) {
+            const status = isBusinessOpen(queueInfo.businesses);
+            if (!status.isOpen) {
+                return res.status(400).json({ status: 'error', message: status.message });
+            }
+        }
+
         // 1. Get current max position for TODAY to determine new position
         const { data: maxPosData, error: maxPosError } = await supabase
             .from('queue_entries')
@@ -134,8 +152,22 @@ export const joinQueue = async (req: Request, res: Response) => {
 
         const nextPosition = (maxPosData && maxPosData.length > 0) ? maxPosData[0].position + 1 : 1;
 
-        // 2. Generate Ticket Number (Simple implementation: Q-{Position})
+        // 2. Generate Ticket Number
         const ticket_number = `Q-${nextPosition}`;
+        const status_token = crypto.randomUUID();
+
+        // 2.5 Fetch all selected services to calculate total duration and get names
+        let selectedServices = [];
+        if (service_ids && service_ids.length > 0) {
+            const { data: sData } = await supabase
+                .from('services')
+                .select('id, name, duration_minutes')
+                .in('id', service_ids);
+            selectedServices = sData || [];
+        }
+
+        const totalEntryDuration = selectedServices.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0);
+        const serviceNamesDisplay = selectedServices.map((s: any) => s.name).join(', ') || 'General';
 
         // 3. Insert Entry
         const { data, error } = await supabase
@@ -143,30 +175,70 @@ export const joinQueue = async (req: Request, res: Response) => {
             .insert([
                 {
                     queue_id,
-                    user_id: user_id || null, // Allow null for guests
+                    user_id: user_id || null,
                     customer_name: customer_name || 'Guest',
                     phone: phone || null,
-                    service_name: service_name || null,
+                    service_name: serviceNamesDisplay, // Combined display name
                     status: 'waiting',
                     position: nextPosition,
                     ticket_number,
-                    entry_date: todayStr // Explicitly set the date
+                    status_token,
+                    entry_date: todayStr
                 }
             ])
-            .select();
+            .select()
+            .single();
 
         if (error) throw error;
 
-        const entry = data[0];
+        // 3.5 Link Multiple Services in Junction Table
+        if (service_ids && service_ids.length > 0) {
+            const junctionEntries = service_ids.map((sId: string) => ({
+                entry_id: data.id,
+                service_id: sId
+            }));
+            await supabase.from('queue_entry_services').insert(junctionEntries);
+        }
 
         // Send Notification
         const recipient = phone || (user_id ? `User-${user_id}` : `Guest-${customer_name}`);
-        await notificationService.sendSMS(recipient, `You have joined the queue. Your ticket number is ${ticket_number}.`);
+        const businessName = queueInfo?.businesses?.name || 'the salon';
+        const smsMessage = `You've joined the queue at ${businessName}! Ticket: ${ticket_number}. Live Status: ${req.headers.origin}/status?token=${status_token}. Thank you!`;
+        await notificationService.sendSMS(recipient, smsMessage);
+
+        // Calculate estimated wait time based on cumulative duration of people ahead
+        // We'll fetch all entries in this queue today that are ahead
+        const { data: entriesAhead } = await supabase
+            .from('queue_entries')
+            .select(`
+                id,
+                queue_entry_services!entry_id (
+                    services!service_id (duration_minutes)
+                )
+            `)
+            .eq('queue_id', queue_id)
+            .eq('entry_date', todayStr)
+            .eq('status', 'waiting')
+            .lt('position', nextPosition);
+
+        let wait_time = 0;
+        if (entriesAhead) {
+            entriesAhead.forEach((entry: any) => {
+                const entryDuration = entry.queue_entry_services?.reduce((acc: number, s: any) => acc + (s.services?.duration_minutes || 10), 0) || 10;
+                wait_time += entryDuration;
+            });
+        }
 
         res.status(201).json({
             status: 'success',
             message: 'Joined queue successfully',
-            data: entry
+            data: {
+                ...data,
+                token: status_token,
+                position: nextPosition,
+                wait_time,
+                status_url: `${req.headers.origin || ''}/status?token=${status_token}`
+            }
         });
 
     } catch (error: any) {
@@ -330,7 +402,12 @@ export const getTodayQueue = async (req: Request, res: Response) => {
 
         const { data, error } = await supabase
             .from('queue_entries')
-            .select('*')
+            .select(`
+                *,
+                queue_entry_services!entry_id (
+                    services!service_id (id, name, duration_minutes)
+                )
+            `)
             .eq('queue_id', id)
             .eq('entry_date', todayStr)
             .in('status', ['waiting', 'serving']) // Only active people
@@ -422,7 +499,7 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
             if (nextPeople && nextPeople.length > 0) {
                 const nextPerson = nextPeople[0];
                 const nextRecipient = nextPerson.user_id ? `User-${nextPerson.user_id}` : `Guest-${nextPerson.customer_name}`;
-                await notificationService.sendSMS(nextRecipient, `Your turn for ${entry.queues.name} is approaching! You are next in line.`);
+                await notificationService.sendSMS(nextRecipient, `Hello ${nextPerson.customer_name},\n\nYour turn for *${entry.queues.name}* is approaching! You are next in line.`);
             }
 
         } else if (status === 'completed') {
@@ -477,5 +554,144 @@ export const resetQueueEntries = async (req: Request, res: Response) => {
             status: 'error',
             message: error.message
         });
+    }
+};
+
+export const getQueueStatus = async (req: Request, res: Response) => {
+    try {
+        const { token } = req.query; // status_token (UUID)
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!token) {
+            return res.status(400).json({ status: 'error', message: 'Token is required' });
+        }
+
+        // 1. Get the entry and basic business info
+        const { data: entry, error: entryError } = await supabase
+            .from('queue_entries')
+            .select('*, queues(*, businesses(name, slug))')
+            .eq('status_token', token)
+            .single();
+
+        if (entryError || !entry) {
+            return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        // 2. Get currently serving person for this queue
+        const { data: currentServing } = await supabase
+            .from('queue_entries')
+            .select('ticket_number')
+            .eq('queue_id', entry.queue_id)
+            .eq('status', 'serving')
+            .eq('entry_date', entry.entry_date)
+            .maybeSingle();
+
+        // 3. Calculate position ahead
+        const { count } = await supabase
+            .from('queue_entries')
+            .select('*', { count: 'exact', head: true })
+            .eq('queue_id', entry.queue_id)
+            .eq('status', 'waiting')
+            .eq('entry_date', entry.entry_date)
+            .lt('position', entry.position);
+
+        const positionAhead = count || 0;
+
+        // 4. Calculate total wait time based on services of people ahead
+        const { data: entriesAhead } = await supabase
+            .from('queue_entries')
+            .select(`
+                id,
+                queue_entry_services(
+                    services(duration_minutes)
+                )
+            `)
+            .eq('queue_id', entry.queue_id)
+            .eq('status', 'waiting')
+            .eq('entry_date', entry.entry_date)
+            .lt('position', entry.position);
+
+        let estimatedWait = 0;
+        if (entriesAhead) {
+            entriesAhead.forEach((aheadEntry: any) => {
+                const duration = aheadEntry.queue_entry_services?.reduce((acc: number, s: any) => acc + (s.services?.duration_minutes || 10), 0) || 10;
+                estimatedWait += duration;
+            });
+        }
+
+        // Add current entry's estimate if they are still waiting
+        if (entry.status === 'waiting') {
+            // Fetch current entry's services as well
+            const { data: myServices } = await supabase
+                .from('queue_entry_services')
+                .select('services(duration_minutes)')
+                .eq('entry_id', entry.id);
+
+            const myDuration = myServices?.reduce((acc: number, s: any) => acc + (s.services?.duration_minutes || 10), 0) || 10;
+            // Usually wait time is "time until your turn", so we don't necessarily add our own duration
+            // unless we want "time until completion". Let's stick to "time until start".
+        }
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                business_name: entry.queues?.businesses?.name,
+                business_slug: entry.queues?.businesses?.slug,
+                display_token: entry.ticket_number,
+                current_serving: currentServing?.ticket_number || 'None',
+                position: positionAhead + 1,
+                estimated_wait_time: estimatedWait,
+                status: entry.status
+            }
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const nextEntry = async (req: Request, res: Response) => {
+    try {
+        const { queue_id } = req.body;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        if (!queue_id) {
+            return res.status(400).json({ status: 'error', message: 'Queue ID is required' });
+        }
+
+        // 1. Mark current serving as completed
+        await supabase
+            .from('queue_entries')
+            .update({ status: 'completed', completed_at: new Date().toISOString() })
+            .eq('queue_id', queue_id)
+            .eq('status', 'serving')
+            .eq('entry_date', todayStr);
+
+        // 2. Find next person in line
+        const { data: next, error: nextError } = await supabase
+            .from('queue_entries')
+            .select('*')
+            .eq('queue_id', queue_id)
+            .eq('status', 'waiting')
+            .eq('entry_date', todayStr)
+            .order('position', { ascending: true })
+            .limit(1)
+            .single();
+
+        if (next) {
+            await supabase
+                .from('queue_entries')
+                .update({ status: 'serving', served_at: new Date().toISOString() })
+                .eq('id', next.id);
+
+            // Optional: Trigger WhatsApp/SMS Notification here
+        }
+
+        res.status(200).json({
+            status: 'success',
+            message: next ? `Next customer ${next.ticket_number} is now being served.` : 'No more customers in queue.'
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
     }
 };

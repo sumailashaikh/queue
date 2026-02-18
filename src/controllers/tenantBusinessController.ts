@@ -5,7 +5,7 @@ import { Business } from '../types';
 export const createBusiness = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
-        const { name, slug, address, phone } = req.body;
+        const { name, slug, address, phone, whatsapp_number, open_time, close_time, is_closed } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         if (!userId) {
@@ -60,7 +60,11 @@ export const createBusiness = async (req: Request, res: Response) => {
             name,
             slug,
             address,
-            phone
+            phone,
+            whatsapp_number,
+            open_time,
+            close_time,
+            is_closed
         };
 
         const { data, error } = await supabase
@@ -128,7 +132,7 @@ export const getMyBusinesses = async (req: Request, res: Response) => {
 export const updateBusiness = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { name, address, phone } = req.body;
+        const { name, address, phone, whatsapp_number, open_time, close_time, is_closed } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -141,7 +145,7 @@ export const updateBusiness = async (req: Request, res: Response) => {
 
         const { data, error } = await supabase
             .from('businesses')
-            .update({ name, address, phone })
+            .update({ name, address, phone, whatsapp_number, open_time, close_time, is_closed })
             .eq('id', id)
             .eq('owner_id', userId) // Extra safety
             .select()
@@ -238,5 +242,110 @@ export const getBusinessBySlug = async (req: Request, res: Response) => {
             status: 'error',
             message: error.message
         });
+    }
+};
+
+export const getBusinessDisplayData = async (req: Request, res: Response) => {
+    try {
+        const { slug } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // 1. Get Business and its Queues
+        const { data: business, error: businessError } = await supabase
+            .from('businesses')
+            .select(`
+                id,
+                name,
+                slug,
+                queues (id, name)
+            `)
+            .eq('slug', slug)
+            .single();
+
+        if (businessError || !business) {
+            return res.status(404).json({ status: 'error', message: 'Business not found' });
+        }
+
+        const queueIds = business.queues.map((q: any) => q.id);
+
+        // 2. Fetch Active Queue Entries Today
+        const { data: queueEntries, error: qError } = await supabase
+            .from('queue_entries')
+            .select('*')
+            .in('queue_id', queueIds)
+            .eq('entry_date', todayStr)
+            .in('status', ['waiting', 'serving'])
+            .order('position', { ascending: true });
+
+        if (qError) throw qError;
+
+        // 3. Fetch Appointments Today (only confirmed or completed)
+        // Note: For appointments, we might need to filter by start_time being today
+        const { data: appointments, error: aError } = await supabase
+            .from('appointments')
+            .select(`
+                id,
+                status,
+                start_time,
+                guest_name,
+                profiles (full_name),
+                appointment_services (
+                    services (name)
+                )
+            `)
+            .eq('business_id', business.id)
+            .gte('start_time', `${todayStr}T00:00:00`)
+            .lte('start_time', `${todayStr}T23:59:59`)
+            .in('status', ['confirmed', 'completed']);
+
+        if (aError) throw aError;
+
+        // 4. Unify and Sort
+        // We'll return them separately or combined depending on frontend need.
+        // Combined is better for a single "Up Next" list.
+        const unified = [
+            ...(queueEntries?.map((e: any) => ({
+                id: e.id,
+                type: 'queue',
+                display_token: e.ticket_number,
+                customer_name: e.customer_name,
+                status: e.status,
+                time: e.joined_at,
+                service_name: e.service_name || 'Walk-in'
+            })) || []),
+            ...(appointments?.map((a: any) => {
+                const customerName = a.guest_name ||
+                    (Array.isArray(a.profiles) ? a.profiles[0]?.full_name : a.profiles?.full_name) ||
+                    'Premium Guest';
+
+                const serviceNames = (a as any).appointment_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || 'Service';
+
+                return {
+                    id: a.id,
+                    type: 'appointment',
+                    display_token: 'BOOKED',
+                    customer_name: customerName,
+                    status: a.status === 'confirmed' ? 'waiting' : 'serving', // Map to queue status for simplicity
+                    time: a.start_time,
+                    service_name: serviceNames
+                };
+            }) || [])
+        ];
+
+        // Sort by time (joined_at for queue, start_time for appointments)
+        unified.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                business,
+                entries: unified
+            }
+        });
+
+    } catch (error: any) {
+        console.error('[DisplayData] Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
     }
 };

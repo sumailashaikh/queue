@@ -6,9 +6,9 @@ import businessRoutes from './businessRoutes';
 
 import appointmentRoutes from './appointmentRoutes';
 import analyticsRoutes from './analyticsRoutes';
-
 import serviceRoutes from './serviceRoutes';
 import adminRoutes from './adminRoutes';
+import publicRoutes from './publicRoutes';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -18,6 +18,7 @@ router.get('/', (req, res) => {
     res.json({ message: 'Queue API is online', version: '1.0.0' });
 });
 
+router.use('/public', publicRoutes);
 router.use('/queues', queueRoutes);
 router.use('/auth', authRoutes); // Auth routes (OTP)
 router.use('/users', userRoutes);

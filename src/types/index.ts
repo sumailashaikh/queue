@@ -12,6 +12,10 @@ export interface Business {
     slug: string;
     address?: string | null;
     phone?: string | null;
+    whatsapp_number?: string | null;
+    open_time: string; // HH:mm:ss
+    close_time: string; // HH:mm:ss
+    is_closed: boolean;
     created_at: string;
 }
 

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getAllQueues, createQueue, joinQueue, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries } from '../controllers/queueController';
+import { getAllQueues, createQueue, joinQueue, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry } from '../controllers/queueController';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -18,8 +18,8 @@ router.delete('/:id/entries/today', requireAuth, resetQueueEntries); // Clear en
 
 // Customer entries
 router.patch('/entries/:id/status', requireAuth, updateQueueEntryStatus); // Owner action
+router.post('/next', requireAuth, nextEntry); // Auto-next flow
 
-// Protected routes (User joining)
 // Moved to public routes to allow guest joining
 
 export default router;
