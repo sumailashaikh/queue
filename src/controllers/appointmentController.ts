@@ -34,9 +34,9 @@ export const createAppointment = async (req: Request, res: Response) => {
             return res.status(404).json({ status: 'error', message: 'Business not found' });
         }
 
-        const businessStatus = isBusinessOpen(business);
-        if (!businessStatus.isOpen) {
-            return res.status(400).json({ status: 'error', message: businessStatus.message });
+        // Check business manually closed status (completely offline)
+        if (business.is_closed) {
+            return res.status(400).json({ status: 'error', message: 'The business is currently not accepting new bookings.' });
         }
 
         // Calculate total duration from services
@@ -73,13 +73,22 @@ export const createAppointment = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        // Link services in junction table
+        // Link services in junction table with snapshots
         if (service_ids && service_ids.length > 0) {
-            const junctionEntries = service_ids.map((sId: string) => ({
-                appointment_id: data.id,
-                service_id: sId
-            }));
-            await supabase.from('appointment_services').insert(junctionEntries);
+            const { data: sData } = await supabase
+                .from('services')
+                .select('id, price, duration_minutes')
+                .in('id', service_ids);
+
+            if (sData) {
+                const junctionEntries = sData.map((s: any) => ({
+                    appointment_id: data.id,
+                    service_id: s.id,
+                    price: s.price || 0,
+                    duration_minutes: s.duration_minutes || 0
+                }));
+                await supabase.from('appointment_services').insert(junctionEntries);
+            }
         }
 
         // Send Notification
@@ -163,6 +172,16 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
 
         const businessIds = businesses.map((b: any) => b.id);
 
+        // 1.5 Auto-Process No-Shows (15 minute rule)
+        // Set 'confirmed' or 'scheduled' appointments to 'no_show' if start_time + 15m < now
+        const fifteenMinsAgo = new Date(Date.now() - 15 * 60000).toISOString();
+        await supabase
+            .from('appointments')
+            .update({ status: 'no_show' })
+            .in('business_id', businessIds)
+            .in('status', ['scheduled', 'confirmed'])
+            .lt('start_time', fifteenMinsAgo);
+
         // 2. Get appointments for these businesses
         const { data, error } = await supabase
             .from('appointments')
@@ -199,34 +218,52 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        const validStatuses = ['scheduled', 'confirmed', 'checked_in', 'in_service', 'completed', 'cancelled'];
+        const validStatuses = ['scheduled', 'confirmed', 'checked_in', 'in_service', 'completed', 'cancelled', 'no_show'];
         if (!validStatuses.includes(status)) {
             return res.status(400).json({ status: 'error', message: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
         }
 
         // 1. Fetch appointment with business and service info
-        const { data: appointment, error: fetchError } = await supabase
+        const { data: appts, error: fetchError } = await supabase
             .from('appointments')
             .select(`
                 *,
-                businesses (id, name, owner_id),
+                businesses!business_id (id, name, owner_id),
                 appointment_services!appointment_id (
-                    services!service_id (id, name, duration_minutes)
+                    id,
+                    price,
+                    duration_minutes,
+                    services!service_id (id, name)
                 )
             `)
-            .eq('id', id)
-            .single();
+            .eq('id', id);
+
+        const appointment = appts && appts.length > 0 ? (appts[0] as any) : null;
 
         if (fetchError || !appointment) {
-            return res.status(404).json({ status: 'error', message: 'Appointment not found' });
+            console.error('[UpdateStatus] Fetch Error:', fetchError);
+            console.error('[UpdateStatus] Params - ID:', id, 'User:', userId);
+            return res.status(404).json({
+                status: 'error',
+                message: 'Appointment not found',
+                details: fetchError?.message
+            });
         }
 
-        if (appointment.businesses.owner_id !== userId) {
+        // Handle possible array/object from join
+        const business = Array.isArray(appointment.businesses) ? appointment.businesses[0] : appointment.businesses;
+
+        if (!business || business.owner_id !== userId) {
+            console.error('[UpdateStatus] Ownership failure:', { business, userId });
             return res.status(403).json({ status: 'error', message: 'Unauthorized to update this appointment' });
         }
 
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
         let updateData: any = { status };
+
+        if (status === 'checked_in') {
+            updateData.checked_in_at = new Date().toISOString();
+        }
 
         // 2. Handle Logic for specific transitions
         if (status === 'checked_in') {
@@ -264,53 +301,178 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
                 const nextPosition = (maxPosData && maxPosData.length > 0) ? maxPosData[0].position + 1 : 1;
                 const ticketNumber = `A-${nextPosition}`; // A for Appointment
 
-                const services = (appointment as any).appointment_services?.map((as: any) => as.services).filter(Boolean) || [];
-                const serviceNamesDisplay = services.map((s: any) => s.name).join(', ') || 'Appointment Service';
+                const apptData = appointment as any; // Cast for easier access to nested properties
+
+                // Calculate totals from appointment services
+                const total_duration_minutes = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
+                const total_price = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
+                const serviceNamesDisplay = apptData.appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Appointment Service';
 
                 const { data: newEntry, error: entryError } = await supabase
                     .from('queue_entries')
                     .insert([{
-                        queue_id: queue.id,
-                        appointment_id: id,
-                        customer_name: appointment.guest_name || (appointment.profiles as any)?.full_name || 'Premium Guest',
-                        phone: appointment.guest_phone || (appointment.profiles as any)?.phone,
+                        queue_id: queue.id, // Use queue.id from the fetched queue
+                        appointment_id: id, // Link to the appointment
+                        user_id: apptData.user_id,
+                        customer_name: (apptData.profiles?.full_name || apptData.guest_name || 'Appointment Customer'),
+                        phone: (apptData.profiles?.phone || apptData.guest_phone || null),
+                        service_name: serviceNamesDisplay,
                         status: 'waiting',
                         position: nextPosition,
-                        ticket_number: ticketNumber,
+                        ticket_number: `A-${nextPosition}`,
                         entry_date: todayStr,
-                        service_name: serviceNamesDisplay
+                        total_price,
+                        total_duration_minutes
                     }])
                     .select()
                     .single();
 
                 if (entryError) throw entryError;
+                if (!newEntry) throw new Error('Failed to create queue entry for appointment');
 
-                // Sync services to queue_entry_services
-                if (services.length > 0 && newEntry) {
-                    const queueServiceEntries = services.map((s: any) => ({
-                        entry_id: newEntry.id,
-                        service_id: s.id
+                // 4. Link services to queue entry
+                if (apptData.appointment_services && apptData.appointment_services.length > 0) {
+                    const junctionEntries = apptData.appointment_services.map((as: any) => ({
+                        queue_entry_id: newEntry.id,
+                        service_id: as.services.id,
+                        price: as.price || 0,
+                        duration_minutes: as.duration_minutes || 0
                     }));
-                    await supabase.from('queue_entry_services').insert(queueServiceEntries);
+                    await supabase.from('queue_entry_services').insert(junctionEntries);
                 }
             }
         } else if (status === 'in_service') {
-            // Update queue entry to 'serving'
-            await supabase
+            // --- PARALLEL SERVING LOGIC & PROVIDER ASSIGNMENT ---
+            const { data: qIn } = await supabase
                 .from('queue_entries')
-                .update({ status: 'serving', served_at: new Date().toISOString() })
-                .eq('appointment_id', id);
+                .select(`
+                    id, 
+                    queue_id, 
+                    entry_date, 
+                    total_duration_minutes,
+                    assigned_provider_id,
+                    queue_entry_services (service_id)
+                `)
+                .eq('appointment_id', id)
+                .single();
 
-            // WhatsApp: Send "It's your turn now"
-            const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
-            await notificationService.sendSMS(recipient, `Hello ${appointment.guest_name || 'Guest'},\n\nIt's now your turn at *${appointment.businesses.name}*! Please proceed to the service area.\n\nThank you!`);
+            if (qIn) {
+                // 1. Get current busy providers for this business today
+                const { data: busyProviders } = await supabase
+                    .from('queue_entries')
+                    .select('assigned_provider_id')
+                    .eq('entry_date', qIn.entry_date)
+                    .eq('status', 'serving')
+                    .not('assigned_provider_id', 'is', null);
+
+                const busyProviderIds = busyProviders?.map((p: any) => p.assigned_provider_id) || [];
+
+                let eligibleProviderId = qIn.assigned_provider_id;
+
+                // 2. Provider Assignment Logic
+                if (!eligibleProviderId) {
+                    const requiredServiceIds = (qIn as any).queue_entry_services?.map((s: any) => s.service_id) || [];
+
+                    // Find providers for this business
+                    const { data: providers, error: provError } = await supabase
+                        .from('service_providers')
+                        .select(`
+                            id,
+                            name,
+                            provider_services (service_id)
+                        `)
+                        .eq('business_id', appointment.business_id)
+                        .eq('is_active', true);
+
+                    if (provError) throw provError;
+
+                    // Filtering: Supports ALL selected services AND is NOT busy
+                    const availableProvider = providers?.find((p: any) => {
+                        const providerServiceIds = p.provider_services?.map((ps: any) => ps.service_id) || [];
+                        const supportsAll = requiredServiceIds.every((rid: string) => providerServiceIds.includes(rid));
+                        const isNotBusy = !busyProviderIds.includes(p.id);
+                        return supportsAll && isNotBusy;
+                    });
+
+                    if (!availableProvider) {
+                        return res.status(400).json({
+                            status: 'error',
+                            message: "No available expert found who supports all selected services. Please wait or assign manually."
+                        });
+                    }
+                    eligibleProviderId = availableProvider.id;
+                } else {
+                    // Check if the pre-assigned provider is busy
+                    if (busyProviderIds.includes(eligibleProviderId)) {
+                        return res.status(400).json({
+                            status: 'error',
+                            message: "The selected expert is currently attending to another guest. Please choose an available expert."
+                        });
+                    }
+                }
+
+                // 3. Timing snapshots and SMS ETA
+                const now = new Date();
+                const duration = Number(qIn.total_duration_minutes || 0);
+                const estEnd = new Date(now.getTime() + duration * 60000);
+
+                await supabase
+                    .from('queue_entries')
+                    .update({
+                        status: 'serving',
+                        served_at: now.toISOString(),
+                        service_started_at: now.toISOString(),
+                        estimated_end_at: estEnd.toISOString(),
+                        assigned_provider_id: eligibleProviderId
+                    })
+                    .eq('appointment_id', id);
+
+                // Update per-service assignment in queue_entry_services
+                await supabase
+                    .from('queue_entry_services')
+                    .update({ assigned_provider_id: eligibleProviderId })
+                    .eq('queue_entry_id', qIn.id);
+
+                const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
+                const etaStr = estEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+                await notificationService.sendSMS(recipient, `Hello ${appointment.guest_name || 'Guest'},\n\nIt's now your turn at *${appointment.businesses.name}*! Estimated completion is ${etaStr}. Please proceed to the service area.\n\nThank you!`);
+            } else {
+                // If no queue entry found, just update appointment (though there should be one if checked_in)
+                console.warn(`[Appointment] No queue entry found for appointment ${id} during in_service transition`);
+            }
 
         } else if (status === 'completed') {
-            updateData.completed_at = new Date().toISOString();
-            // Update queue entry to 'completed'
+            const now = new Date();
+            updateData.completed_at = now.toISOString();
+
+            // 1. Fetch timing data from queue entry to calculate delay
+            const { data: timingData } = await supabase
+                .from('queue_entries')
+                .select('id, service_started_at, estimated_end_at')
+                .eq('appointment_id', id)
+                .single();
+
+            let entryUpdates: any = {
+                status: 'completed',
+                completed_at: now.toISOString()
+            };
+
+            if (timingData?.service_started_at) {
+                const start = new Date(timingData.service_started_at);
+                const actualDuration = Math.round((now.getTime() - start.getTime()) / 60000);
+                entryUpdates.actual_duration_minutes = actualDuration;
+
+                if (timingData.estimated_end_at) {
+                    const estEnd = new Date(timingData.estimated_end_at);
+                    const delay = Math.max(0, Math.round((now.getTime() - estEnd.getTime()) / 60000));
+                    entryUpdates.delay_minutes = delay;
+                }
+            }
+
+            // 2. Update queue entry
             await supabase
                 .from('queue_entries')
-                .update({ status: 'completed', completed_at: new Date().toISOString() })
+                .update(entryUpdates)
                 .eq('appointment_id', id);
         }
 
@@ -395,14 +557,32 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
             .single();
 
         if (error) throw error;
+        console.log('[bookPublicAppointment] Supabase Insert Result:', { data, error });
 
-        // Link services in junction table
+        if (!data || !data.id) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'Booking failed. This might be due to security policies or missing information.',
+                details: 'Data or ID missing from response'
+            });
+        }
+
+        // Link services in junction table with snapshots
         if (service_ids && service_ids.length > 0) {
-            const junctionEntries = service_ids.map((sId: string) => ({
-                appointment_id: data.id,
-                service_id: sId
-            }));
-            await supabase.from('appointment_services').insert(junctionEntries);
+            const { data: sData } = await supabase
+                .from('services')
+                .select('id, price, duration_minutes')
+                .in('id', service_ids);
+
+            if (sData) {
+                const junctionEntries = sData.map((s: any) => ({
+                    appointment_id: data.id,
+                    service_id: s.id,
+                    price: s.price || 0,
+                    duration_minutes: s.duration_minutes || 0
+                }));
+                await supabase.from('appointment_services').insert(junctionEntries);
+            }
         }
 
         // Send Notification to Business Owner

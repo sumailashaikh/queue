@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getAllQueues, createQueue, joinQueue, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry } from '../controllers/queueController';
+import { getAllQueues, createQueue, joinQueue, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry, extendTime, assignTaskProvider, startTask, completeTask } from '../controllers/queueController';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -18,7 +18,13 @@ router.delete('/:id/entries/today', requireAuth, resetQueueEntries); // Clear en
 
 // Customer entries
 router.patch('/entries/:id/status', requireAuth, updateQueueEntryStatus); // Owner action
+router.patch('/entries/:id/extend-time', requireAuth, extendTime); // Extend service duration
 router.post('/next', requireAuth, nextEntry); // Auto-next flow
+
+// Per-Service Tasks (Phase 3)
+router.patch('/services/:id/assign-provider', requireAuth, assignTaskProvider);
+router.patch('/services/:id/start', requireAuth, startTask);
+router.patch('/services/:id/complete', requireAuth, completeTask);
 
 // Moved to public routes to allow guest joining
 

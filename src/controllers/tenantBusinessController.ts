@@ -272,7 +272,12 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
         // 2. Fetch Active Queue Entries Today
         const { data: queueEntries, error: qError } = await supabase
             .from('queue_entries')
-            .select('*')
+            .select(`
+                *,
+                queue_entry_services!queue_entry_id (
+                    services!service_id (name)
+                )
+            `)
             .in('queue_id', queueIds)
             .eq('entry_date', todayStr)
             .in('status', ['waiting', 'serving'])
@@ -312,7 +317,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 customer_name: e.customer_name,
                 status: e.status,
                 time: e.joined_at,
-                service_name: e.service_name || 'Walk-in'
+                service_name: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || e.service_name || 'Walk-in'
             })) || []),
             ...(appointments?.map((a: any) => {
                 const customerName = a.guest_name ||
@@ -347,5 +352,29 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
     } catch (error: any) {
         console.error('[DisplayData] Error:', error);
         res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+export const getBusinessServices = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        const { data, error } = await supabase
+            .from('services')
+            .select('*')
+            .eq('business_id', id);
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
     }
 };

@@ -37,10 +37,62 @@ export const isBusinessOpen = (business: { open_time: string; close_time: string
     return { isOpen: true };
 };
 
+
+/**
+ * Gets the current minutes since midnight in IST
+ */
+export const getISTMinutes = (date: Date = new Date()): number => {
+    const istTimeStr = date.toLocaleTimeString('en-GB', {
+        timeZone: 'Asia/Kolkata',
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit'
+    });
+    const [h, m] = istTimeStr.split(':').map(Number);
+    return (h * 60) + m;
+};
+
+/**
+ * Converts HH:mm string to minutes since midnight
+ */
+export const parseTimeToMinutes = (timeStr: string): number => {
+    if (!timeStr) return 0;
+    const [h, m] = timeStr.split(':').map(Number);
+    return (h * 60) + m;
+};
+
+/**
+ * Checks if a service can be completed before the business closes
+ */
+export const canCompleteBeforeClosing = (
+    business: { close_time: string },
+    currentWaitMins: number,
+    serviceDurationMins: number,
+    bufferMins: number = 10
+): { canJoin: boolean; finishTimeStr?: string; closingTimeStr?: string } => {
+    const nowMins = getISTMinutes();
+    const closeMins = parseTimeToMinutes(business.close_time);
+    const totalFinishMins = nowMins + currentWaitMins + serviceDurationMins + bufferMins;
+
+    if (totalFinishMins > closeMins) {
+        const h = Math.floor(totalFinishMins / 60);
+        const m = totalFinishMins % 60;
+        const finishTimeStr = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
+        return {
+            canJoin: false,
+            finishTimeStr: formatTime12(finishTimeStr),
+            closingTimeStr: formatTime12(business.close_time)
+        };
+    }
+
+    return { canJoin: true };
+};
+
 export const formatTime12 = (timeStr: string): string => {
     if (!timeStr) return "";
-    const [hours, minutes] = timeStr.split(':');
-    const h = parseInt(hours);
+    const parts = timeStr.split(':');
+    const h = parseInt(parts[0]);
+    const minutes = parts[1] || "00";
     const ampm = h >= 12 ? 'PM' : 'AM';
     const h12 = h % 12 || 12;
     return `${h12}:${minutes} ${ampm}`;

@@ -9,6 +9,7 @@ import analyticsRoutes from './analyticsRoutes';
 import serviceRoutes from './serviceRoutes';
 import adminRoutes from './adminRoutes';
 import publicRoutes from './publicRoutes';
+import serviceProviderRoutes from './serviceProviderRoutes';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -27,5 +28,6 @@ router.use('/appointments', appointmentRoutes);
 router.use('/services', serviceRoutes);
 router.use('/analytics', analyticsRoutes);
 router.use('/admin', adminRoutes);
+router.use('/service-providers', serviceProviderRoutes);
 
 export default router;

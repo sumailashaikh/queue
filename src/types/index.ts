@@ -50,4 +50,39 @@ export interface QueueEntry {
     joined_at: string;
     served_at?: string | null;
     completed_at?: string | null;
+    total_price: number;
+    total_duration_minutes: number;
+    service_started_at?: string | null;
+    estimated_end_at?: string | null;
+    actual_duration_minutes?: number | null;
+    delay_minutes: number;
+    assigned_provider_id?: string | null;
+}
+
+export interface ServiceProvider {
+    id: string;
+    business_id: string;
+    name: string;
+    phone?: string | null;
+    role?: string | null;
+    department?: string | null;
+    is_active: boolean;
+    created_at: string;
+}
+
+export interface ProviderService {
+    id: string;
+    provider_id: string;
+    service_id: string;
+    created_at: string;
+}
+
+export interface ProviderAvailability {
+    id: string;
+    provider_id: string;
+    day_of_week: number;
+    start_time: string;
+    end_time: string;
+    is_available: boolean;
+    created_at: string;
 }

@@ -199,7 +199,8 @@ export const getBusinessDetails = async (req: any, res: Response) => {
                 customer_name,
                 ticket_number,
                 joined_at,
-                queue_entry_services!entry_id (
+                total_price,
+                queue_entry_services!queue_entry_id (
                     services!service_id (id, name, price)
                 )
             `)
@@ -236,8 +237,7 @@ export const getBusinessDetails = async (req: any, res: Response) => {
         qEntries?.forEach((entry: any) => {
             if (entry.status === 'completed') {
                 completedVisits++;
-                const entryPrice = entry.queue_entry_services?.reduce((acc: number, as: any) => acc + (as.services?.price || 0), 0) || 0;
-                totalRevenue += entryPrice;
+                totalRevenue += Number(entry.total_price || 0);
             }
         });
 
@@ -245,6 +245,7 @@ export const getBusinessDetails = async (req: any, res: Response) => {
         appointments?.forEach((appt: any) => {
             if (appt.status === 'completed') {
                 completedVisits++;
+                // Note: appointments still use junction calc until total_price added there too
                 const apptPrice = appt.appointment_services?.reduce((acc: number, as: any) => acc + (as.services?.price || 0), 0) || 0;
                 totalRevenue += apptPrice;
             }
@@ -259,7 +260,7 @@ export const getBusinessDetails = async (req: any, res: Response) => {
                 token: e.ticket_number,
                 status: e.status,
                 time: e.joined_at,
-                service: e.queue_entry_services?.map((as: any) => as.services?.name).join(', ') || 'Walk-in'
+                service: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || 'Walk-in'
             })) || []),
             ...(appointments?.map((a: any) => ({
                 id: a.id,
