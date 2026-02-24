@@ -82,15 +82,24 @@ export const getServiceProviders = async (req: Request, res: Response) => {
         // Enhance with current task count
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
         const enhancedProviders = await Promise.all((providers || []).map(async (p: any) => {
-            const { count } = await supabase
+            // Count tasks that are in_progress AND belong to an entry that is currently serving today
+            const { data: busyTasks } = await supabase
                 .from('queue_entry_services')
-                .select('*', { count: 'exact', head: true })
+                .select(`
+                    id,
+                    queue_entries!inner (
+                        entry_date,
+                        status
+                    )
+                `)
                 .eq('assigned_provider_id', p.id)
-                .eq('task_status', 'in_progress');
+                .eq('task_status', 'in_progress')
+                .eq('queue_entries.entry_date', todayStr)
+                .eq('queue_entries.status', 'serving');
 
             return {
                 ...p,
-                current_tasks_count: count || 0
+                current_tasks_count: busyTasks?.length || 0
             };
         }));
 

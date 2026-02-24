@@ -1239,6 +1239,14 @@ export const startTask = async (req: Request, res: Response) => {
                 })
                 .eq('id', task.queue_entries.id);
 
+            // Sync with parent appointment
+            if (task.queue_entries.appointment_id) {
+                await supabase
+                    .from('appointments')
+                    .update({ status: 'in_service' })
+                    .eq('id', task.queue_entries.appointment_id);
+            }
+
             // Send Notification for first service start
             const recipient = task.queue_entries.phone || (task.queue_entries.user_id ? `User-${task.queue_entries.user_id}` : `Guest-${task.queue_entries.customer_name}`);
             const etaStr = estEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
@@ -1445,7 +1453,11 @@ export const updateQueueEntryPayment = async (req: Request, res: Response) => {
 
         const { data, error } = await supabase
             .from('queue_entries')
-            .update({ payment_method })
+            .update({
+                payment_method,
+                payment_status: 'paid',
+                paid_at: new Date().toISOString()
+            })
             .eq('id', id)
             .select()
             .single();

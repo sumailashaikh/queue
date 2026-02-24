@@ -919,7 +919,11 @@ export const processAppointmentPayment = async (req: Request, res: Response) => 
 
         const { data, error } = await supabase
             .from('appointments')
-            .update({ payment_method })
+            .update({
+                payment_method,
+                payment_status: 'paid',
+                paid_at: new Date().toISOString()
+            })
             .eq('id', id)
             .select()
             .single();
