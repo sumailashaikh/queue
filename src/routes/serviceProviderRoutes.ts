@@ -16,4 +16,9 @@ router.get('/:id/availability', serviceProviderController.getProviderAvailabilit
 router.put('/:id/availability', serviceProviderController.updateProviderAvailability);
 router.patch('/assignments/:id', serviceProviderController.assignProviderToEntry);
 
+// Provider Leaves endpoints
+router.get('/:id/leaves', serviceProviderController.getProviderLeaves);
+router.post('/:id/leaves', serviceProviderController.addProviderLeave);
+router.delete('/leaves/:leaveId', serviceProviderController.deleteProviderLeave);
+
 export default router;

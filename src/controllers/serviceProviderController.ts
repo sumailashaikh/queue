@@ -48,7 +48,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
 
 export const getServiceProviders = async (req: Request, res: Response) => {
     try {
-        const { business_id } = req.query;
+        const { business_id, date } = req.query;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -79,27 +79,51 @@ export const getServiceProviders = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        // Enhance with current task count
+        // Determine the target date for availability
+        const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // Fetch all active leaves for these providers on the target date
+        let leavesOnTargetDate: any[] = [];
+        if (providers && providers.length > 0) {
+            const providerIds = providers.map((p: any) => p.id);
+            const { data: leaves } = await supabase
+                .from('provider_leaves')
+                .select('provider_id')
+                .in('provider_id', providerIds)
+                .lte('start_date', targetDateStr)
+                .gte('end_date', targetDateStr);
+
+            if (leaves) leavesOnTargetDate = leaves;
+        }
+
+        const providersOnLeaveIds = new Set(leavesOnTargetDate.map((l: any) => l.provider_id));
+
+        // Enhance with current task count and availability
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
         const enhancedProviders = await Promise.all((providers || []).map(async (p: any) => {
-            // Count tasks that are in_progress AND belong to an entry that is currently serving today
-            const { data: busyTasks } = await supabase
-                .from('queue_entry_services')
-                .select(`
-                    id,
-                    queue_entries!inner (
-                        entry_date,
-                        status
-                    )
-                `)
-                .eq('assigned_provider_id', p.id)
-                .eq('task_status', 'in_progress')
-                .eq('queue_entries.entry_date', todayStr)
-                .eq('queue_entries.status', 'serving');
+            let currentTasksCount = 0;
+            // Only fetch task count if assessing today's data to save DB hits if checking future dates
+            if (targetDateStr === todayStr) {
+                const { data: busyTasks } = await supabase
+                    .from('queue_entry_services')
+                    .select(`
+                        id,
+                        queue_entries!inner (
+                            entry_date,
+                            status
+                        )
+                    `)
+                    .eq('assigned_provider_id', p.id)
+                    .eq('task_status', 'in_progress')
+                    .eq('queue_entries.entry_date', todayStr)
+                    .eq('queue_entries.status', 'serving');
+                currentTasksCount = busyTasks?.length || 0;
+            }
 
             return {
                 ...p,
-                current_tasks_count: busyTasks?.length || 0
+                is_available: !providersOnLeaveIds.has(p.id) && p.is_active !== false,
+                current_tasks_count: currentTasksCount
             };
         }));
 
@@ -383,6 +407,162 @@ export const assignProviderToEntry = async (req: Request, res: Response) => {
         res.status(200).json({
             status: 'success',
             message: 'Expert assigned to entry successfully'
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+// ----------------------------------------------------
+// Provider Leaves
+// ----------------------------------------------------
+
+export const getProviderLeaves = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        const { data, error } = await supabase
+            .from('provider_leaves')
+            .select('*')
+            .eq('provider_id', id)
+            .order('start_date', { ascending: true });
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            data: data || []
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const addProviderLeave = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params; // provider_id
+        const { start_date, end_date, leave_type, note } = req.body;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        if (!start_date || !end_date || !leave_type) {
+            return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+        }
+
+        // 1. Verify ownership of the provider
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id, business_id')
+            .eq('id', id)
+            .single();
+
+        if (!provider) {
+            return res.status(404).json({ status: 'error', message: 'Provider not found' });
+        }
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', provider.business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 2. Overlap check application level (in case DB exclusion constraints aren't sufficient/present)
+        const { data: overlaps } = await supabase
+            .from('provider_leaves')
+            .select('id')
+            .eq('provider_id', id)
+            .lte('start_date', end_date)
+            .gte('end_date', start_date);
+
+        if (overlaps && overlaps.length > 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'This provider already has a leave scheduled during these dates.'
+            });
+        }
+
+        // 3. Insert leave
+        const { data, error } = await supabase
+            .from('provider_leaves')
+            .insert([{
+                provider_id: id,
+                business_id: provider.business_id,
+                start_date,
+                end_date,
+                leave_type,
+                note
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.status(201).json({
+            status: 'success',
+            message: 'Leave added successfully',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const deleteProviderLeave = async (req: Request, res: Response) => {
+    try {
+        const { leaveId } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // We could explicitly check owner_id again for max security, but we rely on RLS 
+        // to restrict deletes if configured, or we can just double check ownership manually here.
+
+        const { data: leave } = await supabase
+            .from('provider_leaves')
+            .select('business_id')
+            .eq('id', leaveId)
+            .single();
+
+        if (!leave) {
+            return res.status(404).json({ status: 'error', message: 'Leave not found' });
+        }
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', leave.business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized to delete this leave' });
+        }
+
+        const { error } = await supabase
+            .from('provider_leaves')
+            .delete()
+            .eq('id', leaveId);
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Leave removed successfully'
         });
 
     } catch (error: any) {

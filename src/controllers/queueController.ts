@@ -1123,7 +1123,35 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // queue_entry_service_id
         const { provider_id } = req.body;
+        const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 0. Validate if provider is on leave for this task's date
+        if (provider_id) {
+            const { data: taskStr } = await supabase
+                .from('queue_entry_services')
+                .select('queue_entries!inner(entry_date)')
+                .eq('id', id)
+                .single();
+
+            if (taskStr && taskStr.queue_entries?.entry_date) {
+                const entryDate = taskStr.queue_entries.entry_date;
+                const { data: leaves } = await supabase
+                    .from('provider_leaves')
+                    .select('id')
+                    .eq('provider_id', provider_id)
+                    .lte('start_date', entryDate)
+                    .gte('end_date', entryDate);
+
+                if (leaves && leaves.length > 0) {
+                    return res.status(400).json({ status: 'error', message: 'This expert is on leave and cannot be assigned to tasks on this date.' });
+                }
+            }
+        }
 
         const { data, error } = await supabase
             .from('queue_entry_services')
@@ -1174,6 +1202,21 @@ export const startTask = async (req: Request, res: Response) => {
         const providerId = task.assigned_provider_id;
         if (!providerId) {
             return res.status(400).json({ status: 'error', message: 'Please assign an expert to this task first.' });
+        }
+
+        // 1.5 Validate if provider is on leave for this task's date
+        if (task.queue_entries?.entry_date) {
+            const entryDate = task.queue_entries.entry_date;
+            const { data: leaves } = await supabase
+                .from('provider_leaves')
+                .select('id')
+                .eq('provider_id', providerId)
+                .lte('start_date', entryDate)
+                .gte('end_date', entryDate);
+
+            if (leaves && leaves.length > 0) {
+                return res.status(400).json({ status: 'error', message: 'This expert is on leave and cannot start tasks on this date.' });
+            }
         }
 
         // 2. STRICTOR PROVIDER LOCK
