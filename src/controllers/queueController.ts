@@ -431,6 +431,7 @@ export const getTodayQueue = async (req: Request, res: Response) => {
             .from('queue_entries')
             .select(`
                 *,
+                appointments ( id, start_time, checked_in_at ),
                 service_providers (id, name),
                 queue_entry_services (
                     id,
@@ -450,7 +451,7 @@ export const getTodayQueue = async (req: Request, res: Response) => {
             `)
             .eq('queue_id', id)
             .eq('entry_date', todayStr)
-            .in('status', ['waiting', 'serving']) // Only active people
+            .or('status.in.(waiting,serving,no_show),and(status.eq.completed,or(payment_method.eq.unpaid,payment_method.is.null))')
             .order('position', { ascending: true });
 
         if (error) throw error;
@@ -715,6 +716,14 @@ export const noShowQueueEntry = async (req: Request, res: Response) => {
 
         if (!currentEntry) {
             return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        // Enhanced Validation: Prevent no-show if checked in or in an invalid state
+        if (currentEntry.checked_in_at) {
+            return res.status(400).json({ status: 'error', message: 'Cannot mark no-show: Customer has already checked in.' });
+        }
+        if (['serving', 'completed', 'done', 'skipped'].includes(currentEntry.status)) {
+            return res.status(400).json({ status: 'error', message: `Cannot mark no-show: Entry is currently ${currentEntry.status}.` });
         }
 
         // 2. Update status and release provider lock
