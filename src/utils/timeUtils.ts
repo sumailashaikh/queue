@@ -63,25 +63,37 @@ export const parseTimeToMinutes = (timeStr: string): number => {
 
 /**
  * Checks if a service can be completed before the business closes
+ * Logic:
+ * estimated_start_time = max(current_time, last_estimated_end_in_queue)
+ * estimated_end_time = estimated_start_time + total_service_duration
+ * Reject if estimated_end_time > (closing_time - buffer_minutes)
  */
 export const canCompleteBeforeClosing = (
     business: { close_time: string },
     currentWaitMins: number,
     serviceDurationMins: number,
-    bufferMins: number = 10
-): { canJoin: boolean; finishTimeStr?: string; closingTimeStr?: string } => {
+    bufferMins: number = 10 // Default 10 min buffer
+): { canJoin: boolean; finishTimeStr?: string; closingTimeStr?: string; message?: string } => {
     const nowMins = getISTMinutes();
     const closeMins = parseTimeToMinutes(business.close_time);
-    const totalFinishMins = nowMins + currentWaitMins + serviceDurationMins + bufferMins;
 
-    if (totalFinishMins > closeMins) {
-        const h = Math.floor(totalFinishMins / 60);
-        const m = totalFinishMins % 60;
+    // estimated_start_time = max(current_time, last_estimated_end_in_queue)
+    // currentWaitMins already represents (last_estimated_end_in_queue - current_time) if positive
+    // So estimated_start_time = current_time + currentWaitMins
+    const estimatedStartMins = nowMins + currentWaitMins;
+    const estimatedEndMins = estimatedStartMins + serviceDurationMins;
+
+    const limitMins = closeMins - bufferMins;
+
+    if (estimatedEndMins > limitMins) {
+        const h = Math.floor(estimatedEndMins / 60);
+        const m = estimatedEndMins % 60;
         const finishTimeStr = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
         return {
             canJoin: false,
             finishTimeStr: formatTime12(finishTimeStr),
-            closingTimeStr: formatTime12(business.close_time)
+            closingTimeStr: formatTime12(business.close_time),
+            message: "We’re fully booked for today. Please select a slot for tomorrow."
         };
     }
 

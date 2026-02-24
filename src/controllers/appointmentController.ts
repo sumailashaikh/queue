@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
 import { isBusinessOpen } from '../utils/timeUtils';
+import { recomputeProviderDelays } from '../utils/delayLogic';
 
 export const createAppointment = async (req: Request, res: Response) => {
     try {
@@ -36,7 +37,7 @@ export const createAppointment = async (req: Request, res: Response) => {
 
         // Check business manually closed status (completely offline)
         if (business.is_closed) {
-            return res.status(400).json({ status: 'error', message: 'The business is currently not accepting new bookings.' });
+            return res.status(400).json({ status: 'error', message: 'Business is closed. Please book during working hours.' });
         }
 
         // Calculate total duration from services
@@ -54,6 +55,38 @@ export const createAppointment = async (req: Request, res: Response) => {
             }
         }
 
+        // Buffer for closing time protection
+        const bufferMins = 15;
+        const nowMins = require('../utils/timeUtils').getISTMinutes();
+        const closeMins = require('../utils/timeUtils').parseTimeToMinutes(business.close_time);
+
+        // Check if appointment date is today
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const apptDateStr = new Date(start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        if (todayStr === apptDateStr) {
+            // For today, we consider current time vs start time
+            const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+            const estEndMins = startMins + totalDuration;
+
+            if (estEndMins > (closeMins - 10)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: "We’re fully booked for today. Please select a slot for tomorrow."
+                });
+            }
+        } else {
+            // For future days, just check against closing time
+            const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+            const estEndMins = startMins + totalDuration;
+            if (estEndMins > (closeMins - 10)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: "We’re fully booked for today. Please select a slot for tomorrow."
+                });
+            }
+        }
+
         const calculatedEndTime = end_time || new Date(new Date(start_time).getTime() + totalDuration * 60000).toISOString();
 
         const { data, error } = await supabase
@@ -65,7 +98,7 @@ export const createAppointment = async (req: Request, res: Response) => {
                     service_id, // Legacy compatibility
                     start_time,
                     end_time: calculatedEndTime,
-                    status: 'pending'
+                    status: 'scheduled' // Updated status to scheduled
                 }
             ])
             .select()
@@ -259,6 +292,30 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         }
 
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // --- PREVENT ILLEGAL TRANSITIONS ---
+        const currentStatus = appointment.status;
+        const terminalStatuses = ['cancelled', 'no_show', 'completed'];
+
+        if (terminalStatuses.includes(currentStatus)) {
+            return res.status(400).json({ status: 'error', message: `Cannot update appointment in terminal state: ${currentStatus}` });
+        }
+
+        const allowedTransitions: Record<string, string[]> = {
+            'scheduled': ['confirmed', 'cancelled', 'no_show'],
+            'confirmed': ['checked_in', 'cancelled', 'no_show'],
+            'checked_in': ['in_service', 'cancelled', 'no_show'],
+            'in_service': ['completed', 'cancelled', 'no_show'],
+        };
+
+        if (allowedTransitions[currentStatus] && !allowedTransitions[currentStatus].includes(status)) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Invalid transition from ${currentStatus} to ${status}. Expected flow: scheduled → confirmed → checked_in → in_service → completed`
+            });
+        }
+        // -----------------------------------
+
         let updateData: any = { status };
 
         if (status === 'checked_in') {
@@ -436,6 +493,11 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
                 const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
                 const etaStr = estEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
                 await notificationService.sendSMS(recipient, `Hello ${appointment.guest_name || 'Guest'},\n\nIt's now your turn at *${appointment.businesses.name}*! Estimated completion is ${etaStr}. Please proceed to the service area.\n\nThank you!`);
+
+                // Recompute delays for this provider's upcoming appointments
+                await recomputeProviderDelays(eligibleProviderId, appointment.business_id, estEnd).catch(err => {
+                    console.error('[appointmentController] Failed to recompute delays in in_service:', err);
+                });
             } else {
                 // If no queue entry found, just update appointment (though there should be one if checked_in)
                 console.warn(`[Appointment] No queue entry found for appointment ${id} during in_service transition`);
@@ -448,7 +510,7 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             // 1. Fetch timing data from queue entry to calculate delay
             const { data: timingData } = await supabase
                 .from('queue_entries')
-                .select('id, service_started_at, estimated_end_at')
+                .select('id, service_started_at, estimated_end_at, assigned_provider_id')
                 .eq('appointment_id', id)
                 .single();
 
@@ -469,11 +531,29 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
                 }
             }
 
-            // 2. Update queue entry
+            // 2. Update queue entry and its services
             await supabase
                 .from('queue_entries')
                 .update(entryUpdates)
                 .eq('appointment_id', id);
+
+            // 3. Update services to 'done' for analytics
+            if (timingData?.id) {
+                await supabase
+                    .from('queue_entry_services')
+                    .update({
+                        task_status: 'done',
+                        completed_at: now.toISOString(),
+                        actual_minutes: entryUpdates.actual_duration_minutes || null
+                    })
+                    .eq('queue_entry_id', timingData.id);
+            }
+
+            if (timingData?.assigned_provider_id) {
+                await recomputeProviderDelays(timingData.assigned_provider_id, appointment.business_id, now).catch(err => {
+                    console.error('[appointmentController] Failed to recompute delays in completed:', err);
+                });
+            }
         }
 
         // 3. Perform the main appointment update
@@ -518,6 +598,17 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
             });
         }
 
+        // Fetch business for closing time validation
+        const { data: business, error: bizError } = await supabase
+            .from('businesses')
+            .select('name, close_time, is_closed')
+            .eq('id', business_id)
+            .single();
+
+        if (bizError || !business) {
+            return res.status(404).json({ status: 'error', message: 'Business not found' });
+        }
+
         // Insert appointment with customer details in metadata or a separate guest column if exists
         // Since the current schema doesn't have customer_name/phone in appointments table, 
         // I should ideally add them or use the 'notes' field if available.
@@ -538,6 +629,19 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
             }
         }
 
+        // Buffer for closing time protection
+        const bufferMins = 10;
+        const closeMins = require('../utils/timeUtils').parseTimeToMinutes(business.close_time);
+        const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+        const estEndMins = startMins + totalDuration;
+
+        if (estEndMins > (closeMins - bufferMins)) {
+            return res.status(400).json({
+                status: 'error',
+                message: "We’re fully booked for today. Please select a slot for tomorrow."
+            });
+        }
+
         const calculatedEndTime = end_time || new Date(new Date(start_time).getTime() + totalDuration * 60000).toISOString();
 
         const { data, error } = await supabase
@@ -548,7 +652,7 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
                     service_id: firstServiceId,
                     start_time,
                     end_time: calculatedEndTime,
-                    status: 'pending',
+                    status: 'scheduled', // Updated status to scheduled
                     guest_name: customer_name,
                     guest_phone: phone
                 }
@@ -660,6 +764,174 @@ export const sendAppointmentAlert = async (req: Request, res: Response) => {
 
     } catch (error: any) {
         console.error('[SendAlert] Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const rescheduleAppointment = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const { start_time } = req.body;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId || !start_time) {
+            return res.status(400).json({ status: 'error', message: 'Unauthorized or missing start_time' });
+        }
+
+        // 1. Fetch appointment details
+        const { data: appointment, error: fetchError } = await supabase
+            .from('appointments')
+            .select(`
+                *,
+                businesses (close_time, owner_id, name),
+                appointment_services (duration_minutes)
+            `)
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !appointment) {
+            return res.status(404).json({ status: 'error', message: 'Appointment not found' });
+        }
+
+        // 2. Ownership check
+        if (appointment.businesses.owner_id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 3. Closing time re-validation
+        const totalDuration = appointment.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 30;
+        const closeMins = require('../utils/timeUtils').parseTimeToMinutes(appointment.businesses.close_time);
+        const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+        const estEndMins = startMins + totalDuration;
+
+        if (estEndMins > (closeMins - 10)) {
+            return res.status(400).json({
+                status: 'error',
+                message: "We’re fully booked for today. Please select a slot for tomorrow."
+            });
+        }
+
+        const calculatedEndTime = new Date(new Date(start_time).getTime() + totalDuration * 60000).toISOString();
+
+        // 4. Update
+        const { data, error } = await supabase
+            .from('appointments')
+            .update({
+                start_time,
+                end_time: calculatedEndTime,
+                status: 'rescheduled'
+            })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // Notify client
+        const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
+        await notificationService.sendSMS(recipient, `Your appointment at ${appointment.businesses.name} has been rescheduled to ${new Date(start_time).toLocaleString('en-IN')}.`);
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Appointment rescheduled successfully',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const cancelAppointment = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // Fetch to verify ownership
+        const { data: appointment, error: fetchError } = await supabase
+            .from('appointments')
+            .select(`*, businesses (owner_id, name)`)
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !appointment) {
+            return res.status(404).json({ status: 'error', message: 'Appointment not found' });
+        }
+
+        if (appointment.businesses.owner_id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { data, error } = await supabase
+            .from('appointments')
+            .update({ status: 'cancelled' })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // Notify client
+        const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
+        await notificationService.sendSMS(recipient, `Your appointment at ${appointment.businesses.name} has been cancelled.`);
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Appointment cancelled successfully',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const processAppointmentPayment = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const { payment_method } = req.body;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { data: appointment, error: fetchError } = await supabase
+            .from('appointments')
+            .select(`businesses (owner_id)`)
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !appointment) {
+            return res.status(404).json({ status: 'error', message: 'Appointment not found' });
+        }
+
+        if (appointment.businesses.owner_id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { data, error } = await supabase
+            .from('appointments')
+            .update({ payment_method })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Payment updated successfully',
+            data
+        });
+    } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
     }
 };

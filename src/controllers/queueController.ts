@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
 import { isBusinessOpen } from '../utils/timeUtils';
+import { recomputeProviderDelays } from '../utils/delayLogic';
 
 export const getAllQueues = async (req: Request, res: Response) => {
     try {
@@ -163,13 +164,13 @@ export const joinQueue = async (req: Request, res: Response) => {
                 queueInfo.businesses,
                 currentWaitTime,
                 serviceDuration,
-                10 // 10 min buffer
+                10 // 10 min buffer as requested
             );
 
             if (!closingProtection.canJoin) {
                 return res.status(400).json({
                     status: 'error',
-                    message: `Queue is closed for today. Estimated finish time (${closingProtection.finishTimeStr}) exceeds closing time (${closingProtection.closingTimeStr}). Please book an appointment for tomorrow.`
+                    message: closingProtection.message || `We’re fully booked for today. Please book for tomorrow.`
                 });
             }
         }
@@ -226,11 +227,25 @@ export const joinQueue = async (req: Request, res: Response) => {
             await supabase.from('queue_entry_services').insert(junctionEntries);
         }
 
-        // Send Notification
-        const recipient = phone || (user_id ? `User-${user_id}` : `Guest-${customer_name}`);
+        // Send Notifications
+        const isOnline = (entry_source || 'online') === 'online';
         const businessName = queueInfo?.businesses?.name || 'the salon';
-        const smsMessage = `You've joined the queue at ${businessName}! Ticket: ${ticket_number}. Live Status: ${req.headers.origin}/status?token=${status_token}. Thank you!`;
-        await notificationService.sendSMS(recipient, smsMessage);
+
+        if (isOnline && phone) {
+            // 1. Join Notification
+            await notificationService.sendWhatsApp(phone, `Thank you for joining the queue at ${businessName}. We’ll notify you as your turn approaches.`);
+
+            // 2. High Demand Notification (if delay >= 15)
+            if (currentWaitTime >= 15) {
+                await notificationService.sendWhatsApp(phone, `We’re currently serving guests and operating at full capacity. Thank you for your patience.`);
+            }
+
+            // Update notified_join
+            await supabase
+                .from('queue_entries')
+                .update({ notified_join: true })
+                .eq('id', data.id);
+        }
 
         res.status(201).json({
             status: 'success',
@@ -502,11 +517,23 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
             .from('queue_entries')
             .select(`
                 *,
-                queues!inner (business_id),
+                queues!inner (business_id, status),
                 queue_entry_services (service_id)
             `)
             .eq('id', id)
             .single();
+
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // Backend-level Walk-in / Direct Serve Block
+        if (status === 'serving') {
+            if (!currentEntry || !currentEntry.ticket_number || currentEntry.entry_date !== todayStr) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: "Customer must join the queue before being served."
+                });
+            }
+        }
 
         const updates: any = { status };
 
@@ -650,27 +677,9 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
         // For now, mocking with "User-{id}"
         const recipient = entry.user_id ? `User-${entry.user_id}` : `Guest-${entry.customer_name}`;
 
-        if (status === 'serving') {
-            await notificationService.sendSMS(recipient, `It's your turn for ${entry.queues.name}! Please proceed to the counter.`);
-
-            // Refinement: Notify the next person in line (who is now technically position 1 or 2 depending on how you count)
-            // Let's find the person with the lowest position who is still 'waiting'
-            const { data: nextPeople } = await supabase
-                .from('queue_entries')
-                .select('*')
-                .eq('queue_id', entry.queue_id)
-                .eq('status', 'waiting')
-                .order('position', { ascending: true })
-                .limit(2); // Notify the very next one
-
-            if (nextPeople && nextPeople.length > 0) {
-                const nextPerson = nextPeople[0];
-                const nextRecipient = nextPerson.user_id ? `User-${nextPerson.user_id}` : `Guest-${nextPerson.customer_name}`;
-                await notificationService.sendSMS(nextRecipient, `Hello ${nextPerson.customer_name},\n\nYour turn for *${entry.queues.name}* is approaching! You are next in line.`);
-            }
-
-        } else if (status === 'completed') {
-            await notificationService.sendSMS(recipient, `Thanks for visiting! We hope to see you again.`);
+        // Consolidate all queue notifications through the process helper
+        if (currentEntry) {
+            await processQueueNotifications(currentEntry.queue_id, currentEntry.entry_date, supabase);
         }
 
         res.status(200).json({
@@ -684,6 +693,128 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
             status: 'error',
             message: error.message
         });
+    }
+};
+
+export const noShowQueueEntry = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 1. Get current entry to check for notifications and provider lock
+        const { data: currentEntry } = await supabase
+            .from('queue_entries')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (!currentEntry) {
+            return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        // 2. Update status and release provider lock
+        const updates: any = {
+            status: 'no_show',
+            assigned_provider_id: null
+        };
+
+        const { data, error } = await supabase
+            .from('queue_entries')
+            .update(updates)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // Release lock in junction table if needed
+        await supabase
+            .from('queue_entry_services')
+            .update({ assigned_provider_id: null })
+            .eq('queue_entry_id', id);
+
+        // 3. Send Notification
+        const recipient = currentEntry.phone;
+        const isOnline = (currentEntry.entry_source || 'online') === 'online';
+        if (isOnline && recipient) {
+            const message = "We tried reaching you for your turn. If you still need service, please rejoin the queue.";
+            await notificationService.sendWhatsApp(recipient, message);
+            await supabase.from('queue_entries').update({ notified_noshow: true }).eq('id', id);
+        }
+
+        // 4. Trigger position updates for the rest of the queue
+        await processQueueNotifications(currentEntry.queue_id, currentEntry.entry_date, supabase);
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Customer marked as no-show and expert released.',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+/**
+ * Automated Queue Notifications
+ * State 1: Join (Online Only) - Handled in joinQueue
+ * State 2: Position <= 3 (Top 3) - Handled here
+ * State 3: Position = 1 (Becoming Next) - Handled here
+ * State 5: High Demand (Delay >= 15) - Handled in joinQueue
+ */
+export const processQueueNotifications = async (queueId: string, entryDate: string, supabase: any) => {
+    try {
+        // 1. Fetch current waiting entries for this queue
+        // We join queues to get business name safely
+        const { data: entries, error } = await supabase
+            .from('queue_entries')
+            .select(`
+                id, ticket_number, phone, position, customer_name, entry_source, 
+                notified_top3, notified_next,
+                queues (
+                    business_id,
+                    businesses ( name )
+                )
+            `)
+            .eq('queue_id', queueId)
+            .eq('entry_date', entryDate)
+            .eq('status', 'waiting')
+            .order('position', { ascending: true });
+
+        if (error || !entries) {
+            console.error('[Notification Process] Fetch Error:', error);
+            return;
+        }
+
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i];
+            const rank = i + 1; // Real-time rank in the waiting list
+            const isOnline = (entry.entry_source || 'online') === 'online';
+
+            // Extract business name from join
+            const businessName = (entry.queues as any)?.businesses?.name || 'the salon';
+
+            if (!isOnline || !entry.phone) continue;
+
+            // State 3: Position = 1 (Becoming Next)
+            if (rank === 1 && !entry.notified_next) {
+                await notificationService.sendWhatsApp(entry.phone, `Your turn is now at ${businessName}. Please proceed to the counter.`);
+                await supabase.from('queue_entries').update({ notified_next: true }).eq('id', entry.id);
+            }
+            // State 2: Position <= 3 (Top 3)
+            else if (rank <= 3 && rank > 1 && !entry.notified_top3) {
+                await notificationService.sendWhatsApp(entry.phone, `Your turn at ${businessName} is coming up soon. Please stay nearby.`);
+                await supabase.from('queue_entries').update({ notified_top3: true }).eq('id', entry.id);
+            }
+        }
+    } catch (err) {
+        console.error('[Notification Process Error]:', err);
     }
 };
 
@@ -1047,19 +1178,24 @@ export const startTask = async (req: Request, res: Response) => {
 
         // 2. STRICTOR PROVIDER LOCK
         // Check if provider has ANY task 'in_progress' for this business today
-        const { data: busyTasks } = await supabase
+        const { data: rawBusyTasks } = await supabase
             .from('queue_entry_services')
             .select(`
                 id,
                 queue_entries!inner (
                     entry_date,
+                    status,
                     queues!inner (business_id)
                 )
             `)
             .eq('assigned_provider_id', providerId)
-            .eq('task_status', 'in_progress')
-            .eq('queue_entries.queues.business_id', task.queue_entries.queues.business_id)
-            .eq('queue_entries.entry_date', task.queue_entries.entry_date);
+            .eq('task_status', 'in_progress');
+
+        const busyTasks = rawBusyTasks?.filter((b: any) =>
+            b.queue_entries?.entry_date === task.queue_entries.entry_date &&
+            b.queue_entries?.queues?.business_id === task.queue_entries.queues.business_id &&
+            b.queue_entries?.status === 'serving'
+        );
 
         if (busyTasks && busyTasks.length > 0) {
             return res.status(400).json({
@@ -1085,6 +1221,12 @@ export const startTask = async (req: Request, res: Response) => {
             .single();
 
         if (updateError) throw updateError;
+
+        // 3.5 Recompute delays for this provider's upcoming appointments
+        const businessId = task.queue_entries.queues.business_id;
+        await recomputeProviderDelays(providerId, businessId, estEnd).catch((err: Error) => {
+            console.error('[queueController] Failed to recompute delays in startTask:', err);
+        });
 
         // 4. Update parent entry status to 'serving' if it's currently 'waiting'
         if (task.queue_entries.status === 'waiting') {
@@ -1123,7 +1265,7 @@ export const completeTask = async (req: Request, res: Response) => {
             .from('queue_entry_services')
             .select(`
                 *,
-                queue_entries!inner (id)
+                queue_entries!inner (id, appointment_id, queues!inner(business_id))
             `)
             .eq('id', id)
             .single();
@@ -1160,6 +1302,13 @@ export const completeTask = async (req: Request, res: Response) => {
 
         if (updateError) throw updateError;
 
+        // Recompute delays based on actual completion time
+        if (task.assigned_provider_id && task.queue_entries?.queues?.business_id) {
+            await recomputeProviderDelays(task.assigned_provider_id, task.queue_entries.queues.business_id, now).catch(err => {
+                console.error('[queueController] Failed to recompute delays in completeTask:', err);
+            });
+        }
+
         // 4. Check if ALL tasks for this entry are done
         const { data: allTasks } = await supabase
             .from('queue_entry_services')
@@ -1177,12 +1326,136 @@ export const completeTask = async (req: Request, res: Response) => {
                     completed_at: now.toISOString()
                 })
                 .eq('id', task.queue_entry_id);
+
+            // Sync with parent appointment
+            if (task.queue_entries.appointment_id) {
+                await supabase
+                    .from('appointments')
+                    .update({
+                        status: 'completed',
+                        completed_at: now.toISOString()
+                    })
+                    .eq('id', task.queue_entries.appointment_id);
+            }
         }
 
         res.status(200).json({
             status: 'success',
             message: allDone ? 'All services completed. Guest session finished.' : 'Task completed successfully',
             data: updatedTask
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const skipQueueEntry = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 1. Get current entry
+        const { data: currentEntry } = await supabase
+            .from('queue_entries')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (!currentEntry) {
+            return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        if (currentEntry.status !== 'waiting') {
+            return res.status(400).json({ status: 'error', message: 'Can only skip customers who are in the waiting list.' });
+        }
+
+        // 2. Find the entry immediately after this one (next position)
+        const { data: nextEntry } = await supabase
+            .from('queue_entries')
+            .select('id, position')
+            .eq('queue_id', currentEntry.queue_id)
+            .eq('entry_date', currentEntry.entry_date)
+            .eq('status', 'waiting')
+            .gt('position', currentEntry.position)
+            .order('position', { ascending: true })
+            .limit(1)
+            .maybeSingle();
+
+        if (!nextEntry) {
+            return res.status(400).json({ status: 'error', message: 'Customer is already at the end of the queue.' });
+        }
+
+        // 3. Swap positions
+        const tempPos = 999999 + Math.floor(Math.random() * 1000);
+
+        await supabase.from('queue_entries').update({ position: tempPos }).eq('id', currentEntry.id);
+        await supabase.from('queue_entries').update({ position: currentEntry.position }).eq('id', nextEntry.id);
+        await supabase.from('queue_entries').update({ position: nextEntry.position }).eq('id', currentEntry.id);
+
+        // Trigger notifications as positions have swapped
+        await processQueueNotifications(currentEntry.queue_id, currentEntry.entry_date, supabase);
+
+        res.status(200).json({
+            status: 'success',
+            message: `Customer ${currentEntry.ticket_number} skipped. Moved down 1 position.`,
+            data: { id: currentEntry.id, new_position: nextEntry.position }
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const updateQueueEntryPayment = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const { payment_method } = req.body;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // Verify ownership
+        const { data: entry, error: fetchError } = await supabase
+            .from('queue_entries')
+            .select('queues!inner(business_id)')
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !entry) {
+            return res.status(404).json({ status: 'error', message: 'Queue entry not found' });
+        }
+
+        const { data: businessInfo } = await supabase
+            .from('businesses')
+            .select('owner_id')
+            .eq('id', entry.queues.business_id)
+            .single();
+
+        if (!businessInfo || businessInfo.owner_id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { data, error } = await supabase
+            .from('queue_entries')
+            .update({ payment_method })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Payment updated successfully',
+            data
         });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });

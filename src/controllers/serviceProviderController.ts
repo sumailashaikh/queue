@@ -75,13 +75,28 @@ export const getServiceProviders = async (req: Request, res: Response) => {
             }
         }
 
-        const { data, error } = await query.order('name', { ascending: true });
+        const { data: providers, error } = await query.order('name', { ascending: true });
 
         if (error) throw error;
 
+        // Enhance with current task count
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const enhancedProviders = await Promise.all((providers || []).map(async (p: any) => {
+            const { count } = await supabase
+                .from('queue_entry_services')
+                .select('*', { count: 'exact', head: true })
+                .eq('assigned_provider_id', p.id)
+                .eq('task_status', 'in_progress');
+
+            return {
+                ...p,
+                current_tasks_count: count || 0
+            };
+        }));
+
         res.status(200).json({
             status: 'success',
-            data
+            data: enhancedProviders
         });
 
     } catch (error: any) {
