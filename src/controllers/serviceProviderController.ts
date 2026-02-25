@@ -56,7 +56,7 @@ export const getServiceProviders = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        let query = supabase.from('service_providers').select('*');
+        let query = supabase.from('service_providers').select('*, services:provider_services(services(id, name))');
 
         if (business_id) {
             query = query.eq('business_id', business_id);
@@ -98,8 +98,24 @@ export const getServiceProviders = async (req: Request, res: Response) => {
 
         const providersOnLeaveIds = new Set(leavesOnTargetDate.map((l: any) => l.provider_id));
 
+        // Enhancement: Fetch all leaves for these providers to compute "upcoming" status
+        let allRecentLeaves: any[] = [];
+        if (providers && providers.length > 0) {
+            const providerIds = providers.map((p: any) => p.id);
+            const { data: recentLeaves } = await supabase
+                .from('provider_leaves')
+                .select('*')
+                .in('provider_id', providerIds)
+                .gte('end_date', targetDateStr);
+            if (recentLeaves) allRecentLeaves = recentLeaves;
+        }
+
         // Enhance with current task count and availability
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const now = new Date();
+        const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+        const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
         const enhancedProviders = await Promise.all((providers || []).map(async (p: any) => {
             let currentTasksCount = 0;
             // Only fetch task count if assessing today's data to save DB hits if checking future dates
@@ -120,10 +136,31 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 currentTasksCount = busyTasks?.length || 0;
             }
 
+            // Compute leave status
+            const providerLeaves = allRecentLeaves.filter((l: any) => l.provider_id === p.id);
+            const currentLeave = providerLeaves.find((l: any) => l.start_date <= targetDateStr && l.end_date >= targetDateStr);
+            const upcomingLeave = providerLeaves.find((l: any) => l.start_date > targetDateStr && l.start_date <= tomorrowStr);
+
+            let leave_status = 'available';
+            let leave_until = null;
+            let leave_starts_at = null;
+
+            if (currentLeave) {
+                leave_status = 'on_leave';
+                leave_until = currentLeave.end_date;
+            } else if (upcomingLeave) {
+                leave_status = 'upcoming';
+                leave_starts_at = upcomingLeave.start_date;
+            }
+
             return {
                 ...p,
-                is_available: !providersOnLeaveIds.has(p.id) && p.is_active !== false,
-                current_tasks_count: currentTasksCount
+                is_available: leave_status === 'available' && p.is_active !== false,
+                leave_status,
+                leave_until,
+                leave_starts_at,
+                current_tasks_count: currentTasksCount,
+                services: p.services?.map((ps: any) => ps.services).filter(Boolean) || []
             };
         }));
 
@@ -420,14 +457,20 @@ export const assignProviderToEntry = async (req: Request, res: Response) => {
 
 export const getProviderLeaves = async (req: Request, res: Response) => {
     try {
-        const { id } = req.params;
+        const { id } = req.params; // provider_id
+        const { business_id } = req.query; // optional but recommended
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
-        const { data, error } = await supabase
+        let query = supabase
             .from('provider_leaves')
             .select('*')
-            .eq('provider_id', id)
-            .order('start_date', { ascending: true });
+            .eq('provider_id', id);
+
+        if (business_id) {
+            query = query.eq('business_id', business_id);
+        }
+
+        const { data, error } = await query.order('start_date', { ascending: true });
 
         if (error) throw error;
 
@@ -563,6 +606,84 @@ export const deleteProviderLeave = async (req: Request, res: Response) => {
         res.status(200).json({
             status: 'success',
             message: 'Leave removed successfully'
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const getBulkLeaveStatus = async (req: Request, res: Response) => {
+    try {
+        const { business_id, date } = req.query;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        if (!business_id) {
+            return res.status(400).json({ status: 'error', message: 'Business ID is required' });
+        }
+
+        // Verify ownership
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { data: providers } = await supabase
+            .from('service_providers')
+            .select('id, name')
+            .eq('business_id', business_id)
+            .eq('is_active', true);
+
+        const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const tomorrow = new Date(new Date(targetDateStr).getTime() + 24 * 60 * 60 * 1000);
+        const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        const { data: leaves } = await supabase
+            .from('provider_leaves')
+            .select('*')
+            .eq('business_id', business_id)
+            .gte('end_date', targetDateStr);
+
+        const results = (providers || []).map((p: any) => {
+            const providerLeaves = (leaves || []).filter((l: any) => l.provider_id === p.id);
+            const currentLeave = providerLeaves.find((l: any) => l.start_date <= targetDateStr && l.end_date >= targetDateStr);
+            const upcomingLeave = providerLeaves.find((l: any) => l.start_date > targetDateStr && l.start_date <= tomorrowStr);
+
+            let leave_status = 'available';
+            let leave_until = null;
+            let leave_starts_at = null;
+
+            if (currentLeave) {
+                leave_status = 'on_leave';
+                leave_until = currentLeave.end_date;
+            } else if (upcomingLeave) {
+                leave_status = 'upcoming';
+                leave_starts_at = upcomingLeave.start_date;
+            }
+
+            return {
+                provider_id: p.id,
+                name: p.name,
+                leave_status,
+                leave_until,
+                leave_starts_at
+            };
+        });
+
+        res.status(200).json({
+            status: 'success',
+            data: results
         });
 
     } catch (error: any) {

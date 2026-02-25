@@ -8,6 +8,7 @@ const router = Router();
 router.use(requireAuth);
 
 router.post('/', serviceProviderController.createServiceProvider);
+router.get('/leaves/status', serviceProviderController.getBulkLeaveStatus);
 router.get('/', serviceProviderController.getServiceProviders);
 router.patch('/:id', serviceProviderController.updateServiceProvider);
 router.delete('/:id', serviceProviderController.deleteServiceProvider);

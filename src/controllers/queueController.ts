@@ -876,7 +876,7 @@ export const getQueueStatus = async (req: Request, res: Response) => {
         // 1. Get the entry and basic business info
         const { data: entry, error: entryError } = await supabase
             .from('queue_entries')
-            .select('*, queues(*, businesses(name, slug))')
+            .select('*, queues(*, businesses(name, slug, phone))')
             .eq('status_token', token)
             .single();
 
@@ -885,13 +885,16 @@ export const getQueueStatus = async (req: Request, res: Response) => {
         }
 
         // 2. Get currently serving person for this queue
-        const { data: currentServing } = await supabase
+        const { data: currentServingEntries } = await supabase
             .from('queue_entries')
             .select('ticket_number, estimated_end_at')
             .eq('queue_id', entry.queue_id)
             .eq('status', 'serving')
             .eq('entry_date', entry.entry_date)
-            .maybeSingle();
+            .order('served_at', { ascending: false })
+            .limit(1);
+
+        const currentServing = currentServingEntries && currentServingEntries.length > 0 ? currentServingEntries[0] : null;
 
         // 3. Calculate position ahead
         const { count } = await supabase
@@ -946,11 +949,13 @@ export const getQueueStatus = async (req: Request, res: Response) => {
             data: {
                 business_name: entry.queues?.businesses?.name,
                 business_slug: entry.queues?.businesses?.slug,
+                business_phone: entry.queues?.businesses?.phone,
                 display_token: entry.ticket_number,
                 current_serving: currentServing?.ticket_number || 'None',
                 position: positionAhead + 1,
                 estimated_wait_time: waitTime,
-                status: entry.status
+                status: entry.status,
+                guest_name: entry.customer_name
             }
         });
     } catch (error: any) {
@@ -1482,10 +1487,10 @@ export const updateQueueEntryPayment = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // Verify ownership
+        // Verify ownership and get appointment_id
         const { data: entry, error: fetchError } = await supabase
             .from('queue_entries')
-            .select('queues!inner(business_id)')
+            .select('appointment_id, total_price, queues!inner(business_id)')
             .eq('id', id)
             .single();
 
@@ -1503,18 +1508,37 @@ export const updateQueueEntryPayment = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized' });
         }
 
+        const now = new Date().toISOString();
+
+        // 1. Update Queue Entry
         const { data, error } = await supabase
             .from('queue_entries')
             .update({
                 payment_method,
                 payment_status: 'paid',
-                paid_at: new Date().toISOString()
+                paid_at: now,
+                amount_paid: entry.total_price || 0
             })
             .eq('id', id)
             .select()
             .single();
 
         if (error) throw error;
+
+        // 2. Sync with Appointment (if linked)
+        if (entry.appointment_id) {
+            await supabase
+                .from('appointments')
+                .update({
+                    status: 'completed',
+                    payment_status: 'paid',
+                    payment_method,
+                    paid_at: now,
+                    completed_at: now,
+                    amount_paid: data.total_price || 0 // Sync total price if available
+                })
+                .eq('id', entry.appointment_id);
+        }
 
         res.status(200).json({
             status: 'success',
