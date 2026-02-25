@@ -4,29 +4,36 @@ import { supabase } from '../config/supabaseClient';
 export const sendOtp = async (req: Request, res: Response) => {
     try {
         const { phone } = req.body;
+        console.log(`[AUTH] Received OTP request for phone: ${phone}`);
 
         if (!phone) {
+            console.log('[AUTH] Phone number missing');
             return res.status(400).json({
                 status: 'error',
                 message: 'Phone number is required'
             });
         }
 
+        console.log('[AUTH] Calling supabase.auth.signInWithOtp...');
+        const start = Date.now();
         const { error } = await supabase.auth.signInWithOtp({
             phone
         });
+        const duration = Date.now() - start;
 
         if (error) {
-            console.error('Supabase OTP Error:', error);
+            console.error(`[AUTH] Supabase OTP Error (${duration}ms):`, error);
             throw error;
         }
 
+        console.log(`[AUTH] OTP sent successfully to ${phone} in ${duration}ms`);
         res.status(200).json({
             status: 'success',
             message: 'OTP sent successfully'
         });
 
     } catch (error: any) {
+        console.error('[AUTH] sendOtp caught error:', error.message);
         res.status(400).json({
             status: 'error',
             message: error.message

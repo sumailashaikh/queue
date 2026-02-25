@@ -683,6 +683,24 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
             await processQueueNotifications(currentEntry.queue_id, currentEntry.entry_date, supabase);
         }
 
+        // --- SYNC STATUS TO APPOINTMENT ---
+        if (entry.appointment_id) {
+            let apptStatus = status;
+            if (status === 'waiting') apptStatus = 'checked_in';
+            if (status === 'serving') apptStatus = 'in_service';
+
+            if (['no_show', 'cancelled', 'completed', 'checked_in', 'in_service'].includes(apptStatus)) {
+                await supabase
+                    .from('appointments')
+                    .update({
+                        status: apptStatus,
+                        completed_at: status === 'completed' ? new Date().toISOString() : null
+                    })
+                    .eq('id', entry.appointment_id);
+            }
+        }
+        // -----------------------------------
+
         res.status(200).json({
             status: 'success',
             message: 'Status updated successfully',
@@ -740,6 +758,15 @@ export const noShowQueueEntry = async (req: Request, res: Response) => {
             .single();
 
         if (error) throw error;
+
+        // --- SYNC STATUS TO APPOINTMENT ---
+        if (currentEntry.appointment_id) {
+            await supabase
+                .from('appointments')
+                .update({ status: 'no_show' })
+                .eq('id', currentEntry.appointment_id);
+        }
+        // -----------------------------------
 
         // Release lock in junction table if needed
         await supabase
@@ -887,7 +914,7 @@ export const getQueueStatus = async (req: Request, res: Response) => {
         // 2. Get currently serving person for this queue
         const { data: currentServingEntries } = await supabase
             .from('queue_entries')
-            .select('ticket_number, estimated_end_at')
+            .select('ticket_number, estimated_end_at, service_providers(name)')
             .eq('queue_id', entry.queue_id)
             .eq('status', 'serving')
             .eq('entry_date', entry.entry_date)
@@ -896,7 +923,30 @@ export const getQueueStatus = async (req: Request, res: Response) => {
 
         const currentServing = currentServingEntries && currentServingEntries.length > 0 ? currentServingEntries[0] : null;
 
-        // 3. Calculate position ahead
+        // 3. Get Top 3 Context for "Queue Status" list
+        const { data: topEntries } = await supabase
+            .from('queue_entries')
+            .select(`
+                id, ticket_number, customer_name, status, position,
+                service_providers(name),
+                queue_entry_services(services(name))
+            `)
+            .eq('queue_id', entry.queue_id)
+            .eq('entry_date', entry.entry_date)
+            .in('status', ['serving', 'waiting'])
+            .order('position', { ascending: true })
+            .limit(3);
+
+        const queueContext = (topEntries || []).map((e: any) => ({
+            ticket: e.ticket_number,
+            name: e.customer_name,
+            status: e.status,
+            specialist: e.service_providers?.name || 'Waiting',
+            service: e.queue_entry_services?.[0]?.services?.name || 'General',
+            is_user: e.id === entry.id
+        }));
+
+        // 4. Calculate position ahead
         const { count } = await supabase
             .from('queue_entries')
             .select('*', { count: 'exact', head: true })
@@ -907,7 +957,7 @@ export const getQueueStatus = async (req: Request, res: Response) => {
 
         const positionAhead = count || 0;
 
-        // 4. Calculate total wait time based on entries ahead (waiting)
+        // 5. Calculate total wait time based on entries ahead (waiting)
         const { data: entriesAhead } = await supabase
             .from('queue_entries')
             .select('id, total_duration_minutes')
@@ -921,28 +971,27 @@ export const getQueueStatus = async (req: Request, res: Response) => {
             waitTime += (e.total_duration_minutes || 10);
         });
 
-        // 5. Add remaining time of the current serving entry
+        // 6. Add remaining time of the current serving entry
         if (currentServing?.estimated_end_at) {
             const now = new Date();
             const estEnd = new Date(currentServing.estimated_end_at);
             const remainingMinutes = Math.max(0, Math.round((estEnd.getTime() - now.getTime()) / 60000));
-
-            // For waiting customers, the wait is (remaining of serving person) + (sum of everyone ahead)
             waitTime += remainingMinutes;
         }
 
-        // Add current entry's estimate if they are still waiting
-        if (entry.status === 'waiting') {
-            // Fetch current entry's services as well
-            const { data: myServices } = await supabase
-                .from('queue_entry_services')
-                .select('services(duration_minutes)')
-                .eq('queue_entry_id', entry.id);
+        // 7. Fetch current user's services/specialist info for the main card
+        const { data: myUserExtended } = await supabase
+            .from('queue_entries')
+            .select('*, service_providers(name, department, role)')
+            .eq('id', entry.id)
+            .single();
 
-            const myDuration = myServices?.reduce((acc: number, s: any) => acc + (s.services?.duration_minutes || 10), 0) || 10;
-            // Usually wait time is "time until your turn", so we don't necessarily add our own duration
-            // unless we want "time until completion". Let's stick to "time until start".
-        }
+        const { data: myServices } = await supabase
+            .from('queue_entry_services')
+            .select('services(name, duration_minutes)')
+            .eq('queue_entry_id', entry.id);
+
+        const serviceNames = myServices?.map((s: any) => s.services?.name).filter(Boolean) || [];
 
         res.status(200).json({
             status: 'success',
@@ -952,10 +1001,17 @@ export const getQueueStatus = async (req: Request, res: Response) => {
                 business_phone: entry.queues?.businesses?.phone,
                 display_token: entry.ticket_number,
                 current_serving: currentServing?.ticket_number || 'None',
+                current_specialist: currentServing?.service_providers?.name || 'Expert',
                 position: positionAhead + 1,
                 estimated_wait_time: waitTime,
                 status: entry.status,
-                guest_name: entry.customer_name
+                guest_name: entry.customer_name,
+                service_names: serviceNames,
+                specialist: {
+                    name: myUserExtended?.service_providers?.name || 'TBD',
+                    role: myUserExtended?.service_providers?.role || myUserExtended?.service_providers?.department || 'Specialist'
+                },
+                queue_context: queueContext
             }
         });
     } catch (error: any) {

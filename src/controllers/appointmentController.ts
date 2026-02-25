@@ -158,7 +158,7 @@ export const getMyAppointments = async (req: Request, res: Response) => {
             .from('appointments')
             .select(`
                 *,
-                businesses (name, address, checkin_creates_queue_entry),
+                businesses (name, address),
                 profiles:user_id (full_name, phone),
                 appointment_services!appointment_id (
                     services!service_id (id, name, duration_minutes)
@@ -183,7 +183,7 @@ export const getMyAppointments = async (req: Request, res: Response) => {
             if (isLate) appointmentState = 'LATE';
             if (appt.status === 'scheduled' && now < startTime) appointmentState = 'UPCOMING';
 
-            const activeQueueEntry = (appt.queue_entries || []).find((q: any) => q.status !== 'no_show' && q.status !== 'done');
+            const activeQueueEntry = (appt.queue_entries || []).find((q: any) => !['completed', 'cancelled', 'no_show', 'skipped'].includes(q.status));
             if (appt.status === 'checked_in' && activeQueueEntry) appointmentState = 'IN_QUEUE';
 
             return {
@@ -281,7 +281,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
             if (isLate) appointmentState = 'LATE';
             if (appt.status === 'scheduled' && now < startTime) appointmentState = 'UPCOMING';
 
-            const activeQueueEntry = (appt.queue_entries || []).find((q: any) => q.status !== 'no_show' && q.status !== 'done');
+            const activeQueueEntry = (appt.queue_entries || []).find((q: any) => !['completed', 'cancelled', 'no_show', 'skipped'].includes(q.status));
             if (appt.status === 'checked_in' && activeQueueEntry) appointmentState = 'IN_QUEUE';
 
             return {
@@ -325,7 +325,7 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             .from('appointments')
             .select(`
                 *,
-                businesses!business_id (id, name, owner_id, checkin_creates_queue_entry),
+                businesses!business_id (id, name, owner_id),
                 appointment_services!appointment_id (
                     id,
                     price,
@@ -366,10 +366,12 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         }
 
         const allowedTransitions: Record<string, string[]> = {
-            'scheduled': ['confirmed', 'cancelled', 'no_show'],
+            'scheduled': ['confirmed', 'checked_in', 'cancelled', 'no_show'],
             'confirmed': ['checked_in', 'cancelled', 'no_show'],
             'checked_in': ['in_service', 'cancelled', 'no_show'],
             'in_service': ['completed', 'cancelled', 'no_show'],
+            'no_show': ['scheduled', 'confirmed', 'checked_in'], // Re-activation
+            'cancelled': ['scheduled', 'confirmed'] // Optional re-activation
         };
 
         if (allowedTransitions[currentStatus] && !allowedTransitions[currentStatus].includes(status)) {
@@ -389,7 +391,7 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         // 2. Handle Logic for specific transitions
         if (status === 'checked_in') {
             // Only create a queue entry if business setting allows
-            if (business.checkin_creates_queue_entry !== false) {
+            if (business.checkin_creates_queue_entry !== false) { // Defaults to true if column missing or true
                 // First, find an open queue for this business
                 const { data: queue } = await supabase
                     .from('queues')
@@ -632,9 +634,7 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             }
         }
 
-        if (status === 'in_service') {
-            updateData.started_at = new Date().toISOString();
-        }
+        // updateData.started_at = new Date().toISOString(); // Column missing
 
         // 3. Perform the main appointment update
         const { data, error } = await supabase
@@ -645,6 +645,57 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             .single();
 
         if (error) throw error;
+
+        // --- SYNC STATUS TO QUEUE ENTRY ---
+        if (['no_show', 'cancelled', 'completed'].includes(status)) {
+            let entryStatus = status;
+            if (status === 'cancelled') entryStatus = 'cancelled'; // Explicitly set
+
+            const { data: qeUpdate } = await supabase
+                .from('queue_entries')
+                .update({
+                    status: entryStatus,
+                    completed_at: status === 'completed' ? new Date().toISOString() : null
+                })
+                .eq('appointment_id', id)
+                .select();
+
+            // Create a queue entry for appointments marked no_show directly, so they appear in Live Queue
+            if (status === 'no_show' && (!qeUpdate || qeUpdate.length === 0)) {
+                const { data: queue } = await supabase
+                    .from('queues')
+                    .select('id')
+                    .eq('business_id', appointment.business_id)
+                    .eq('status', 'open')
+                    .limit(1)
+                    .single();
+
+                if (queue) {
+                    const apptData = appointment as any;
+                    const total_duration_minutes = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
+                    const total_price = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
+                    const serviceNamesDisplay = apptData.appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Appointment Service';
+
+                    await supabase
+                        .from('queue_entries')
+                        .insert([{
+                            queue_id: queue.id,
+                            appointment_id: id,
+                            user_id: apptData.user_id,
+                            customer_name: (apptData.profiles?.full_name || apptData.guest_name || 'Appointment Customer'),
+                            phone: (apptData.profiles?.phone || apptData.guest_phone || null),
+                            service_name: serviceNamesDisplay,
+                            status: 'no_show',
+                            position: 0,
+                            ticket_number: `A-NS`,
+                            entry_date: todayStr,
+                            total_price,
+                            total_duration_minutes
+                        }]);
+                }
+            }
+        }
+        // ----------------------------------
 
         // 4. Compute derived fields for the response
         const now = new Date();
@@ -1020,6 +1071,17 @@ export const processAppointmentPayment = async (req: Request, res: Response) => 
             .single();
 
         if (error) throw error;
+
+        // --- SYNC PAYMENT TO QUEUE ENTRY ---
+        // If an appointment is paid, the queue entry should also reflect it to avoid 'unpaid' status lingering.
+        await supabase
+            .from('queue_entries')
+            .update({
+                payment_method,
+                payment_status: 'paid'
+            })
+            .eq('appointment_id', id);
+        // -----------------------------------
 
         res.status(200).json({
             status: 'success',
