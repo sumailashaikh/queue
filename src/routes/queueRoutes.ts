@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getAllQueues, createQueue, joinQueue, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry, extendTime, assignTaskProvider, startTask, completeTask, noShowQueueEntry, skipQueueEntry, updateQueueEntryPayment } from '../controllers/queueController';
+import { getAllQueues, createQueue, joinQueue, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry, extendTime, assignTaskProvider, startTask, completeTask, noShowQueueEntry, skipQueueEntry, updateQueueEntryPayment, restoreQueueEntry } from '../controllers/queueController';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -22,6 +22,7 @@ router.patch('/entries/:id/no-show', requireAuth, noShowQueueEntry); // NEW: No-
 router.patch('/entries/:id/skip', requireAuth, skipQueueEntry); // NEW: Skip endpoint
 router.patch('/entries/:id/extend-time', requireAuth, extendTime); // Extend service duration
 router.patch('/entries/:id/payment', requireAuth, updateQueueEntryPayment); // NEW: Payment
+router.patch('/entries/:id/restore', requireAuth, restoreQueueEntry); // NEW: Restore no-show
 router.post('/next', requireAuth, nextEntry); // Auto-next flow
 
 // Per-Service Tasks (Phase 3)

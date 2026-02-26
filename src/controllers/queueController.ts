@@ -102,7 +102,7 @@ export const createQueue = async (req: Request, res: Response) => {
 
 export const joinQueue = async (req: Request, res: Response) => {
     try {
-        const { queue_id, customer_name, phone, service_ids, entry_source } = req.body; // entry_source is new
+        const { queue_id, customer_name, phone, service_ids, entry_source, appointment_id } = req.body; // entry_source and appointment_id
         const user_id = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -110,11 +110,42 @@ export const joinQueue = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Queue ID is required' });
         }
 
-        if (!user_id && !customer_name) {
-            return res.status(400).json({ status: 'error', message: 'Either User ID or Customer Name is required' });
+        if (!user_id && !customer_name && !appointment_id) {
+            return res.status(400).json({ status: 'error', message: 'User ID, Customer Name, or Appointment ID is required' });
         }
 
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // --- STRONG APP RULE: Appointment Validation ---
+        if (appointment_id) {
+            const { data: appt, error: apptError } = await supabase
+                .from('appointments')
+                .select('id, start_time, status, business_id')
+                .eq('id', appointment_id)
+                .single();
+
+            if (apptError || !appt) {
+                return res.status(404).json({ status: 'error', message: 'Appointment not found' });
+            }
+
+            const apptDateStr = new Date(appt.start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+            const now = new Date();
+            const gracePeriodMins = 30;
+            const isExpired = now > new Date(new Date(appt.start_time).getTime() + gracePeriodMins * 60000);
+
+            if (apptDateStr !== todayStr) {
+                return res.status(400).json({ status: 'error', message: 'Please book a new appointment. This appointment is not for today.' });
+            }
+
+            if (!['scheduled', 'confirmed'].includes(appt.status)) {
+                return res.status(400).json({ status: 'error', message: `Please book a new appointment. This appointment status is ${appt.status}.` });
+            }
+
+            if (isExpired) {
+                return res.status(400).json({ status: 'error', message: 'Please book a new appointment. Your appointment time has passed the 30-minute grace period.' });
+            }
+        }
+        // ----------------------------------------------
 
         // 0. Get Queue and Business info
         const { data: queueInfo, error: queueInfoError } = await supabase
@@ -208,7 +239,8 @@ export const joinQueue = async (req: Request, res: Response) => {
                     entry_date: todayStr,
                     total_price,
                     total_duration_minutes: serviceDuration,
-                    entry_source: entry_source || 'online' // New field
+                    entry_source: entry_source || 'online',
+                    appointment_id: appointment_id || null // Link appointment if provided
                 }
             ])
             .select()
@@ -415,7 +447,77 @@ export const getTodayQueue = async (req: Request, res: Response) => {
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
         console.log(`Fetching today's queue for id: ${id}, date: ${todayStr}`);
 
-        // 1.5 Auto-Process Skipped Entries (7 minute rule)
+        // 1. Get queue business_id to process appointments
+        const { data: qData } = await supabase
+            .from('queues')
+            .select('business_id')
+            .eq('id', id)
+            .single();
+
+        if (qData) {
+            const now = new Date();
+            const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
+            // Start of today in IST
+            const startOfToday = new Date();
+            startOfToday.setHours(0, 0, 0, 0);
+
+            // 1.5 Auto-Process No-Shows for Appointments (30-min grace)
+            // Find today's appointments that are past due but not checked in
+            const { data: expiredAppts } = await supabase
+                .from('appointments')
+                .update({ status: 'no_show' })
+                .eq('business_id', qData.business_id)
+                .in('status', ['scheduled', 'confirmed'])
+                .lt('start_time', thirtyMinsAgo)
+                .gt('start_time', startOfToday.toISOString()) // Only today's scheduled
+                .select(`
+                    id, 
+                    user_id, 
+                    guest_name, 
+                    guest_phone,
+                    profiles:user_id (full_name, phone),
+                    appointment_services (
+                        price,
+                        duration_minutes,
+                        services!service_id (id, name)
+                    )
+                `);
+
+            if (expiredAppts && expiredAppts.length > 0) {
+                for (const appt of expiredAppts) {
+                    const { data: existingEntry } = await supabase
+                        .from('queue_entries')
+                        .select('id')
+                        .eq('appointment_id', appt.id)
+                        .single();
+
+                    if (!existingEntry) {
+                        const total_duration = (appt as any).appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
+                        const total_price = (appt as any).appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
+                        const serviceNames = (appt as any).appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Appointment Service';
+
+                        await supabase.from('queue_entries').insert([{
+                            queue_id: id,
+                            appointment_id: appt.id,
+                            user_id: appt.user_id,
+                            customer_name: (appt as any).profiles?.full_name || (appt as any).guest_name || 'Guest',
+                            phone: (appt as any).profiles?.phone || (appt as any).guest_phone || null,
+                            service_name: serviceNames,
+                            status: 'no_show',
+                            entry_date: todayStr,
+                            total_price,
+                            total_duration_minutes: total_duration,
+                            position: 0,
+                            ticket_number: 'A-NS'
+                        }]);
+                    } else {
+                        await supabase.from('queue_entries').update({ status: 'no_show' }).eq('id', existingEntry.id);
+                    }
+                }
+            }
+        }
+
+        // 1.6 Auto-Process Skipped Entries (7 minute rule)
         // If status is 'serving' (called) but served_at + 7m < now, set to 'skipped'
         // This only applies to entries where NO work has started (service_started_at is null)
         const sevenMinsAgo = new Date(Date.now() - 7 * 60000).toISOString();
@@ -1242,6 +1344,52 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
     }
 };
 
+// Assuming this is the markNoShow function based on the provided edit context
+export const markNoShow = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params; // queue_entry_id
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        // 1. Fetch the current entry to get appointment_id
+        const { data: currentEntry, error: fetchError } = await supabase
+            .from('queue_entries')
+            .select('id, appointment_id')
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !currentEntry) {
+            return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        // 2. Mark the queue entry as 'no_show'
+        const { data, error } = await supabase
+            .from('queue_entries')
+            .update({ status: 'no_show' })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // 3. Sync with Appointment (if linked)
+        if (currentEntry.appointment_id) {
+            await supabase
+                .from('appointments')
+                .update({ status: 'no_show' })
+                .eq('id', currentEntry.appointment_id);
+        }
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Customer marked as No-Show',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const startTask = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // queue_entry_service_id
@@ -1601,6 +1749,71 @@ export const updateQueueEntryPayment = async (req: Request, res: Response) => {
             message: 'Payment updated successfully',
             data
         });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const restoreQueueEntry = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 1. Get current entry
+        const { data: entry } = await supabase
+            .from('queue_entries')
+            .select(`
+                *,
+                queues!inner (business_id)
+            `)
+            .eq('id', id)
+            .single();
+
+        if (!entry) {
+            return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        // Verify ownership
+        const { data: biz } = await supabase.from('businesses').select('owner_id').eq('id', entry.queues.business_id).single();
+        if (biz?.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Forbidden' });
+
+        // Verify it's from today (Only allow restoration for same-day no-shows)
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        if (entry.entry_date !== todayStr) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Cannot restore no-shows from previous days. Please ask the customer to join the queue again.'
+            });
+        }
+
+        const { data, error } = await supabase
+            .from('queue_entries')
+            .update({ status: 'waiting' })
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // 2. Sync with Appointment (if linked)
+        if (entry.appointment_id) {
+            await supabase
+                .from('appointments')
+                .update({ status: 'confirmed' }) // Or 'checked_in'? Confirmed is safer as it represents "ready to be served"
+                .eq('id', entry.appointment_id);
+        }
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Customer restored to live queue',
+            data
+        });
+
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
     }

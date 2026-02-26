@@ -258,7 +258,11 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 id,
                 name,
                 slug,
-                queues (id, name)
+                open_time,
+                close_time,
+                is_closed,
+                queues (id, name),
+                services (*)
             `)
             .eq('slug', slug)
             .single();

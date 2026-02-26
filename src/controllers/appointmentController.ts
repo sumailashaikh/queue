@@ -232,26 +232,30 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
 
         const businessIds = businesses.map((b: any) => b.id);
 
-        // 1.5 Auto-Process No-Shows & Expirations
+        // 1.5 Auto-Process No-Shows & Expirations (30-min grace period)
         const now = new Date();
-        const fifteenMinsAgo = new Date(now.getTime() - 15 * 60000).toISOString();
+        const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
 
-        // Auto mark no_show
-        await supabase
+        // Auto mark no_show for today's past due appointments
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const { data: expiredAppointments } = await supabase
             .from('appointments')
             .update({ status: 'no_show' })
             .in('business_id', businessIds)
             .in('status', ['scheduled', 'confirmed'])
-            .lt('start_time', fifteenMinsAgo);
+            .lt('start_time', thirtyMinsAgo)
+            .gte('start_time', todayStr + 'T00:00:00Z') // Only today's
+            .select('id');
 
-        // Auto mark expired (if now > end_time and not completed)
-        // We do this for today's appointments specifically or past ones
-        await supabase
-            .from('appointments')
-            .update({ status: 'expired' })
-            .in('business_id', businessIds)
-            .in('status', ['scheduled', 'confirmed', 'checked_in'])
-            .lt('end_time', now.toISOString());
+        // Also sync with queue entries if any expired
+        if (expiredAppointments && expiredAppointments.length > 0) {
+            const expiredIds = expiredAppointments.map((a: { id: string }) => a.id);
+            await supabase
+                .from('queue_entries')
+                .update({ status: 'no_show' })
+                .in('appointment_id', expiredIds)
+                .in('status', ['waiting', 'serving']);
+        }
 
         // 2. Get appointments for these businesses
         const { data, error } = await supabase
@@ -347,6 +351,19 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             });
         }
 
+        // 1.1 Date Validation for Check-In
+        if (status === 'checked_in') {
+            const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+            const aptDateStr = new Date(appointment.start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+            if (aptDateStr !== todayStr) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Past or future appointments cannot be checked in. This customer must join the queue fresh or book a new appointment for today.'
+                });
+            }
+        }
+
         // Handle possible array/object from join
         const business = Array.isArray(appointment.businesses) ? appointment.businesses[0] : appointment.businesses;
 
@@ -370,8 +387,9 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             'confirmed': ['checked_in', 'cancelled', 'no_show'],
             'checked_in': ['in_service', 'cancelled', 'no_show'],
             'in_service': ['completed', 'cancelled', 'no_show'],
-            'no_show': ['scheduled', 'confirmed', 'checked_in'], // Re-activation
-            'cancelled': ['scheduled', 'confirmed'] // Optional re-activation
+            'no_show': [], // Terminal
+            'cancelled': [], // Terminal
+            'completed': [] // Terminal
         };
 
         if (allowedTransitions[currentStatus] && !allowedTransitions[currentStatus].includes(status)) {
@@ -637,14 +655,23 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         // updateData.started_at = new Date().toISOString(); // Column missing
 
         // 3. Perform the main appointment update
-        const { data, error } = await supabase
+        // 3. Update Sync Logic for Terminal Statuses
+        if (status === 'no_show' || status === 'cancelled') {
+            await supabase
+                .from('queue_entries')
+                .update({ status: status })
+                .eq('appointment_id', id)
+                .in('status', ['waiting', 'serving']);
+        }
+
+        const { data, error: updateError } = await supabase
             .from('appointments')
             .update(updateData)
             .eq('id', id)
             .select()
             .single();
 
-        if (error) throw error;
+        if (updateError) throw updateError;
 
         // --- SYNC STATUS TO QUEUE ENTRY ---
         if (['no_show', 'cancelled', 'completed'].includes(status)) {
