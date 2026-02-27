@@ -288,6 +288,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 open_time,
                 close_time,
                 is_closed,
+                language,
                 queues (id, name),
                 services (*)
             `)
@@ -306,7 +307,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
             .select(`
                 *,
                 queue_entry_services!queue_entry_id (
-                    services!service_id (name)
+                    services!service_id (name, translations)
                 )
             `)
             .in('queue_id', queueIds)
@@ -327,7 +328,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 guest_name,
                 profiles (full_name),
                 appointment_services (
-                    services (name)
+                    services (name, translations)
                 )
             `)
             .eq('business_id', business.id)
@@ -348,7 +349,8 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 customer_name: e.customer_name,
                 status: e.status,
                 time: e.joined_at,
-                service_name: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || e.service_name || 'Walk-in'
+                service_name: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || e.service_name || 'Walk-in',
+                translations: e.queue_entry_services?.map((as: any) => as.services?.translations).filter(Boolean) || []
             })) || []),
             ...(appointments?.map((a: any) => {
                 const customerName = a.guest_name ||
@@ -356,6 +358,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                     'Premium Guest';
 
                 const serviceNames = (a as any).appointment_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || 'Service';
+                const serviceTranslations = (a as any).appointment_services?.map((as: any) => as.services?.translations).filter(Boolean) || [];
 
                 return {
                     id: a.id,
@@ -364,7 +367,8 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                     customer_name: customerName,
                     status: a.status === 'confirmed' ? 'waiting' : 'serving', // Map to queue status for simplicity
                     time: a.start_time,
-                    service_name: serviceNames
+                    service_name: serviceNames,
+                    translations: serviceTranslations
                 };
             }) || [])
         ];

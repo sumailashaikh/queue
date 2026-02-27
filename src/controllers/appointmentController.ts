@@ -264,7 +264,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
                 *,
                 profiles (full_name, id, phone),
                 appointment_services!appointment_id (
-                    services!service_id (id, name, duration_minutes)
+                    services!service_id (id, name, duration_minutes, translations)
                 ),
                 queue_entries (id, status, ticket_number)
             `)

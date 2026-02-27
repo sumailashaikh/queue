@@ -10,7 +10,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 async function runMigration() {
     try {
-        const sql = fs.readFileSync('33_add_appointment_delay_and_payment_tracking.sql', 'utf8');
+        const sql = fs.readFileSync('34_add_service_translations.sql', 'utf8');
 
         // Supabase REST API does not support arbitrary SQL execution directly without an RPC function.
         // But let's check if the project has the 'exec_sql' RPC function we created earlier?

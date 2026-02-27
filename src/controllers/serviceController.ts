@@ -3,7 +3,7 @@ import { supabase } from '../config/supabaseClient';
 
 export const createService = async (req: Request, res: Response) => {
     try {
-        const { name, description, duration_minutes, price, business_id } = req.body;
+        const { name, description, duration_minutes, price, business_id, translations } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -52,7 +52,8 @@ export const createService = async (req: Request, res: Response) => {
                     name,
                     description,
                     duration_minutes,
-                    price: Number(price) || 0
+                    price: Number(price) || 0,
+                    translations: translations || {}
                 }
             ])
             .select()
