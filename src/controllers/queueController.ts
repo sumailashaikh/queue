@@ -1005,7 +1005,7 @@ export const getQueueStatus = async (req: Request, res: Response) => {
         // 1. Get the entry and basic business info
         const { data: entry, error: entryError } = await supabase
             .from('queue_entries')
-            .select('*, queues(*, businesses(name, slug, phone))')
+            .select('*, queues(*, businesses(name, slug, phone, language))')
             .eq('status_token', token)
             .single();
 
@@ -1101,6 +1101,7 @@ export const getQueueStatus = async (req: Request, res: Response) => {
                 business_name: entry.queues?.businesses?.name,
                 business_slug: entry.queues?.businesses?.slug,
                 business_phone: entry.queues?.businesses?.phone,
+                business_language: entry.queues?.businesses?.language || 'en',
                 display_token: entry.ticket_number,
                 current_serving: currentServing?.ticket_number || 'None',
                 current_specialist: currentServing?.service_providers?.name || 'Expert',

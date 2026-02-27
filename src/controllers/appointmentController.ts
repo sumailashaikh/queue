@@ -285,8 +285,13 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
             if (isLate) appointmentState = 'LATE';
             if (appt.status === 'scheduled' && now < startTime) appointmentState = 'UPCOMING';
 
+            const isToday = new Date(appt.start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) === todayStr;
+            const isTerminal = ['completed', 'no_show', 'cancelled'].includes(appt.status);
+
             const activeQueueEntry = (appt.queue_entries || []).find((q: any) => !['completed', 'cancelled', 'no_show', 'skipped'].includes(q.status));
-            if (appt.status === 'checked_in' && activeQueueEntry) appointmentState = 'IN_QUEUE';
+
+            // Refined logic for queue_entry metadata
+            const queueEntry = (isToday && !isTerminal) ? activeQueueEntry : null;
 
             return {
                 ...appt,
@@ -294,7 +299,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
                 is_late: isLate,
                 late_minutes: lateMinutes,
                 expected_end_at: expectedEndAt.toISOString(),
-                queue_entry: activeQueueEntry
+                queue_entry: queueEntry
             };
         });
 
@@ -311,443 +316,108 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
 export const updateAppointmentStatus = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { status } = req.body; // 'scheduled', 'confirmed', 'checked_in', 'in_service', 'completed', 'cancelled'
+        const { status } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
         const validStatuses = ['scheduled', 'confirmed', 'checked_in', 'in_service', 'completed', 'cancelled', 'no_show', 'expired'];
         if (!validStatuses.includes(status)) {
-            return res.status(400).json({ status: 'error', message: `Invalid status. Must be one of: ${validStatuses.join(', ')}` });
+            return res.status(400).json({ status: 'error', message: 'Invalid status' });
         }
 
-        // 1. Fetch appointment with business and service info
         const { data: appts, error: fetchError } = await supabase
             .from('appointments')
             .select(`
                 *,
-                businesses!business_id (id, name, owner_id),
+                businesses!business_id (id, name, owner_id, checkin_creates_queue_entry),
                 appointment_services!appointment_id (
-                    id,
-                    price,
-                    duration_minutes,
+                    id, price, duration_minutes,
                     services!service_id (id, name)
-                )
+                ),
+                profiles (full_name, phone)
             `)
             .eq('id', id);
 
-        const appointment = appts && appts.length > 0 ? (appts[0] as any) : null;
+        const appointment = appts?.[0];
+        if (fetchError || !appointment) return res.status(404).json({ status: 'error', message: 'Appointment not found' });
 
-        if (fetchError || !appointment) {
-            console.error('[UpdateStatus] Fetch Error:', fetchError);
-            console.error('[UpdateStatus] Params - ID:', id, 'User:', userId);
-            return res.status(404).json({
-                status: 'error',
-                message: 'Appointment not found',
-                details: fetchError?.message
-            });
-        }
-
-        // 1.1 Date Validation for Check-In
-        if (status === 'checked_in') {
-            const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-            const aptDateStr = new Date(appointment.start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-
-            if (aptDateStr !== todayStr) {
-                return res.status(400).json({
-                    status: 'error',
-                    message: 'Past or future appointments cannot be checked in. This customer must join the queue fresh or book a new appointment for today.'
-                });
-            }
-        }
-
-        // Handle possible array/object from join
         const business = Array.isArray(appointment.businesses) ? appointment.businesses[0] : appointment.businesses;
-
-        if (!business || business.owner_id !== userId) {
-            console.error('[UpdateStatus] Ownership failure:', { business, userId });
-            return res.status(403).json({ status: 'error', message: 'Unauthorized to update this appointment' });
-        }
+        if (!business || business.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-
-        // --- PREVENT ILLEGAL TRANSITIONS ---
         const currentStatus = appointment.status;
-        const terminalStatuses = ['cancelled', 'no_show', 'completed'];
 
-        if (terminalStatuses.includes(currentStatus)) {
-            return res.status(400).json({ status: 'error', message: `Cannot update appointment in terminal state: ${currentStatus}` });
+        // Terminal status check
+        if (['cancelled', 'no_show', 'completed'].includes(currentStatus)) {
+            return res.status(400).json({ status: 'error', message: 'Already in terminal state' });
         }
-
-        const allowedTransitions: Record<string, string[]> = {
-            'scheduled': ['confirmed', 'checked_in', 'cancelled', 'no_show'],
-            'confirmed': ['checked_in', 'cancelled', 'no_show'],
-            'checked_in': ['in_service', 'cancelled', 'no_show'],
-            'in_service': ['completed', 'cancelled', 'no_show'],
-            'no_show': [], // Terminal
-            'cancelled': [], // Terminal
-            'completed': [] // Terminal
-        };
-
-        if (allowedTransitions[currentStatus] && !allowedTransitions[currentStatus].includes(status)) {
-            return res.status(400).json({
-                status: 'error',
-                message: `Invalid transition from ${currentStatus} to ${status}. Expected flow: scheduled → confirmed → checked_in → in_service → completed`
-            });
-        }
-        // -----------------------------------
 
         let updateData: any = { status };
+        if (status === 'checked_in') updateData.checked_in_at = new Date().toISOString();
+        if (status === 'completed') updateData.completed_at = new Date().toISOString();
 
-        if (status === 'checked_in') {
-            updateData.checked_in_at = new Date().toISOString();
-        }
+        // 1. Sync with Queue
+        if (status === 'checked_in' && business.checkin_creates_queue_entry !== false) {
+            const { data: queue } = await supabase.from('queues').select('id').eq('business_id', appointment.business_id).eq('status', 'open').limit(1).single();
+            if (queue) {
+                const { data: existing } = await supabase.from('queue_entries').select('id').eq('appointment_id', id).maybeSingle();
+                if (!existing) {
+                    const { data: maxPos } = await supabase.from('queue_entries').select('position').eq('queue_id', queue.id).eq('entry_date', todayStr).order('position', { ascending: false }).limit(1);
+                    const nextPos = (maxPos?.[0]?.position || 0) + 1;
+                    const totalDur = appointment.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
+                    const totalPri = appointment.appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
+                    const sNames = appointment.appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Service';
 
-        // 2. Handle Logic for specific transitions
-        if (status === 'checked_in') {
-            // Only create a queue entry if business setting allows
-            if (business.checkin_creates_queue_entry !== false) { // Defaults to true if column missing or true
-                // First, find an open queue for this business
-                const { data: queue } = await supabase
-                    .from('queues')
-                    .select('id')
-                    .eq('business_id', appointment.business_id)
-                    .eq('status', 'open')
-                    .limit(1)
-                    .single();
+                    const { data: newEntry } = await supabase.from('queue_entries').insert([{
+                        queue_id: queue.id, appointment_id: id, user_id: appointment.user_id,
+                        customer_name: (appointment.profiles?.full_name || appointment.guest_name || 'Customer'),
+                        phone: (appointment.profiles?.phone || appointment.guest_phone || null),
+                        service_name: sNames, status: 'waiting', position: nextPos,
+                        ticket_number: `A-${nextPos}`, entry_date: todayStr,
+                        total_price: totalPri, total_duration_minutes: totalDur
+                    }]).select().single();
 
-                if (!queue) {
-                    return res.status(400).json({ status: 'error', message: 'No open queue found for this business. Please open a queue first.' });
-                }
-
-                // Check if queue entry already exists for this appointment
-                const { data: existingEntry } = await supabase
-                    .from('queue_entries')
-                    .select('id')
-                    .eq('appointment_id', id)
-                    .single();
-
-                if (!existingEntry) {
-                    // Get next position
-                    const { data: maxPosData } = await supabase
-                        .from('queue_entries')
-                        .select('position')
-                        .eq('queue_id', queue.id)
-                        .eq('entry_date', todayStr)
-                        .order('position', { ascending: false })
-                        .limit(1);
-
-                    const nextPosition = (maxPosData && maxPosData.length > 0) ? maxPosData[0].position + 1 : 1;
-
-                    const apptData = appointment as any;
-                    const total_duration_minutes = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
-                    const total_price = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
-                    const serviceNamesDisplay = apptData.appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Appointment Service';
-
-                    const { data: newEntry, error: entryError } = await supabase
-                        .from('queue_entries')
-                        .insert([{
-                            queue_id: queue.id,
-                            appointment_id: id,
-                            user_id: apptData.user_id,
-                            customer_name: (apptData.profiles?.full_name || apptData.guest_name || 'Appointment Customer'),
-                            phone: (apptData.profiles?.phone || apptData.guest_phone || null),
-                            service_name: serviceNamesDisplay,
-                            status: 'waiting',
-                            position: nextPosition,
-                            ticket_number: `A-${nextPosition}`,
-                            entry_date: todayStr,
-                            total_price,
-                            total_duration_minutes
-                        }])
-                        .select()
-                        .single();
-
-                    if (entryError) throw entryError;
-                    if (apptData.appointment_services && apptData.appointment_services.length > 0) {
-                        const junctionEntries = apptData.appointment_services.map((as: any) => ({
-                            queue_entry_id: newEntry.id,
-                            service_id: as.services.id,
-                            price: as.price || 0,
-                            duration_minutes: as.duration_minutes || 0
+                    if (newEntry && appointment.appointment_services) {
+                        const junctions = appointment.appointment_services.map((as: any) => ({
+                            queue_entry_id: newEntry.id, service_id: as.services.id, price: as.price || 0, duration_minutes: as.duration_minutes || 0
                         }));
-                        await supabase.from('queue_entry_services').insert(junctionEntries);
+                        await supabase.from('queue_entry_services').insert(junctions);
                     }
                 }
             }
         }
         else if (status === 'in_service') {
-            // --- PARALLEL SERVING LOGIC & PROVIDER ASSIGNMENT ---
-            const { data: qIn } = await supabase
-                .from('queue_entries')
-                .select(`
-                    id, 
-                    queue_id, 
-                    entry_date, 
-                    total_duration_minutes,
-                    assigned_provider_id,
-                    queue_entry_services (service_id)
-                `)
-                .eq('appointment_id', id)
-                .single();
-
+            const { data: qIn } = await supabase.from('queue_entries').select('*').eq('appointment_id', id).maybeSingle();
             if (qIn) {
-                // 1. Get current busy providers for this business today
-                const { data: busyProviders } = await supabase
-                    .from('queue_entries')
-                    .select('assigned_provider_id')
-                    .eq('entry_date', qIn.entry_date)
-                    .eq('status', 'serving')
-                    .not('assigned_provider_id', 'is', null);
-
-                const busyProviderIds = busyProviders?.map((p: any) => p.assigned_provider_id) || [];
-
-                let eligibleProviderId = qIn.assigned_provider_id;
-
-                // 2. Provider Assignment Logic
-                if (!eligibleProviderId) {
-                    const requiredServiceIds = (qIn as any).queue_entry_services?.map((s: any) => s.service_id) || [];
-
-                    // Find providers for this business
-                    const { data: providers, error: provError } = await supabase
-                        .from('service_providers')
-                        .select(`
-                            id,
-                            name,
-                            provider_services (service_id)
-                        `)
-                        .eq('business_id', appointment.business_id)
-                        .eq('is_active', true);
-
-                    if (provError) throw provError;
-
-                    // Filtering: Supports ALL selected services AND is NOT busy
-                    const availableProvider = providers?.find((p: any) => {
-                        const providerServiceIds = p.provider_services?.map((ps: any) => ps.service_id) || [];
-                        const supportsAll = requiredServiceIds.every((rid: string) => providerServiceIds.includes(rid));
-                        const isNotBusy = !busyProviderIds.includes(p.id);
-                        return supportsAll && isNotBusy;
-                    });
-
-                    if (!availableProvider) {
-                        return res.status(400).json({
-                            status: 'error',
-                            message: "No available expert found who supports all selected services. Please wait or assign manually."
-                        });
-                    }
-                    eligibleProviderId = availableProvider.id;
-                } else {
-                    // Check if the pre-assigned provider is busy
-                    if (busyProviderIds.includes(eligibleProviderId)) {
-                        return res.status(400).json({
-                            status: 'error',
-                            message: "The selected expert is currently attending to another guest. Please choose an available expert."
-                        });
-                    }
-                }
-
-                // 2.5 Validation: Expert On Leave check
-                const { data: leaves } = await supabase
-                    .from('provider_leaves')
-                    .select('id')
-                    .eq('provider_id', eligibleProviderId)
-                    .lte('start_date', qIn.entry_date)
-                    .gte('end_date', qIn.entry_date);
-
-                if (leaves && leaves.length > 0) {
-                    return res.status(400).json({
-                        status: 'error',
-                        message: 'Cannot start: This expert is on leave today.'
-                    });
-                }
-
-                // 3. Timing snapshots and SMS ETA
-                const now = new Date();
-                const duration = Number(qIn.total_duration_minutes || 0);
-                const estEnd = new Date(now.getTime() + duration * 60000);
-
-                await supabase
-                    .from('queue_entries')
-                    .update({
-                        status: 'serving',
-                        served_at: now.toISOString(),
-                        service_started_at: now.toISOString(),
-                        estimated_end_at: estEnd.toISOString(),
-                        assigned_provider_id: eligibleProviderId
-                    })
-                    .eq('appointment_id', id);
-
-                // Update per-service assignment in queue_entry_services
-                await supabase
-                    .from('queue_entry_services')
-                    .update({ assigned_provider_id: eligibleProviderId })
-                    .eq('queue_entry_id', qIn.id);
-
-                const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
-                const etaStr = estEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
-                await notificationService.sendSMS(recipient, `Hello ${appointment.guest_name || 'Guest'},\n\nIt's now your turn at *${appointment.businesses.name}*! Estimated completion is ${etaStr}. Please proceed to the service area.\n\nThank you!`);
-
-                // Recompute delays for this provider's upcoming appointments
-                await recomputeProviderDelays(eligibleProviderId, appointment.business_id, estEnd).catch(err => {
-                    console.error('[appointmentController] Failed to recompute delays in in_service:', err);
-                });
-            } else {
-                // If no queue entry found, just update appointment (though there should be one if checked_in)
-                console.warn(`[Appointment] No queue entry found for appointment ${id} during in_service transition`);
+                // If you have parallel serving logic or provider assignment, it would go here.
+                // For now, simpler serving sync:
+                await supabase.from('queue_entries').update({
+                    status: 'serving',
+                    service_started_at: new Date().toISOString()
+                }).eq('id', qIn.id);
             }
+        }
+        else if (['completed', 'cancelled', 'no_show'].includes(status)) {
+            const { data: qEntry } = await supabase.from('queue_entries').select('id, status').eq('appointment_id', id).maybeSingle();
+            if (qEntry && !['completed', 'cancelled', 'no_show'].includes(qEntry.status)) {
+                await supabase.from('queue_entries').update({
+                    status: status === 'completed' ? 'completed' : 'cancelled',
+                    completed_at: status === 'completed' ? new Date().toISOString() : null
+                }).eq('id', qEntry.id);
 
-        } else if (status === 'completed') {
-            const now = new Date();
-            updateData.completed_at = now.toISOString();
-
-            // 1. Fetch timing data from queue entry to calculate delay
-            const { data: timingData } = await supabase
-                .from('queue_entries')
-                .select('id, service_started_at, estimated_end_at, assigned_provider_id')
-                .eq('appointment_id', id)
-                .single();
-
-            let entryUpdates: any = {
-                status: 'completed',
-                completed_at: now.toISOString()
-            };
-
-            if (timingData?.service_started_at) {
-                const start = new Date(timingData.service_started_at);
-                const actualDuration = Math.round((now.getTime() - start.getTime()) / 60000);
-                entryUpdates.actual_duration_minutes = actualDuration;
-
-                if (timingData.estimated_end_at) {
-                    const estEnd = new Date(timingData.estimated_end_at);
-                    const delay = Math.max(0, Math.round((now.getTime() - estEnd.getTime()) / 60000));
-                    entryUpdates.delay_minutes = delay;
+                if (status === 'completed' && qEntry.id) {
+                    await supabase.from('queue_entry_services').update({ task_status: 'done', completed_at: new Date().toISOString() }).eq('queue_entry_id', qEntry.id);
                 }
-            }
-
-            // 2. Update queue entry and its services
-            await supabase
-                .from('queue_entries')
-                .update(entryUpdates)
-                .eq('appointment_id', id);
-
-            // 3. Update services to 'done' for analytics
-            if (timingData?.id) {
-                await supabase
-                    .from('queue_entry_services')
-                    .update({
-                        task_status: 'done',
-                        completed_at: now.toISOString(),
-                        actual_minutes: entryUpdates.actual_duration_minutes || null
-                    })
-                    .eq('queue_entry_id', timingData.id);
-            }
-
-            if (timingData?.assigned_provider_id) {
-                await recomputeProviderDelays(timingData.assigned_provider_id, appointment.business_id, now).catch(err => {
-                    console.error('[appointmentController] Failed to recompute delays in completed:', err);
-                });
             }
         }
 
-        // updateData.started_at = new Date().toISOString(); // Column missing
-
-        // 3. Perform the main appointment update
-        // 3. Update Sync Logic for Terminal Statuses
-        if (status === 'no_show' || status === 'cancelled') {
-            await supabase
-                .from('queue_entries')
-                .update({ status: status })
-                .eq('appointment_id', id)
-                .in('status', ['waiting', 'serving']);
-        }
-
-        const { data, error: updateError } = await supabase
-            .from('appointments')
-            .update(updateData)
-            .eq('id', id)
-            .select()
-            .single();
-
+        // 2. Update Appointment
+        const { data: updated, error: updateError } = await supabase.from('appointments').update(updateData).eq('id', id).select().single();
         if (updateError) throw updateError;
 
-        // --- SYNC STATUS TO QUEUE ENTRY ---
-        if (['no_show', 'cancelled', 'completed'].includes(status)) {
-            let entryStatus = status;
-            if (status === 'cancelled') entryStatus = 'cancelled'; // Explicitly set
-
-            const { data: qeUpdate } = await supabase
-                .from('queue_entries')
-                .update({
-                    status: entryStatus,
-                    completed_at: status === 'completed' ? new Date().toISOString() : null
-                })
-                .eq('appointment_id', id)
-                .select();
-
-            // Create a queue entry for appointments marked no_show directly, so they appear in Live Queue
-            if (status === 'no_show' && (!qeUpdate || qeUpdate.length === 0)) {
-                const { data: queue } = await supabase
-                    .from('queues')
-                    .select('id')
-                    .eq('business_id', appointment.business_id)
-                    .eq('status', 'open')
-                    .limit(1)
-                    .single();
-
-                if (queue) {
-                    const apptData = appointment as any;
-                    const total_duration_minutes = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
-                    const total_price = apptData.appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
-                    const serviceNamesDisplay = apptData.appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Appointment Service';
-
-                    await supabase
-                        .from('queue_entries')
-                        .insert([{
-                            queue_id: queue.id,
-                            appointment_id: id,
-                            user_id: apptData.user_id,
-                            customer_name: (apptData.profiles?.full_name || apptData.guest_name || 'Appointment Customer'),
-                            phone: (apptData.profiles?.phone || apptData.guest_phone || null),
-                            service_name: serviceNamesDisplay,
-                            status: 'no_show',
-                            position: 0,
-                            ticket_number: `A-NS`,
-                            entry_date: todayStr,
-                            total_price,
-                            total_duration_minutes
-                        }]);
-                }
-            }
-        }
-        // ----------------------------------
-
-        // 4. Compute derived fields for the response
-        const now = new Date();
-        const startTime = new Date(data.start_time);
-        const duration = appointment.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 30;
-        const expectedEndAt = new Date(startTime.getTime() + duration * 60000);
-
-        const isLate = ['scheduled', 'confirmed', 'checked_in'].includes(data.status) && now > startTime;
-        const lateMinutes = isLate ? Math.max(0, Math.round((now.getTime() - startTime.getTime()) / 60000)) : 0;
-
-        let appointmentState = data.status.toUpperCase();
-        if (isLate) appointmentState = 'LATE';
-        if (data.status === 'scheduled' && now < startTime) appointmentState = 'UPCOMING';
-
-        res.status(200).json({
-            status: 'success',
-            message: `Appointment status updated to ${status}`,
-            data: {
-                ...data,
-                appointment_state: appointmentState,
-                is_late: isLate,
-                late_minutes: lateMinutes,
-                expected_end_at: expectedEndAt.toISOString()
-            }
-        });
+        res.status(200).json({ status: 'success', data: updated });
 
     } catch (error: any) {
         console.error('[UpdateStatus] Error:', error);

@@ -2,10 +2,17 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { Business } from '../types';
 
+const COUNTRY_DEFAULTS: Record<string, { currency: string, timezone: string, language: string }> = {
+    'IN': { currency: 'INR', timezone: 'Asia/Kolkata', language: 'hi' },
+    'AE': { currency: 'AED', timezone: 'Asia/Dubai', language: 'ar' },
+    'US': { currency: 'USD', timezone: 'America/New_York', language: 'en' },
+    'GB': { currency: 'GBP', timezone: 'Europe/London', language: 'en' }
+};
+
 export const createBusiness = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
-        const { name, slug, address, phone, whatsapp_number, open_time, close_time, is_closed } = req.body;
+        const { name, slug, address, phone, whatsapp_number, open_time, close_time, is_closed, currency, timezone, language, country_code } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         if (!userId) {
@@ -55,7 +62,10 @@ export const createBusiness = async (req: Request, res: Response) => {
             });
         }
 
-        const newBusiness: Partial<Business> = {
+        const cCode = country_code || 'IN';
+        const defaults = COUNTRY_DEFAULTS[cCode] || COUNTRY_DEFAULTS['IN'];
+
+        const newBusiness = {
             owner_id: userId,
             name,
             slug,
@@ -64,7 +74,11 @@ export const createBusiness = async (req: Request, res: Response) => {
             whatsapp_number,
             open_time,
             close_time,
-            is_closed
+            is_closed,
+            country_code: cCode,
+            currency: currency || defaults.currency,
+            timezone: timezone || defaults.timezone,
+            language: language || defaults.language
         };
 
         const { data, error } = await supabase
@@ -110,7 +124,12 @@ export const getMyBusinesses = async (req: Request, res: Response) => {
 
         const { data, error } = await supabase
             .from('businesses')
-            .select('*')
+            .select(`
+                *,
+                currency,
+                timezone,
+                language
+            `)
             .eq('owner_id', userId)
             .order('created_at', { ascending: false });
 
@@ -132,7 +151,6 @@ export const getMyBusinesses = async (req: Request, res: Response) => {
 export const updateBusiness = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { name, address, phone, whatsapp_number, open_time, close_time, is_closed } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -140,15 +158,21 @@ export const updateBusiness = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // RLS policy "Owners can update their own business" will handle ownership check implicitly
-        // But verifying existence first is good UX
+        // Only update fields that are provided in req.body. 
+        // Do NOT overwrite provided values with defaults.
+        require('fs').writeFileSync('req_body_log.json', JSON.stringify(req.body, null, 2));
+        const updatePayload: any = { ...req.body };
+
+        // Ensure owner_id isn't accidentally overwritten
+        delete updatePayload.owner_id;
+        delete updatePayload.id;
 
         const { data, error } = await supabase
             .from('businesses')
-            .update({ name, address, phone, whatsapp_number, open_time, close_time, is_closed })
+            .update(updatePayload)
             .eq('id', id)
             .eq('owner_id', userId) // Extra safety
-            .select()
+            .select('*, currency, timezone, language, country_code')
             .single();
 
         if (error) throw error;
@@ -217,6 +241,9 @@ export const getBusinessBySlug = async (req: Request, res: Response) => {
             .from('businesses')
             .select(`
                 *,
+                currency,
+                timezone,
+                language,
                 queues (*, services(*)),
                 services (*)
             `)

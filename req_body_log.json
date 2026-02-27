@@ -1,0 +1,14 @@
+{
+  "name": "rahuls salon",
+  "description": "text\r\n",
+  "address": "1210 rajyash rise",
+  "phone": "+918320582350",
+  "whatsapp_number": "",
+  "slug": "rahuls-salon",
+  "open_time": "09:00:00",
+  "close_time": "21:00:00",
+  "is_closed": false,
+  "currency": "EUR",
+  "timezone": "Europe/Berlin",
+  "language": "es"
+}

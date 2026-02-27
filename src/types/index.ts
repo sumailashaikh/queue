@@ -16,6 +16,9 @@ export interface Business {
     open_time: string; // HH:mm:ss
     close_time: string; // HH:mm:ss
     is_closed: boolean;
+    currency: string;
+    timezone: string;
+    language: string;
     created_at: string;
 }
 

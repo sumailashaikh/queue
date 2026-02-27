@@ -82,6 +82,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
                         phone: phone,
                         status: 'pending',
                         is_verified: false,
+                        ui_language: 'en',
                         created_at: new Date().toISOString()
                     }
                 ], { onConflict: 'id' });

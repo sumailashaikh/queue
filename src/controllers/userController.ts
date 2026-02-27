@@ -70,3 +70,38 @@ export const updateProfile = async (req: Request, res: Response) => {
         });
     }
 };
+
+export const updateUiLanguage = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const { ui_language } = req.body;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        if (!ui_language) {
+            return res.status(400).json({ status: 'error', message: 'ui_language is required' });
+        }
+
+        const { data, error } = await supabase
+            .from('profiles')
+            .update({ ui_language })
+            .eq('id', userId)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            message: 'UI language updated successfully',
+            data
+        });
+    } catch (error: any) {
+        res.status(500).json({
+            status: 'error',
+            message: error.message
+        });
+    }
+};
