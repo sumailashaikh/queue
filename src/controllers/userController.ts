@@ -95,7 +95,13 @@ export const updateUiLanguage = async (req: Request, res: Response) => {
 
         // If no data, the profile doesn't exist yet, so we upsert it
         if (!data) {
-            const { data: upsertData, error: upsertError } = await supabase
+            const { createClient } = require('@supabase/supabase-js');
+            const supabaseAdmin = createClient(
+                process.env.SUPABASE_URL || '',
+                process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || ''
+            );
+
+            const { data: upsertData, error: upsertError } = await supabaseAdmin
                 .from('profiles')
                 .upsert({ id: userId, ui_language })
                 .select()
