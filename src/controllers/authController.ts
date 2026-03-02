@@ -123,13 +123,12 @@ export const verifyOtp = async (req: Request, res: Response) => {
                 session: session,
                 is_new_user: isNewUser
             }
-        }
         });
 
-} catch (error: any) {
-    res.status(401).json({
-        status: 'error',
-        message: error.message
-    });
-}
+    } catch (error: any) {
+        res.status(401).json({
+            status: 'error',
+            message: error.message
+        });
+    }
 };
