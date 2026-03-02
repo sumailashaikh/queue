@@ -63,6 +63,8 @@ export const verifyOtp = async (req: Request, res: Response) => {
         const user = data.user;
         const session = data.session;
 
+        let isNewUser = false;
+
         // Check if user exists in profiles, if not create one
         if (user) {
             console.log(`[AUTH] Checking profile for user: ${user.id}`);
@@ -73,6 +75,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
                 .single();
 
             if (!profile || profileError) {
+                isNewUser = true;
                 console.log('[AUTH] Profile missing or error, creating/upserting profile...');
                 const { error: insertError } = await supabase.from('profiles').upsert([
                     {
@@ -117,14 +120,16 @@ export const verifyOtp = async (req: Request, res: Response) => {
             message: 'Login successful',
             data: {
                 user: { ...user, ...finalProfile },
-                session: session
+                session: session,
+                is_new_user: isNewUser
             }
+        }
         });
 
-    } catch (error: any) {
-        res.status(401).json({
-            status: 'error',
-            message: error.message
-        });
-    }
+} catch (error: any) {
+    res.status(401).json({
+        status: 'error',
+        message: error.message
+    });
+}
 };

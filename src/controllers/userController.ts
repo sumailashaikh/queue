@@ -54,7 +54,7 @@ export const updateProfile = async (req: Request, res: Response) => {
             .update(updates)
             .eq('id', userId)
             .select()
-            .single();
+            .maybeSingle();
 
         if (error) throw error;
 
@@ -84,14 +84,26 @@ export const updateUiLanguage = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'ui_language is required' });
         }
 
-        const { data, error } = await supabase
+        let { data, error } = await supabase
             .from('profiles')
             .update({ ui_language })
             .eq('id', userId)
             .select()
-            .single();
+            .maybeSingle();
 
         if (error) throw error;
+
+        // If no data, the profile doesn't exist yet, so we upsert it
+        if (!data) {
+            const { data: upsertData, error: upsertError } = await supabase
+                .from('profiles')
+                .upsert({ id: userId, ui_language })
+                .select()
+                .maybeSingle();
+
+            if (upsertError) throw upsertError;
+            data = upsertData;
+        }
 
         res.status(200).json({
             status: 'success',

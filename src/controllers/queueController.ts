@@ -533,6 +533,7 @@ export const getTodayQueue = async (req: Request, res: Response) => {
             .from('queue_entries')
             .select(`
                 *,
+                profiles:user_id (ui_language),
                 appointments ( id, start_time, checked_in_at ),
                 service_providers (id, name),
                 queue_entry_services (

@@ -283,6 +283,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
             .from('businesses')
             .select(`
                 id,
+                owner_id,
                 name,
                 slug,
                 open_time,
@@ -297,6 +298,13 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
 
         if (businessError || !business) {
             return res.status(404).json({ status: 'error', message: 'Business not found' });
+        }
+
+        if (business.owner_id) {
+            const { data: owner } = await supabase.from('profiles').select('ui_language').eq('id', business.owner_id).single();
+            if (owner?.ui_language) {
+                business.language = owner.ui_language;
+            }
         }
 
         const queueIds = business.queues.map((q: any) => q.id);

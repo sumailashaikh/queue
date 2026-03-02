@@ -262,7 +262,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
             .from('appointments')
             .select(`
                 *,
-                profiles (full_name, id, phone),
+                profiles (full_name, id, phone, ui_language),
                 appointment_services!appointment_id (
                     services!service_id (id, name, duration_minutes, translations)
                 ),
