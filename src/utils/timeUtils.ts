@@ -23,15 +23,26 @@ export const isBusinessOpen = (business: { open_time: string; close_time: string
     const open = normalize(business.open_time || '09:00:00');
     const close = normalize(business.close_time || '21:00:00');
 
-    // 3. Compare as strings (HH:mm:ss format allows direct string comparison)
-    if (istTimeStr < open) {
-        const displayOpen = formatTime12(open);
-        return { isOpen: false, message: `The business is not open yet. It opens at ${displayOpen}.` };
-    }
+    // 3. Handle midnight crossover (e.g., open 10:00, close 02:00)
+    const closesNextDay = close < open;
 
-    if (istTimeStr > close) {
-        const displayClose = formatTime12(close);
-        return { isOpen: false, message: `The business is closed for the day. It closed at ${displayClose}.` };
+    if (closesNextDay) {
+        // If it closes next day, it is closed ONLY between close time and open time.
+        // e.g. close=02:00, open=10:00. Closed if current time is between 02:00 and 10:00.
+        if (istTimeStr >= close && istTimeStr < open) {
+            const displayOpen = formatTime12(open);
+            return { isOpen: false, message: `The business is not open yet. It opens at ${displayOpen}.` };
+        }
+    } else {
+        // Normal case (open 09:00, close 21:00)
+        if (istTimeStr < open) {
+            const displayOpen = formatTime12(open);
+            return { isOpen: false, message: `The business is not open yet. It opens at ${displayOpen}.` };
+        }
+        if (istTimeStr >= close) {
+            const displayClose = formatTime12(close);
+            return { isOpen: false, message: `The business is closed for the day. It closed at ${displayClose}.` };
+        }
     }
 
     return { isOpen: true };
@@ -69,13 +80,29 @@ export const parseTimeToMinutes = (timeStr: string): number => {
  * Reject if estimated_end_time > (closing_time - buffer_minutes)
  */
 export const canCompleteBeforeClosing = (
-    business: { close_time: string },
+    business: { close_time: string; open_time?: string },
     currentWaitMins: number,
     serviceDurationMins: number,
     bufferMins: number = 10 // Default 10 min buffer
 ): { canJoin: boolean; finishTimeStr?: string; closingTimeStr?: string; message?: string } => {
     const nowMins = getISTMinutes();
-    const closeMins = parseTimeToMinutes(business.close_time);
+    const openMins = parseTimeToMinutes(business.open_time || '09:00:00'); // Use default if not provided
+    let closeMins = parseTimeToMinutes(business.close_time);
+
+    const closesNextDay = closeMins < openMins;
+
+    // Adjust closeMins if the business closes on the next day
+    if (closesNextDay) {
+        // If current time is before the 'next day' closing time (e.g., 01:00 AM, closes 02:00 AM)
+        // OR if current time is after the open time (e.g., 10:00 PM, closes 02:00 AM next day)
+        // We need to determine if the closing time refers to today or tomorrow.
+        if (nowMins >= openMins) {
+            // If current time is after open time, the closing time is on the next day
+            closeMins += (24 * 60);
+        }
+        // If nowMins < openMins (e.g., 01:00 AM, open 10:00 AM, close 02:00 AM),
+        // then closeMins is already correct for the current day's early morning closing.
+    }
 
     // estimated_start_time = max(current_time, last_estimated_end_in_queue)
     // currentWaitMins already represents (last_estimated_end_in_queue - current_time) if positive
