@@ -249,6 +249,7 @@ export const joinQueue = async (req: Request, res: Response) => {
         if (error) throw error;
 
         // Junction table insertion
+        // Junction table insertion
         if (selectedServices.length > 0) {
             const junctionEntries = selectedServices.map((service: any) => ({
                 queue_entry_id: data.id,
@@ -257,6 +258,14 @@ export const joinQueue = async (req: Request, res: Response) => {
                 duration_minutes: service.duration_minutes || 0
             }));
             await supabase.from('queue_entry_services').insert(junctionEntries);
+        } else {
+            // Provide a bare-minimum service slot for manual additions
+            await supabase.from('queue_entry_services').insert([{
+                queue_entry_id: data.id,
+                service_id: null,
+                price: queueInfo.businesses?.default_price || 0,
+                duration_minutes: queueInfo.businesses?.default_duration || 5
+            }]);
         }
 
         // Send Notifications
@@ -1665,7 +1674,7 @@ export const skipQueueEntry = async (req: Request, res: Response) => {
             .maybeSingle();
 
         if (!nextEntry) {
-            return res.status(400).json({ status: 'error', message: 'Customer is already at the end of the queue.' });
+            return res.status(400).json({ status: 'error', message: 'queue.err_end_reached' });
         }
 
         // 3. Swap positions
