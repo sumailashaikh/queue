@@ -1003,15 +1003,22 @@ export const getQueueStatus = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Token is required' });
         }
 
-        // 1. Get the entry and basic business info
         const { data: entry, error: entryError } = await supabase
             .from('queue_entries')
-            .select('*, queues(*, businesses(name, slug, phone, language))')
+            .select('*, queues(*, businesses(name, slug, phone, language, owner_id))')
             .eq('status_token', token)
             .single();
 
         if (entryError || !entry) {
             return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        let businessLang = entry.queues?.businesses?.language || 'en';
+        if (entry.queues?.businesses?.owner_id) {
+            const { data: profile } = await supabase.from('profiles').select('ui_language').eq('id', entry.queues.businesses.owner_id).maybeSingle();
+            if (profile?.ui_language) {
+                businessLang = profile.ui_language;
+            }
         }
 
         // 2. Get currently serving person for this queue
@@ -1102,7 +1109,7 @@ export const getQueueStatus = async (req: Request, res: Response) => {
                 business_name: entry.queues?.businesses?.name,
                 business_slug: entry.queues?.businesses?.slug,
                 business_phone: entry.queues?.businesses?.phone,
-                business_language: entry.queues?.businesses?.language || 'en',
+                business_language: businessLang,
                 display_token: entry.ticket_number,
                 current_serving: currentServing?.ticket_number || 'None',
                 current_specialist: currentServing?.service_providers?.name || 'Expert',
