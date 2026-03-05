@@ -100,11 +100,19 @@ export const createQueue = async (req: Request, res: Response) => {
     }
 };
 
+import fs from 'fs';
+
 export const joinQueue = async (req: Request, res: Response) => {
     try {
-        const { queue_id, customer_name, phone, service_ids, entry_source, appointment_id } = req.body; // entry_source and appointment_id
+        const { queue_id, customer_name, phone, service_ids, entry_source, appointment_id } = req.body;
         const user_id = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        const logState = (msg: string) => {
+            fs.appendFileSync('join_debug.log', `[${new Date().toISOString()}] ${msg}\n`);
+        };
+
+        logState(`Join attempt for Queue: ${queue_id} | Name: ${customer_name}`);
 
         if (!queue_id) {
             return res.status(400).json({ status: 'error', message: 'Queue ID is required' });
@@ -172,10 +180,20 @@ export const joinQueue = async (req: Request, res: Response) => {
             .eq('entry_date', todayStr)
             .in('status', ['waiting', 'serving']);
 
-        let currentWaitTime = 0;
+        let currentWaitTimeTotal = 0;
         entriesAhead?.forEach((e: any) => {
-            currentWaitTime += (e.total_duration_minutes || 10);
+            currentWaitTimeTotal += (e.total_duration_minutes || 10);
         });
+
+        // Fetch active providers count to divide wait time (Capacity)
+        const { count: activeProviders } = await supabase
+            .from('service_providers')
+            .select('*', { count: 'exact', head: true })
+            .eq('business_id', queueInfo.business_id)
+            .eq('is_active', true);
+
+        const providerCount = Math.max(1, activeProviders || 1);
+        const currentWaitTime = Math.round(currentWaitTimeTotal / providerCount);
 
         // Fetch selected services for duration
         let selectedServices = [];
@@ -191,6 +209,9 @@ export const joinQueue = async (req: Request, res: Response) => {
 
         // 2. Closing Time Protection Logic
         if (queueInfo?.businesses) {
+            logState(`Checking capacity: Wait=${currentWaitTime}, Service=${serviceDuration}, Providers=${providerCount}`);
+            logState(`Business Data: ${JSON.stringify(queueInfo.businesses)}`);
+
             const closingProtection = require('../utils/timeUtils').canCompleteBeforeClosing(
                 queueInfo.businesses,
                 currentWaitTime,
@@ -199,11 +220,13 @@ export const joinQueue = async (req: Request, res: Response) => {
             );
 
             if (!closingProtection.canJoin) {
+                logState(`REJECTED: ${closingProtection.message}`);
                 return res.status(400).json({
                     status: 'error',
                     message: closingProtection.message || `We’re fully booked for today. Please book for tomorrow.`
                 });
             }
+            logState(`Capacity check PASSED.`);
         }
 
         // 3. Get next position
@@ -218,11 +241,14 @@ export const joinQueue = async (req: Request, res: Response) => {
         const nextPosition = (maxPosData && maxPosData.length > 0) ? maxPosData[0].position + 1 : 1;
         const ticket_number = `Q-${nextPosition}`;
         const status_token = crypto.randomUUID();
+        console.log(`[joinQueue] Next position: ${nextPosition}, Ticket number: ${ticket_number}`);
 
         const total_price = selectedServices.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0);
         const serviceNamesDisplay = selectedServices.map((s: any) => s.name).join(', ') || 'General';
+        console.log(`[joinQueue] Total price: ${total_price}, Service names display: ${serviceNamesDisplay}`);
 
         // 4. Insert Entry with entry_source
+        console.log(`[joinQueue] Inserting new queue entry.`);
         const { data, error } = await supabase
             .from('queue_entries')
             .insert([
@@ -239,8 +265,7 @@ export const joinQueue = async (req: Request, res: Response) => {
                     entry_date: todayStr,
                     total_price,
                     total_duration_minutes: serviceDuration,
-                    entry_source: entry_source || 'online',
-                    appointment_id: appointment_id || null // Link appointment if provided
+                    entry_source: entry_source || 'online'
                 }
             ])
             .select()
@@ -248,7 +273,6 @@ export const joinQueue = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        // Junction table insertion
         // Junction table insertion
         if (selectedServices.length > 0) {
             const junctionEntries = selectedServices.map((service: any) => ({
@@ -1022,8 +1046,8 @@ export const getQueueStatus = async (req: Request, res: Response) => {
             return res.status(404).json({ status: 'error', message: 'Entry not found' });
         }
 
-        let businessLang = entry.queues?.businesses?.language || 'en';
-        if (entry.queues?.businesses?.owner_id) {
+        let businessLang = entry.ui_language || entry.queues?.businesses?.language || 'en';
+        if (!entry.ui_language && entry.queues?.businesses?.owner_id) {
             const { data: profile } = await supabase.from('profiles').select('ui_language').eq('id', entry.queues.businesses.owner_id).maybeSingle();
             if (profile?.ui_language) {
                 businessLang = profile.ui_language;
@@ -1832,6 +1856,46 @@ export const restoreQueueEntry = async (req: Request, res: Response) => {
             data
         });
 
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const initializeEntryTasks = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        // 1. Check if tasks already exist
+        const { data: existing } = await supabase
+            .from('queue_entry_services')
+            .select('id')
+            .eq('queue_entry_id', id);
+
+        if (existing && existing.length > 0) {
+            return res.status(200).json({ status: 'success', message: 'Tasks already initialized' });
+        }
+
+        // 2. Fetch entry and business info for default values
+        const { data: entry } = await supabase
+            .from('queue_entries')
+            .select('*, queues(businesses(default_price, default_duration))')
+            .eq('id', id)
+            .single();
+
+        if (!entry) {
+            return res.status(404).json({ status: 'error', message: 'Entry not found' });
+        }
+
+        // 3. Insert default manual service slot
+        await supabase.from('queue_entry_services').insert([{
+            queue_entry_id: id,
+            service_id: null,
+            price: entry.queues?.businesses?.default_price || 0,
+            duration_minutes: entry.queues?.businesses?.default_duration || 10
+        }]);
+
+        res.status(200).json({ status: 'success', message: 'Tasks initialized' });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
     }

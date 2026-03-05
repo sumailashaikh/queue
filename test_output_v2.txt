@@ -1,0 +1,15 @@
+﻿--- Test 1: Single Object (Current Behavior, Should Pass) ---
+[isBusinessOpen] Now: 11:49:43 | Open: 09:00:00 | Close: 21:00:00
+isBusinessOpen: true
+[canCompleteBeforeClosing] Now: 709 | Wait: 30 | Service: 30 | EstEnd: 769 | Limit: 1250 (Close: 1260)
+canCompleteBeforeClosing: true
+
+--- Test 2: Array (Suspected Bug, Should Fail) ---
+[isBusinessOpen] Now: 11:49:43 | Open: 09:00:00 | Close: 21:00:00
+isBusinessOpen: true (Message: undefined )
+[canCompleteBeforeClosing] Now: 709 | Wait: 30 | Service: 30 | EstEnd: 769 | Limit: 1250 (Close: 1260)
+canCompleteBeforeClosing: true (Message: undefined )
+
+--- Test 3: Missing Close Time (Potential Bug) ---
+[canCompleteBeforeClosing] Now: 709 | Wait: 30 | Service: 30 | EstEnd: 769 | Limit: 1250 (Close: 1260)
+canCompleteBeforeClosing (Missing close_time): true (Message: undefined )

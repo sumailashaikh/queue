@@ -3,7 +3,14 @@
  * All calculations are based on Asia/Kolkata (IST) timezone
  */
 
-export const isBusinessOpen = (business: { open_time: string; close_time: string; is_closed: boolean }): { isOpen: boolean; message?: string } => {
+export const isBusinessOpen = (bizInput: any): { isOpen: boolean; message?: string } => {
+    // 0. Handle array vs object
+    const business = Array.isArray(bizInput) ? bizInput[0] : bizInput;
+
+    if (!business) {
+        return { isOpen: false, message: "Business information is missing." };
+    }
+
     // 1. Check manual closure
     if (business.is_closed) {
         return { isOpen: false, message: "The business is currently closed by the owner." };
@@ -22,6 +29,8 @@ export const isBusinessOpen = (business: { open_time: string; close_time: string
     const normalize = (t: string) => (t && t.length === 5) ? `${t}:00` : t;
     const open = normalize(business.open_time || '09:00:00');
     const close = normalize(business.close_time || '21:00:00');
+
+    console.log(`[isBusinessOpen] Now: ${istTimeStr} | Open: ${open} | Close: ${close}`);
 
     // 3. Handle midnight crossover (e.g., open 10:00, close 02:00)
     const closesNextDay = close < open;
@@ -80,46 +89,46 @@ export const parseTimeToMinutes = (timeStr: string): number => {
  * Reject if estimated_end_time > (closing_time - buffer_minutes)
  */
 export const canCompleteBeforeClosing = (
-    business: { close_time: string; open_time?: string },
+    bizInput: any,
     currentWaitMins: number,
     serviceDurationMins: number,
     bufferMins: number = 10 // Default 10 min buffer
 ): { canJoin: boolean; finishTimeStr?: string; closingTimeStr?: string; message?: string } => {
+    // 0. Handle array vs object
+    const business = Array.isArray(bizInput) ? bizInput[0] : bizInput;
+
+    if (!business) {
+        return { canJoin: true }; // Fallback
+    }
+
     const nowMins = getISTMinutes();
-    const openMins = parseTimeToMinutes(business.open_time || '09:00:00'); // Use default if not provided
-    let closeMins = parseTimeToMinutes(business.close_time);
+    const openMins = parseTimeToMinutes(business.open_time || '09:00:00');
+    const closeTime = business.close_time || '21:00:00';
+    let closeMins = parseTimeToMinutes(closeTime);
 
     const closesNextDay = closeMins < openMins;
 
     // Adjust closeMins if the business closes on the next day
     if (closesNextDay) {
-        // If current time is before the 'next day' closing time (e.g., 01:00 AM, closes 02:00 AM)
-        // OR if current time is after the open time (e.g., 10:00 PM, closes 02:00 AM next day)
-        // We need to determine if the closing time refers to today or tomorrow.
-        if (nowMins >= openMins) {
-            // If current time is after open time, the closing time is on the next day
+        if (nowMins >= (openMins - 120)) { // 2 hour grace before opening to consider it "towards closing"
             closeMins += (24 * 60);
         }
-        // If nowMins < openMins (e.g., 01:00 AM, open 10:00 AM, close 02:00 AM),
-        // then closeMins is already correct for the current day's early morning closing.
     }
 
-    // estimated_start_time = max(current_time, last_estimated_end_in_queue)
-    // currentWaitMins already represents (last_estimated_end_in_queue - current_time) if positive
-    // So estimated_start_time = current_time + currentWaitMins
     const estimatedStartMins = nowMins + currentWaitMins;
     const estimatedEndMins = estimatedStartMins + serviceDurationMins;
-
     const limitMins = closeMins - bufferMins;
 
+    console.log(`[canCompleteBeforeClosing] Now: ${nowMins} | Wait: ${currentWaitMins} | Service: ${serviceDurationMins} | EstEnd: ${estimatedEndMins} | Limit: ${limitMins} (Close: ${closeMins})`);
+
     if (estimatedEndMins > limitMins) {
-        const h = Math.floor(estimatedEndMins / 60);
+        const h = Math.floor(estimatedEndMins / 60) % 24;
         const m = estimatedEndMins % 60;
         const finishTimeStr = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;
         return {
             canJoin: false,
             finishTimeStr: formatTime12(finishTimeStr),
-            closingTimeStr: formatTime12(business.close_time),
+            closingTimeStr: formatTime12(closeTime),
             message: "We’re fully booked for today. Please select a slot for tomorrow."
         };
     }

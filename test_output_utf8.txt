@@ -1,0 +1,11 @@
+﻿--- Test 1: Single Object (Current Behavior, Should Pass) ---
+isBusinessOpen: true
+canCompleteBeforeClosing: true
+
+--- Test 2: Array (Suspected Bug, Should Fail) ---
+isBusinessOpen: true (Message: undefined )
+canCompleteBeforeClosing: true (Message: undefined )
+
+--- Test 3: Missing Close Time (Potential Bug) ---
+canCompleteBeforeClosing (Missing close_time): true (Message: undefined )
+
