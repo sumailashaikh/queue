@@ -89,7 +89,7 @@ export const getAllBusinesses = async (req: any, res: Response) => {
             .from('businesses')
             .select(`
                 *,
-                owner:profiles!owner_id (full_name, phone)
+                owner:profiles!owner_id (id, full_name, phone, status, is_verified)
             `)
             .order('created_at', { ascending: false });
 
@@ -202,7 +202,8 @@ export const getBusinessDetails = async (req: any, res: Response) => {
                 total_price,
                 queue_entry_services!queue_entry_id (
                     services!service_id (id, name, price)
-                )
+                ),
+                queues!inner (business_id)
             `)
             .eq('queues.business_id', id)
             .eq('entry_date', todayStr);
