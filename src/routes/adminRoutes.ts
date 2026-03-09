@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getAllUsers, updateUserRole, getAllBusinesses, updateUserStatus, inviteAdmin, createUser, getBusinessDetails } from '../controllers/adminController';
+import { getAllUsers, updateUserRole, getAllBusinesses, updateUserStatus, inviteAdmin, createUser, getBusinessDetails, getGlobalStats } from '../controllers/adminController';
 import { requireAuth, requireAdmin } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -18,5 +18,6 @@ router.post('/invite', inviteAdmin);
 // Business Oversight
 router.get('/businesses', getAllBusinesses);
 router.get('/businesses/:id/details', getBusinessDetails);
+router.get('/stats', getGlobalStats);
 
 export default router;

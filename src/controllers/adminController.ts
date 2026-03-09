@@ -360,3 +360,61 @@ export const createUser = async (req: any, res: Response) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 };
+
+/**
+ * Get platform-wide statistics (Admin Only)
+ */
+export const getGlobalStats = async (req: any, res: Response) => {
+    try {
+        const supabase = req.supabase;
+
+        // 1. Total Users
+        const { count: totalUsers, error: uError } = await supabase
+            .from('profiles')
+            .select('*', { count: 'exact', head: true });
+
+        if (uError) throw uError;
+
+        // 2. Total Businesses
+        const { count: totalBusinesses, error: bError } = await supabase
+            .from('businesses')
+            .select('*', { count: 'exact', head: true });
+
+        if (bError) throw bError;
+
+        // 3. Pending Verifications (profiles with status 'pending')
+        const { count: pendingVerifications, error: pError } = await supabase
+            .from('profiles')
+            .select('*', { count: 'exact', head: true })
+            .eq('status', 'pending');
+
+        if (pError) throw pError;
+
+        // 4. Calculate Platform Health (e.g., % of businesses that are active/verified)
+        // For now, let's just return a realistic % based on verified vs total businesses
+        const { count: verifiedOwners, error: vError } = await supabase
+            .from('profiles')
+            .select('*', { count: 'exact', head: true })
+            .eq('role', 'owner')
+            .eq('is_verified', true);
+
+        if (vError) throw vError;
+
+        const health = totalBusinesses && totalBusinesses > 0
+            ? Math.round((verifiedOwners || 0) / (totalBusinesses) * 100)
+            : 100;
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                totalUsers: totalUsers || 0,
+                activeBusinesses: totalBusinesses || 0,
+                pendingVerifications: pendingVerifications || 0,
+                platformHealth: `${health}%`
+            }
+        });
+    } catch (error: any) {
+        console.error('[ADMIN] GetGlobalStats Error:', error);
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
