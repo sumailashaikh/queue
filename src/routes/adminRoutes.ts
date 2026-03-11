@@ -16,8 +16,8 @@ router.patch('/users/:id/status', updateUserStatus);
 router.post('/invite', inviteAdmin);
 
 // Business Oversight
+router.get('/stats', getGlobalStats);
 router.get('/businesses', getAllBusinesses);
 router.get('/businesses/:id/details', getBusinessDetails);
-router.get('/stats', getGlobalStats);
 
 export default router;

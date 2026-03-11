@@ -279,7 +279,7 @@ export const getBusinessDetails = async (req: any, res: Response) => {
         let waitTimeCount = 0;
         const { data: waitStats } = await supabase
             .from('queue_entries')
-            .select('joined_at, served_at')
+            .select('joined_at, served_at, queues!inner(business_id)')
             .eq('queues.business_id', id)
             .eq('entry_date', todayStr)
             .not('served_at', 'is', null);
