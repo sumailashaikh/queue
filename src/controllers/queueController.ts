@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
-import { isBusinessOpen } from '../utils/timeUtils';
+import { isBusinessOpen, getLocalDateString } from '../utils/timeUtils';
 import { recomputeProviderDelays } from '../utils/delayLogic';
 
 export const getAllQueues = async (req: Request, res: Response) => {
@@ -122,7 +122,17 @@ export const joinQueue = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'User ID, Customer Name, or Appointment ID is required' });
         }
 
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        // 0. Get Queue and Business info early
+        const { data: queueInfo, error: queueInfoError } = await supabase
+            .from('queues')
+            .select('*, businesses(name, open_time, close_time, is_closed, timezone)')
+            .eq('id', queue_id)
+            .single();
+
+        if (queueInfoError || !queueInfo) throw queueInfoError || new Error("Queue not found");
+
+        const timezone = queueInfo.businesses?.timezone || 'UTC';
+        const todayStr = getLocalDateString(timezone);
 
         // --- STRONG APP RULE: Appointment Validation ---
         if (appointment_id) {
@@ -136,7 +146,7 @@ export const joinQueue = async (req: Request, res: Response) => {
                 return res.status(404).json({ status: 'error', message: 'Appointment not found' });
             }
 
-            const apptDateStr = new Date(appt.start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+            const apptDateStr = getLocalDateString(timezone, new Date(appt.start_time));
             const now = new Date();
             const gracePeriodMins = 30;
             const isExpired = now > new Date(new Date(appt.start_time).getTime() + gracePeriodMins * 60000);
@@ -154,15 +164,6 @@ export const joinQueue = async (req: Request, res: Response) => {
             }
         }
         // ----------------------------------------------
-
-        // 0. Get Queue and Business info
-        const { data: queueInfo, error: queueInfoError } = await supabase
-            .from('queues')
-            .select('*, businesses(name, open_time, close_time, is_closed)')
-            .eq('id', queue_id)
-            .single();
-
-        if (queueInfoError) throw queueInfoError;
 
         // Check Business Hours (Basic Open/Closed)
         if (queueInfo?.businesses) {
@@ -427,7 +428,10 @@ export const getMyQueues = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        // Get user's first business to determine timezone
+        const { data: userBiz } = await supabase.from('businesses').select('timezone').eq('owner_id', userId).limit(1).single();
+        const timezone = userBiz?.timezone || 'UTC';
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
         console.log(`Fetching queues for user ${userId}, today is ${todayStr}`);
 
         // Get queues where the business owner is ME
@@ -477,15 +481,19 @@ export const getTodayQueue = async (req: Request, res: Response) => {
         }
 
         // Get current date in YYYY-MM-DD format
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-        console.log(`Fetching today's queue for id: ${id}, date: ${todayStr}`);
-
-        // 1. Get queue business_id to process appointments
+        // 0. Get queue business_id and timezone
         const { data: qData } = await supabase
             .from('queues')
-            .select('business_id')
+            .select('business_id, businesses(timezone)')
             .eq('id', id)
             .single();
+
+        if (!qData) {
+            return res.status(404).json({ status: 'error', message: 'Queue not found' });
+        }
+
+        const timezone = qData.businesses?.timezone || 'UTC';
+        const todayStr = getLocalDateString(timezone);
 
         if (qData) {
             const now = new Date();
@@ -654,13 +662,18 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
             .from('queue_entries')
             .select(`
                 *,
-                queues!inner (business_id, status),
+                queues!inner (
+                    business_id, 
+                    status,
+                    businesses (timezone)
+                ),
                 queue_entry_services (service_id)
             `)
             .eq('id', id)
             .single();
 
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const timezone = currentEntry?.queues?.businesses?.timezone || 'UTC';
+        const todayStr = getLocalDateString(timezone);
 
         // Backend-level Walk-in / Direct Serve Block
         if (status === 'serving') {
@@ -755,7 +768,11 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
 
             // Send "serving started" SMS with ETA
             const recipient = currentEntry?.phone || (currentEntry?.user_id ? `User-${currentEntry.user_id}` : `Guest-${currentEntry?.customer_name}`);
-            const etaStr = estEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+            const etaStr = estEnd.toLocaleTimeString('en-IN', { 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                timeZone: timezone 
+            });
             await notificationService.sendSMS(recipient, `Hello ${currentEntry?.customer_name}, your service has started! Estimated completion is ${etaStr}. Thank you!`);
         }
 
@@ -1000,8 +1017,12 @@ export const resetQueueEntries = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // Get current date string (India Time)
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        // Get business timezone
+        const { data: qData } = await supabase.from('queues').select('businesses(timezone)').eq('id', id).single();
+        const timezone = qData?.businesses?.timezone || 'UTC';
+
+        // Get current date string (Business Local Time)
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
         console.log(`Resetting queue entries for queue ${id} on date ${todayStr} by user ${userId}`);
 
@@ -1167,7 +1188,11 @@ export const nextEntry = async (req: Request, res: Response) => {
     try {
         const { queue_id } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // Get business timezone
+        const { data: qData } = await supabase.from('queues').select('businesses(timezone)').eq('id', queue_id).single();
+        const timezone = qData?.businesses?.timezone || 'UTC';
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
         if (!queue_id) {
             return res.status(400).json({ status: 'error', message: 'Queue ID is required' });
@@ -1252,7 +1277,11 @@ export const extendTime = async (req: Request, res: Response) => {
         const { id } = req.params;
         const { additional_minutes } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+
+        // Get business timezone
+        const { data: eData } = await supabase.from('queue_entries').select('queues(businesses(timezone))').eq('id', id).single();
+        const timezone = eData?.queues?.businesses?.timezone || 'UTC';
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
         if (!additional_minutes || isNaN(additional_minutes)) {
             return res.status(400).json({ status: 'error', message: 'Valid additional_minutes is required' });
@@ -1303,7 +1332,7 @@ export const extendTime = async (req: Request, res: Response) => {
 
             if (nextPeople && nextPeople.length > 0) {
                 const next = nextPeople[0];
-                const etaStr = newEstEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+                const etaStr = newEstEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: timezone });
                 const recipient = next.phone || (next.user_id ? `User-${next.user_id}` : `Guest-${next.customer_name}`);
 
                 await notificationService.sendSMS(recipient, `Hello ${next.customer_name}, there is a small delay in the queue. Your estimated turn is now around ${etaStr}. We appreciate your patience!`);
@@ -1825,7 +1854,7 @@ export const restoreQueueEntry = async (req: Request, res: Response) => {
         if (biz?.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Forbidden' });
 
         // Verify it's from today (Only allow restoration for same-day no-shows)
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: biz?.timezone || 'UTC' });
         if (entry.entry_date !== todayStr) {
             return res.status(400).json({
                 status: 'error',

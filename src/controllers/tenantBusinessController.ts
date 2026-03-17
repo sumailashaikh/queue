@@ -39,6 +39,12 @@ export const createBusiness = async (req: Request, res: Response) => {
                 is_verified: true,
                 created_at: new Date().toISOString()
             }], { onConflict: 'id' });
+        } else {
+            // PROACTIVE: Ensure existing owner is active and verified when they create a business
+            console.log(`[BUSINESS] Activating profile for user ${userId}`);
+            await supabase.from('profiles')
+                .update({ status: 'active', is_verified: true })
+                .eq('id', userId);
         }
 
         if (!name || !slug) {
@@ -89,9 +95,20 @@ export const createBusiness = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
+        // NEW: Auto-create a default queue for the new business
+        // This prevents the "Door's Closed!" error on the public profile
+        console.log(`[BUSINESS] Creating default queue for business ${data.id}`);
+        await supabase.from('queues').insert([{
+            business_id: data.id,
+            name: 'Main Queue',
+            status: 'open',
+            current_wait_time_minutes: 0,
+            created_at: new Date().toISOString()
+        }]);
+
         res.status(201).json({
             status: 'success',
-            message: 'Business created successfully',
+            message: 'Business created successfully with default queue',
             data
         });
 
@@ -276,7 +293,10 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
     try {
         const { slug } = req.params;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        // Fetch business for timezone
+        const { data: bizInfo } = await supabase.from('businesses').select('timezone').eq('slug', slug).single();
+        const timezone = bizInfo?.timezone || 'UTC';
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
         // 1. Get Business and its Queues
         const { data: business, error: businessError } = await supabase

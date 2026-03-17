@@ -6,7 +6,6 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
         const userId = req.user?.id;
         const businessId = req.query.business_id as string;
         const range = (req.query.range as string) || 'daily';
-        const dateParam = (req.query.date as string) || new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
@@ -18,10 +17,10 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
 
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
-        // Verify ownership
+        // Verify ownership and get timezone
         const { data: business, error: bizError } = await supabase
             .from('businesses')
-            .select('id')
+            .select('id, timezone')
             .eq('id', businessId)
             .eq('owner_id', userId)
             .single();
@@ -30,11 +29,13 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Forbidden' });
         }
 
-        // --- Calculate Time Boundaries (Asia/Kolkata) ---
-        // dateParam is "YYYY-MM-DD"
+        const timezone = business.timezone || 'UTC';
+        const dateParam = (req.query.date as string) || new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+
+        // --- Calculate Time Boundaries ---
         let startISO: string, endISO: string;
 
-        const parseIST = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const parseLocal = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: timezone });
 
         if (range === 'weekly') {
             const date = new Date(dateParam);
@@ -43,8 +44,8 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
             const mon = new Date(date.setDate(diff));
             const sun = new Date(new Date(mon).setDate(mon.getDate() + 6));
 
-            startISO = `${parseIST(mon)}T00:00:00.000+05:30`;
-            endISO = `${parseIST(sun)}T23:59:59.999+05:30`;
+            startISO = `${parseLocal(mon)}T00:00:00.000`;
+            endISO = `${parseLocal(sun)}T23:59:59.999`;
         } else if (range === 'monthly') {
             const date = new Date(dateParam);
             const y = date.getFullYear();
@@ -52,12 +53,12 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
             const first = new Date(y, m, 1);
             const last = new Date(y, m + 1, 0);
 
-            startISO = `${parseIST(first)}T00:00:00.000+05:30`;
-            endISO = `${parseIST(last)}T23:59:59.999+05:30`;
+            startISO = `${parseLocal(first)}T00:00:00.000`;
+            endISO = `${parseLocal(last)}T23:59:59.999`;
         } else {
             // Daily
-            startISO = `${dateParam}T00:00:00.000+05:30`;
-            endISO = `${dateParam}T23:59:59.999+05:30`;
+            startISO = `${dateParam}T00:00:00.000`;
+            endISO = `${dateParam}T23:59:59.999`;
         }
 
         // --- Fetch Completed Tasks ---
@@ -167,7 +168,7 @@ export const getDailySummary = async (req: Request, res: Response) => {
         // 1. Get businesses owned by this user
         const { data: businesses, error: businessError } = await supabase
             .from('businesses')
-            .select('id')
+            .select('id, timezone')
             .eq('owner_id', userId);
 
         if (businessError) throw businessError;
@@ -186,8 +187,9 @@ export const getDailySummary = async (req: Request, res: Response) => {
 
         const businessIds = businesses.map((b: any) => b.id);
 
-        // Get current date string (India Time)
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        // Get current date string (Business Time)
+        const timezone = businesses[0]?.timezone || 'UTC';
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
         // 2. Fetch all entries for today across all queues of these businesses
         const { data: qEntries, error: qError } = await supabase

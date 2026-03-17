@@ -188,8 +188,15 @@ export const getBusinessDetails = async (req: any, res: Response) => {
         const { id } = req.params;
         const supabase = req.supabase;
 
-        // Get current date string (India Time)
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        // Get business details including timezone
+        const { data: businessInfo } = await supabase
+            .from('businesses')
+            .select('timezone')
+            .eq('id', id)
+            .single();
+
+        const timezone = businessInfo?.timezone || 'UTC';
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
         const { data: qEntries, error: qError } = await supabase
             .from('queue_entries')

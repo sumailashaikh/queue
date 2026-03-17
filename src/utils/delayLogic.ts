@@ -11,9 +11,16 @@ import { notificationService } from '../services/notificationService';
 export const recomputeProviderDelays = async (providerId: string, businessId: string, currentTaskEstEnd: Date) => {
     try {
         console.log(`[delayLogic] Recomputing delays for provider ${providerId} starting from ${currentTaskEstEnd.toISOString()}`);
-
-        // 1. Fetch upcoming appointments for this provider today that are NOT in_service, completed, cancelled, or no_show
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        
+        // 0. Fetch business timezone
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('timezone')
+            .eq('id', businessId)
+            .single();
+        
+        const timezone = business?.timezone || 'UTC';
+        const todayStr = require('./timeUtils').getLocalDateString(timezone);
 
         const { data: upcomingAppointments, error } = await supabase
             .from('appointments')
@@ -33,18 +40,23 @@ export const recomputeProviderDelays = async (providerId: string, businessId: st
 
         for (const appt of upcomingAppointments) {
             // Parse the scheduled start time of the appointment
-            const apptStart = new Date(`${appt.appointment_date}T${appt.appointment_time}+05:30`);
+            // Since appointment_time is HH:mm:ss or HH:mm, we combine with date and parse in local timezone
+            const [h, m] = appt.appointment_time.split(':').map(Number);
+            const apptStart = new Date(appt.appointment_date);
+            // We need to set the time correctly in the business timezone.
+            // A simple way is to use the offset, but offsets change.
+            // For now, let's use the same logic as elsewhere or assume the DB stores it in a way we can combine.
+            
+            // Actually, we can just compare minutes since midnight for simplicity
+            const apptMins = h * 60 + m;
+            const rollingMins = require('./timeUtils').getLocalMinutes(timezone, rollingEstEnd);
+            
+            const delayMinutes = Math.max(0, rollingMins - apptMins);
 
-            // Calculate delay minutes: max(0, rollingEstEnd - apptStart)
-            const diffMs = rollingEstEnd.getTime() - apptStart.getTime();
-            const delayMinutes = Math.max(0, Math.floor(diffMs / 60000));
-
-            const expectedStartAt = new Date(apptStart.getTime() + delayMinutes * 60000);
+            const expectedStartAt = new Date(rollingEstEnd.getTime() > new Date(appt.appointment_date + 'T' + appt.appointment_time).getTime() ? rollingEstEnd.getTime() : new Date(appt.appointment_date + 'T' + appt.appointment_time).getTime()); // Simplified
             const duration = Number(appt.duration_minutes || 0);
             const expectedEndAt = new Date(expectedStartAt.getTime() + duration * 60000);
             const isDelayed = delayMinutes >= 10;
-
-            console.log(`[delayLogic] Appt ${appt.id} scheduled at ${apptStart.toISOString()}, expected at ${expectedStartAt.toISOString()} (Delay: ${delayMinutes}m)`);
 
             // Check if we need to send a notification
             // We only send if it crossed the 10m threshold AND it hasn't been delayed previously (we can check if is_delayed was false before)
@@ -62,7 +74,11 @@ export const recomputeProviderDelays = async (providerId: string, businessId: st
                 .eq('id', appt.id);
 
             if (shouldNotify && appt.phone) {
-                const expectedTimeStr = expectedStartAt.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+                const expectedTimeStr = expectedStartAt.toLocaleTimeString('en-IN', { 
+                    hour: '2-digit', 
+                    minute: '2-digit', 
+                    timeZone: timezone 
+                });
                 const message = `We're currently serving guests and operating at full capacity. Your appointment is expected at ${expectedTimeStr}. Thank you for your patience.`;
                 console.log(`[delayLogic] Sending delay WhatsApp to ${appt.phone}: ${message}`);
 

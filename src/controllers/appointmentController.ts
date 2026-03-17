@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
-import { isBusinessOpen } from '../utils/timeUtils';
+import { isBusinessOpen, getLocalMinutes, getLocalDateString } from '../utils/timeUtils';
 import { recomputeProviderDelays } from '../utils/delayLogic';
 
 export const createAppointment = async (req: Request, res: Response) => {
@@ -27,7 +27,7 @@ export const createAppointment = async (req: Request, res: Response) => {
         // Check business hours
         const { data: business, error: bizError } = await supabase
             .from('businesses')
-            .select('name, open_time, close_time, is_closed')
+            .select('name, open_time, close_time, is_closed, timezone')
             .eq('id', business_id)
             .single();
 
@@ -57,16 +57,17 @@ export const createAppointment = async (req: Request, res: Response) => {
 
         // Buffer for closing time protection
         const bufferMins = 15;
-        const nowMins = require('../utils/timeUtils').getISTMinutes();
+        const timezone = business.timezone || 'UTC';
+        const nowMins = getLocalMinutes(timezone);
         const closeMins = require('../utils/timeUtils').parseTimeToMinutes(business.close_time);
 
         // Check if appointment date is today
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
-        const apptDateStr = new Date(start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const todayStr = getLocalDateString(timezone);
+        const apptDateStr = getLocalDateString(timezone, new Date(start_time));
 
         if (todayStr === apptDateStr) {
             // For today, we consider current time vs start time
-            const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+            const startMins = getLocalMinutes(timezone, new Date(start_time));
             const estEndMins = startMins + totalDuration;
 
             if (estEndMins > (closeMins - 10)) {
@@ -77,7 +78,7 @@ export const createAppointment = async (req: Request, res: Response) => {
             }
         } else {
             // For future days, just check against closing time
-            const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+            const startMins = getLocalMinutes(timezone, new Date(start_time));
             const estEndMins = startMins + totalDuration;
             if (estEndMins > (closeMins - 10)) {
                 return res.status(400).json({
@@ -221,7 +222,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
         // 1. Get businesses owned by user
         const { data: businesses, error: businessError } = await supabase
             .from('businesses')
-            .select('id')
+            .select('id, timezone')
             .eq('owner_id', userId);
 
         if (businessError) throw businessError;
@@ -237,7 +238,8 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
         const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
 
         // Auto mark no_show for today's past due appointments
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const primaryTimezone = businesses[0]?.timezone || 'UTC';
+        const todayStr = getLocalDateString(primaryTimezone);
         const { data: expiredAppointments } = await supabase
             .from('appointments')
             .update({ status: 'no_show' })
@@ -285,7 +287,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
             if (isLate) appointmentState = 'LATE';
             if (appt.status === 'scheduled' && now < startTime) appointmentState = 'UPCOMING';
 
-            const isToday = new Date(appt.start_time).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }) === todayStr;
+            const isToday = getLocalDateString(primaryTimezone, new Date(appt.start_time)) === todayStr;
             const isTerminal = ['completed', 'no_show', 'cancelled'].includes(appt.status);
 
             const activeQueueEntry = (appt.queue_entries || []).find((q: any) => !['completed', 'cancelled', 'no_show', 'skipped'].includes(q.status));
@@ -331,7 +333,7 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
             .from('appointments')
             .select(`
                 *,
-                businesses!business_id (id, name, owner_id, checkin_creates_queue_entry),
+                businesses!business_id (id, name, owner_id, checkin_creates_queue_entry, timezone),
                 appointment_services!appointment_id (
                     id, price, duration_minutes,
                     services!service_id (id, name)
@@ -346,7 +348,8 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         const business = Array.isArray(appointment.businesses) ? appointment.businesses[0] : appointment.businesses;
         if (!business || business.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const timezone = business.timezone || 'UTC';
+        const todayStr = getLocalDateString(timezone);
         const currentStatus = appointment.status;
 
         // Terminal status check
@@ -440,7 +443,7 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
         // Fetch business for closing time validation
         const { data: business, error: bizError } = await supabase
             .from('businesses')
-            .select('name, close_time, is_closed')
+            .select('name, close_time, is_closed, timezone')
             .eq('id', business_id)
             .single();
 
@@ -470,8 +473,9 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
 
         // Buffer for closing time protection
         const bufferMins = 10;
+        const timezone = business.timezone || 'UTC';
         const closeMins = require('../utils/timeUtils').parseTimeToMinutes(business.close_time);
-        const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+        const startMins = getLocalMinutes(timezone, new Date(start_time));
         const estEndMins = startMins + totalDuration;
 
         if (estEndMins > (closeMins - bufferMins)) {
@@ -623,7 +627,7 @@ export const rescheduleAppointment = async (req: Request, res: Response) => {
             .from('appointments')
             .select(`
                 *,
-                businesses (close_time, owner_id, name),
+                businesses (close_time, owner_id, name, timezone),
                 appointment_services (duration_minutes)
             `)
             .eq('id', id)
@@ -640,8 +644,9 @@ export const rescheduleAppointment = async (req: Request, res: Response) => {
 
         // 3. Closing time re-validation
         const totalDuration = appointment.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 30;
+        const timezone = appointment.businesses?.timezone || 'UTC';
         const closeMins = require('../utils/timeUtils').parseTimeToMinutes(appointment.businesses.close_time);
-        const startMins = require('../utils/timeUtils').getISTMinutes(new Date(start_time));
+        const startMins = getLocalMinutes(timezone, new Date(start_time));
         const estEndMins = startMins + totalDuration;
 
         if (estEndMins > (closeMins - 10)) {
@@ -669,7 +674,8 @@ export const rescheduleAppointment = async (req: Request, res: Response) => {
 
         // Notify client
         const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
-        await notificationService.sendSMS(recipient, `Your appointment at ${appointment.businesses.name} has been rescheduled to ${new Date(start_time).toLocaleString('en-IN')}.`);
+        const displayTime = new Date(start_time).toLocaleString('en-IN', { timeZone: timezone });
+        await notificationService.sendSMS(recipient, `Your appointment at ${appointment.businesses.name} has been rescheduled to ${displayTime}.`);
 
         res.status(200).json({
             status: 'success',

@@ -1,6 +1,6 @@
 /**
  * Utility functions for business hours and time comparisons
- * All calculations are based on Asia/Kolkata (IST) timezone
+ * Calculations are based on the business's configured timezone (defaulting to UTC)
  */
 
 export const isBusinessOpen = (bizInput: any): { isOpen: boolean; message?: string } => {
@@ -16,10 +16,10 @@ export const isBusinessOpen = (bizInput: any): { isOpen: boolean; message?: stri
         return { isOpen: false, message: "The business is currently closed by the owner." };
     }
 
-    // 2. Get current time in Asia/Kolkata
+    // 2. Get current time in local timezone
     const now = new Date();
     const istTimeStr = now.toLocaleTimeString('en-GB', {
-        timeZone: 'Asia/Kolkata',
+        timeZone: business.timezone || 'UTC',
         hour12: false,
         hour: '2-digit',
         minute: '2-digit',
@@ -59,17 +59,24 @@ export const isBusinessOpen = (bizInput: any): { isOpen: boolean; message?: stri
 
 
 /**
- * Gets the current minutes since midnight in IST
+ * Gets the current minutes since midnight in a specific timezone
  */
-export const getISTMinutes = (date: Date = new Date()): number => {
-    const istTimeStr = date.toLocaleTimeString('en-GB', {
-        timeZone: 'Asia/Kolkata',
+export const getLocalMinutes = (timezone: string = 'UTC', date: Date = new Date()): number => {
+    const timeStr = date.toLocaleTimeString('en-GB', {
+        timeZone: timezone,
         hour12: false,
         hour: '2-digit',
         minute: '2-digit'
     });
-    const [h, m] = istTimeStr.split(':').map(Number);
+    const [h, m] = timeStr.split(':').map(Number);
     return (h * 60) + m;
+};
+
+/**
+ * Gets the current date string (YYYY-MM-DD) in a specific timezone
+ */
+export const getLocalDateString = (timezone: string = 'UTC', date: Date = new Date()): string => {
+    return date.toLocaleDateString('en-CA', { timeZone: timezone });
 };
 
 /**
@@ -101,7 +108,8 @@ export const canCompleteBeforeClosing = (
         return { canJoin: true }; // Fallback
     }
 
-    const nowMins = getISTMinutes();
+    const timezone = business.timezone || 'UTC';
+    const nowMins = getLocalMinutes(timezone);
     const openMins = parseTimeToMinutes(business.open_time || '09:00:00');
     const closeTime = business.close_time || '21:00:00';
     let closeMins = parseTimeToMinutes(closeTime);

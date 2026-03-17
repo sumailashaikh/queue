@@ -79,8 +79,15 @@ export const getServiceProviders = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
+        // Determine the target timezone
+        let timezone = 'UTC';
+        if (business_id) {
+            const { data: biz } = await supabase.from('businesses').select('timezone').eq('id', business_id).single();
+            if (biz?.timezone) timezone = biz.timezone;
+        }
+
         // Determine the target date for availability
-        const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
         // Fetch all active leaves for these providers on the target date
         let leavesOnTargetDate: any[] = [];
@@ -111,10 +118,10 @@ export const getServiceProviders = async (req: Request, res: Response) => {
         }
 
         // Enhance with current task count and availability
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
         const now = new Date();
         const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-        const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: timezone });
 
         const enhancedProviders = await Promise.all((providers || []).map(async (p: any) => {
             let currentTasksCount = 0;
@@ -645,9 +652,13 @@ export const getBulkLeaveStatus = async (req: Request, res: Response) => {
             .eq('business_id', business_id)
             .eq('is_active', true);
 
-        const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        // Get business timezone
+        const { data: bizInfo } = await supabase.from('businesses').select('timezone').eq('id', business_id).single();
+        const timezone = bizInfo?.timezone || 'UTC';
+
+        const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: timezone });
         const tomorrow = new Date(new Date(targetDateStr).getTime() + 24 * 60 * 60 * 1000);
-        const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+        const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: timezone });
 
         const { data: leaves } = await supabase
             .from('provider_leaves')
