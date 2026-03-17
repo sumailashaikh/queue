@@ -6,7 +6,8 @@ const COUNTRY_DEFAULTS: Record<string, { currency: string, timezone: string, lan
     'IN': { currency: 'INR', timezone: 'Asia/Kolkata', language: 'hi' },
     'AE': { currency: 'AED', timezone: 'Asia/Dubai', language: 'ar' },
     'US': { currency: 'USD', timezone: 'America/New_York', language: 'en' },
-    'GB': { currency: 'GBP', timezone: 'Europe/London', language: 'en' }
+    'GB': { currency: 'GBP', timezone: 'Europe/London', language: 'en' },
+    'SA': { currency: 'SAR', timezone: 'Asia/Riyadh', language: 'ar' }
 };
 
 export const createBusiness = async (req: Request, res: Response) => {
