@@ -29,7 +29,7 @@ export const getAllQueues = async (req: Request, res: Response) => {
 
 export const createQueue = async (req: Request, res: Response) => {
     try {
-        const { name, description, service_id } = req.body;
+        const { name, description, service_id, business_id } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         // Basic validation
@@ -46,35 +46,48 @@ export const createQueue = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // Find the business owned by this user
-        // We use the same simple logic that works in getMyQueues
-        console.log(`[createQueue] Looking for business for owner: ${userId}`);
-        const { data: businesses, error: businessError } = await supabase
-            .from('businesses')
-            .select('id')
-            .eq('owner_id', userId);
+        // 1. Link to the correct business
+        let targetBusinessId = business_id;
 
-        if (businessError) {
-            console.error('[createQueue] Business lookup error:', businessError);
-            return res.status(500).json({ status: 'error', message: businessError.message });
+        if (!targetBusinessId) {
+            // Fallback: Find the first business owned by this user
+            console.log(`[createQueue] No business_id provided, looking for business for owner: ${userId}`);
+            const { data: businesses, error: businessError } = await supabase
+                .from('businesses')
+                .select('id')
+                .eq('owner_id', userId);
+
+            if (businessError || !businesses || businesses.length === 0) {
+                return res.status(404).json({
+                    status: 'error',
+                    message: 'No business found for this user. Create a business first.'
+                });
+            }
+            targetBusinessId = businesses[0].id;
+        } else {
+            // Verify ownership of the provided business_id
+            const { data: biz, error: bizError } = await supabase
+                .from('businesses')
+                .select('id')
+                .eq('id', targetBusinessId)
+                .eq('owner_id', userId)
+                .single();
+
+            if (bizError || !biz) {
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'Business not found or access denied'
+                });
+            }
         }
 
-        if (!businesses || businesses.length === 0) {
-            console.warn(`[createQueue] No business found for user: ${userId}`);
-            return res.status(404).json({
-                status: 'error',
-                message: 'No business found for this user. Create a business first.'
-            });
-        }
-
-        const business = businesses[0];
-        console.log(`[createQueue] Found business: ${business.id}. Proceeding to create queue: ${name}`);
+        console.log(`[createQueue] Using business: ${targetBusinessId}. Proceeding to create queue: ${name}`);
 
         const { data, error } = await supabase
             .from('queues')
             .insert([
                 {
-                    business_id: business.id, // <--- IMPORTANT LINK
+                    business_id: targetBusinessId,
                     name,
                     description,
                     service_id,
