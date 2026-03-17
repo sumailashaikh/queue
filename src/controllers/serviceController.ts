@@ -44,6 +44,19 @@ export const createService = async (req: Request, res: Response) => {
             }
         }
 
+        // Check for duplicate service name within the same business
+        console.log(`[DEBUG] Checking for duplicate service: "${name}" in business: ${businessIdToUse}`);
+        const { data: existingServices, error: checkError } = await supabase
+            .from('services')
+            .select('id')
+            .eq('business_id', businessIdToUse)
+            .ilike('name', name.trim());
+
+        if (existingServices && existingServices.length > 0) {
+            console.log(`[DEBUG] Duplicate found: ${existingServices.length} matching rows.`);
+            return res.status(400).json({ status: 'error', message: 'A service with this name already exists' });
+        }
+
         const { data, error } = await supabase
             .from('services')
             .insert([
