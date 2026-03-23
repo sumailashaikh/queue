@@ -2,12 +2,16 @@ import { Router } from 'express';
 import { joinQueue, getQueueStatus } from '../controllers/queueController';
 import { bookPublicAppointment } from '../controllers/appointmentController';
 import { getBusinessDisplayData } from '../controllers/tenantBusinessController';
+import { getPublicPlatformStats } from '../controllers/publicController';
 import { basicRateLimiter } from '../middleware/rateLimiter';
 
 const router = Router();
 
 // Apply rate limiting to all public endpoints
 router.use(basicRateLimiter);
+
+// Platform Stats Public Endpoints
+router.get('/platform-stats', getPublicPlatformStats);
 
 // Business Public Endpoints
 router.get('/business/:slug/display-data', getBusinessDisplayData);
