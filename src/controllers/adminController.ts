@@ -176,18 +176,28 @@ export const inviteAdmin = async (req: any, res: Response) => {
             console.log(`[ADMIN] User not found, falling back to pending_registrations for phone:`, phone);
             
             // Insert into pending_registrations so they get the role upon first login
-            const { error: pendingError } = await supabase
-                .from('pending_registrations')
-                .upsert([{
-                    phone: phone,
-                    role: 'admin',
-                    is_verified: true,
-                    full_name: 'Invited Admin'
-                }]);
+            try {
+                const { error: pendingError } = await supabase
+                    .from('pending_registrations')
+                    .upsert([{
+                        phone: phone,
+                        role: 'admin',
+                        is_verified: true,
+                        full_name: 'Invited Admin'
+                    }]);
 
-            if (pendingError) {
-                console.error('[ADMIN] Failed to save pending registration:', pendingError);
-                return res.status(500).json({ status: 'error', message: 'Failed to save invitation. Please try again.' });
+                if (pendingError) {
+                    if (pendingError.code === 'P0001' || pendingError.message?.includes('relation "pending_registrations" does not exist')) {
+                        return res.status(500).json({ 
+                            status: 'error', 
+                            message: 'Onboarding system not initialized. Please run the SQL script "fix_onboarding.sql" in your Supabase Dashboard to enable invitations for new users.' 
+                        });
+                    }
+                    throw pendingError;
+                }
+            } catch (pErr: any) {
+                console.error('[ADMIN] Invite pending fallback failed:', pErr);
+                return res.status(500).json({ status: 'error', message: 'Admin invitation failed. Please ensure the project database is fully updated.' });
             }
 
             return res.status(200).json({
@@ -406,13 +416,23 @@ export const createUser = async (req: any, res: Response) => {
             try {
                 const { full_name, phone, role } = req.body;
                 const supabase = req.supabase || require('../config/supabaseClient').supabase;
-                await supabase.from('pending_registrations').upsert([{
+                const { error: pError } = await supabase.from('pending_registrations').upsert([{
                     phone: phone,
                     full_name: full_name,
                     role: role || 'owner',
                     is_verified: true
                 }]);
                 
+                if (pError) {
+                    if (pError.message?.includes('relation "pending_registrations" does not exist')) {
+                        return res.status(500).json({ 
+                            status: 'error', 
+                            message: 'Action blocked: Onboarding system not ready. Please run the "fix_onboarding.sql" script in your Supabase SQL Editor to support inviting new users.' 
+                        });
+                    }
+                    throw pError;
+                }
+
                 return res.status(201).json({
                     status: 'success',
                     message: `User pre-registered successfully. Since this number is not yet in our system, they will be automatically set up as ${role || 'owner'} when they login for the first time via Mobile OTP.`
