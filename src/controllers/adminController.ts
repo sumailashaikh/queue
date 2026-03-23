@@ -176,7 +176,7 @@ export const inviteAdmin = async (req: any, res: Response) => {
             console.log(`[ADMIN] User not found for phone formats:`, uniqueFormats);
             return res.status(404).json({
                 status: 'error',
-                message: 'User profile not found. The user must login at least once using OTP before they can be promoted to Admin.'
+                message: 'No profile found for this number. The person you are inviting must login to the app at least once using OTP to create their account before they can be promoted to Admin.'
             });
         }
 
@@ -384,10 +384,13 @@ export const createUser = async (req: any, res: Response) => {
     } catch (error: any) {
         console.error('[ADMIN] CreateUser Error:', error);
         let message = error.message;
+        let statusCode = 500;
+        
         if (error.code === '23503' || (error.message && error.message.includes('foreign key'))) {
-            message = "Cannot create profile directly. Due to security, the user must first login via mobile OTP to create their account, then you can manage them here.";
+            statusCode = 400;
+            message = "This user cannot be manually created yet. Due to system security, they must first sign in to the app themselves using Mobile OTP to initialize their account. After that, you can update their role here.";
         }
-        res.status(500).json({ status: 'error', message });
+        res.status(statusCode).json({ status: 'error', message });
     }
 };
 
