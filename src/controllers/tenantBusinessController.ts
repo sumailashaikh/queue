@@ -99,13 +99,19 @@ export const createBusiness = async (req: Request, res: Response) => {
         // NEW: Auto-create a default queue for the new business
         // This prevents the "Door's Closed!" error on the public profile
         console.log(`[BUSINESS] Creating default queue for business ${data.id}`);
-        await supabase.from('queues').insert([{
+        const { error: queueError } = await supabase.from('queues').insert([{
             business_id: data.id,
             name: 'Main Queue',
             status: 'open',
             current_wait_time_minutes: 0,
             created_at: new Date().toISOString()
         }]);
+
+        if (queueError) {
+            console.error(`[BUSINESS] Failed to create default queue for business ${data.id}:`, queueError);
+            // We don't necessarily want to fail the whole business creation if just the queue fails,
+            // but we should definitely log it.
+        }
 
         res.status(201).json({
             status: 'success',
