@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
+import { notificationService } from '../services/notificationService';
 
 /**
  * Get all users registered on the platform
@@ -200,6 +201,9 @@ export const inviteAdmin = async (req: any, res: Response) => {
                 return res.status(500).json({ status: 'error', message: 'Admin invitation failed. Please ensure the project database is fully updated.' });
             }
 
+            const msg = `Hello! You have been invited as an Admin on QueueUp. Please login with your phone number to gain access: https://queue-admin-182k.vercel.app/`;
+            await notificationService.sendWhatsApp(phone, msg);
+
             return res.status(200).json({
                 status: 'success',
                 message: 'No existing profile found. This number has been successfully pre-registered as an Admin. They will receive their role automatically as soon as they login to the app with this number.'
@@ -214,6 +218,10 @@ export const inviteAdmin = async (req: any, res: Response) => {
             .single();
 
         if (error) throw error;
+
+        // Send WhatsApp Notification for existing user promotion
+        const welcomeMsg = `Hello ${profile.full_name}! You have been promoted to Admin on QueueUp. Please login to your dashboard here: https://queue-admin-182k.vercel.app/`;
+        await notificationService.sendWhatsApp(profile.phone, welcomeMsg);
 
         res.status(200).json({
             status: 'success',
@@ -433,6 +441,9 @@ export const createUser = async (req: any, res: Response) => {
                     throw pError;
                 }
 
+                const msg = `Hello ${full_name || 'there'}! You have been added as a ${role || 'Owner'} on QueueUp. Please login to your management portal here: https://queue-admin-182k.vercel.app/`;
+                await notificationService.sendWhatsApp(phone, msg);
+                
                 return res.status(201).json({
                     status: 'success',
                     message: `User pre-registered successfully. Since this number is not yet in our system, they will be automatically set up as ${role || 'owner'} when they login for the first time via Mobile OTP.`

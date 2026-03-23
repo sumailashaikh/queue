@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
+import { notificationService } from '../services/notificationService';
 
 export const sendOtp = async (req: Request, res: Response) => {
     try {
@@ -114,6 +115,10 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
                             // Clean up
                             await supabase.from('pending_registrations').delete().eq('phone', phone);
+
+                            // Notify via WhatsApp
+                            const msg = `Welcome back! Your account has been automatically upgraded to ${pending.role} on QueueUp. You can now access your management tools.`;
+                            await notificationService.sendWhatsApp(phone, msg);
                         }
                     } catch (pErr) {
                         console.error('[AUTH] Pending check failed:', pErr);
