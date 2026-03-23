@@ -400,12 +400,12 @@ export const createUser = async (req: any, res: Response) => {
     } catch (error: any) {
         console.error('[ADMIN] CreateUser Error:', error);
         
-        // If it's a FK or RLS error, it usually means the user doesn't exist in auth.
+        // If it's a FK (23503), NOT-NULL (23502) or RLS error, it usually means the user doesn't exist in auth.
         // Let's try to save it to pending_registrations as a fallback.
-        if (error.code === '23503' || error.message?.includes('violates row-level security')) {
+        if (['23503', '23502', '42501'].includes(error.code) || error.message?.includes('violates') || error.message?.includes('security')) {
             try {
                 const { full_name, phone, role } = req.body;
-                const supabase = req.supabase;
+                const supabase = req.supabase || require('../config/supabaseClient').supabase;
                 await supabase.from('pending_registrations').upsert([{
                     phone: phone,
                     full_name: full_name,
@@ -415,7 +415,7 @@ export const createUser = async (req: any, res: Response) => {
                 
                 return res.status(201).json({
                     status: 'success',
-                    message: `User pre-registered successfully. They will be fully set up as ${role || 'owner'} once they perform their first OTP login.`
+                    message: `User pre-registered successfully. Since this number is not yet in our system, they will be automatically set up as ${role || 'owner'} when they login for the first time via Mobile OTP.`
                 });
             } catch (innerError: any) {
                 console.error('[ADMIN] Pending fallback failed:', innerError);
