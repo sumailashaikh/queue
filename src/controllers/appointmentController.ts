@@ -364,6 +364,13 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         // 1. Sync with Queue
         if (status === 'checked_in' && business.checkin_creates_queue_entry !== false) {
             const { data: queue } = await supabase.from('queues').select('id').eq('business_id', appointment.business_id).eq('status', 'open').limit(1).single();
+            if (!queue) {
+                return res.status(400).json({ 
+                    status: 'error', 
+                    message: 'No open queue found. Please create and open a queue in the Live Queue dashboard first.' 
+                });
+            }
+            
             if (queue) {
                 const { data: existing } = await supabase.from('queue_entries').select('id').eq('appointment_id', id).maybeSingle();
                 if (!existing) {

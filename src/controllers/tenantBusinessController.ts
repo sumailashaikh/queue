@@ -283,6 +283,23 @@ export const getBusinessBySlug = async (req: Request, res: Response) => {
             });
         }
 
+        // AUTO-CREATE QUEUE: If the business exists but has NO queues, create a default one
+        // This ensures public join and check-in always work.
+        if (!data.queues || data.queues.length === 0) {
+            console.log(`[getBusinessBySlug] Auto-creating missing queue for business ${data.id}`);
+            const { data: newQueue, error: qError } = await supabase.from('queues').insert([{
+                business_id: data.id,
+                name: 'Main Queue',
+                status: 'open',
+                current_wait_time_minutes: 0,
+                created_at: new Date().toISOString()
+            }]).select().single();
+
+            if (!qError && newQueue) {
+                data.queues = [newQueue];
+            }
+        }
+
         res.status(200).json({
             status: 'success',
             data
@@ -334,7 +351,23 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
             }
         }
 
-        const queueIds = business.queues.map((q: any) => q.id);
+        // AUTO-CREATE QUEUE: If no queues exist, create a default one
+        if (!business.queues || business.queues.length === 0) {
+            console.log(`[getBusinessDisplayData] Auto-creating missing queue for business ${business.id}`);
+            const { data: newQueue, error: qError } = await supabase.from('queues').insert([{
+                business_id: business.id,
+                name: 'Main Queue',
+                status: 'open',
+                current_wait_time_minutes: 0,
+                created_at: new Date().toISOString()
+            }]).select().single();
+
+            if (!qError && newQueue) {
+                business.queues = [newQueue];
+            }
+        }
+
+        const queueIds = (business.queues || []).map((q: any) => q.id);
 
         // 2. Fetch Active Queue Entries Today
         const { data: queueEntries, error: qError } = await supabase
