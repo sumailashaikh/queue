@@ -363,12 +363,27 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
 
         // 1. Sync with Queue
         if (status === 'checked_in' && business.checkin_creates_queue_entry !== false) {
-            const { data: queue } = await supabase.from('queues').select('id').eq('business_id', appointment.business_id).eq('status', 'open').limit(1).single();
+            let { data: queue } = await supabase.from('queues').select('id').eq('business_id', appointment.business_id).eq('status', 'open').limit(1).single();
+            
+            // AUTO-CREATE QUEUE: If no open queue exists, create a default one on the fly
             if (!queue) {
-                return res.status(400).json({ 
-                    status: 'error', 
-                    message: 'No open queue found. Please create and open a queue in the Live Queue dashboard first.' 
-                });
+                console.log(`[updateAppointmentStatus] Auto-creating missing queue for business ${appointment.business_id}`);
+                const { data: newQueue, error: qError } = await supabase.from('queues').insert([{
+                    business_id: appointment.business_id,
+                    name: 'Main Queue',
+                    status: 'open',
+                    current_wait_time_minutes: 0,
+                    created_at: new Date().toISOString()
+                }]).select().single();
+
+                if (!qError && newQueue) {
+                    queue = { id: newQueue.id };
+                } else {
+                    return res.status(400).json({ 
+                        status: 'error', 
+                        message: 'No open queue found and auto-creation failed.' 
+                    });
+                }
             }
             
             if (queue) {
