@@ -114,8 +114,17 @@ export const updateUserStatus = async (req: any, res: Response) => {
         const supabase = req.supabase;
 
         const updates: any = {};
-        if (status) updates.status = status;
-        if (is_verified !== undefined) updates.is_verified = is_verified;
+        if (status) {
+            updates.status = status;
+            // SYNC: If moving to active, also verify. If blocked, unverify.
+            if (status === 'active') updates.is_verified = true;
+            if (status === 'blocked') updates.is_verified = false;
+        }
+        if (is_verified !== undefined) {
+            updates.is_verified = is_verified;
+            // SYNC: If verified, set status to active
+            if (is_verified === true) updates.status = 'active';
+        }
 
         const { data, error } = await supabase
             .from('profiles')
@@ -148,17 +157,26 @@ export const inviteAdmin = async (req: any, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Phone number is required' });
         }
 
-        // Check if user exists
+        // Check if user exists - Try multiple formats for phone matching robustness
+        const formats = [
+            phone,                                   // e.g. +91 98765 43210
+            phone.replace(/\+/g, ''),               // e.g. 91 98765 43210
+            phone.replace(/\D/g, ''),               // e.g. 919876543210
+            phone.replace(/\D/g, '').slice(-10)     // e.g. 9876543210
+        ];
+        
+        const uniqueFormats = [...new Set(formats)];
         const { data: profile, error: findError } = await supabase
             .from('profiles')
-            .select('id, full_name')
-            .eq('phone', phone)
-            .single();
+            .select('id, full_name, phone')
+            .or(`phone.in.(${uniqueFormats.map(f => `"${f}"`).join(',')})`)
+            .maybeSingle();
 
         if (findError || !profile) {
+            console.log(`[ADMIN] User not found for phone formats:`, uniqueFormats);
             return res.status(404).json({
                 status: 'error',
-                message: 'User not found. Ask them to login once first, then you can promote them.'
+                message: 'User profile not found. The user must login at least once using OTP before they can be promoted to Admin.'
             });
         }
 
@@ -364,7 +382,12 @@ export const createUser = async (req: any, res: Response) => {
             data
         });
     } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+        console.error('[ADMIN] CreateUser Error:', error);
+        let message = error.message;
+        if (error.code === '23503' || (error.message && error.message.includes('foreign key'))) {
+            message = "Cannot create profile directly. Due to security, the user must first login via mobile OTP to create their account, then you can manage them here.";
+        }
+        res.status(500).json({ status: 'error', message });
     }
 };
 
@@ -389,11 +412,12 @@ export const getGlobalStats = async (req: any, res: Response) => {
 
         if (bError) throw bError;
 
-        // 3. Pending Verifications (profiles with status 'pending')
+        // 3. Pending Verifications (profiles where owner is not verified)
         const { count: pendingVerifications, error: pError } = await supabase
             .from('profiles')
             .select('*', { count: 'exact', head: true })
-            .eq('status', 'pending');
+            .eq('is_verified', false)
+            .eq('role', 'owner');
 
         if (pError) throw pError;
 
