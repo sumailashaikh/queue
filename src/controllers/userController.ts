@@ -16,9 +16,16 @@ export const getProfile = async (req: Request, res: Response) => {
             .from('profiles')
             .select('*')
             .eq('id', userId)
-            .single();
+            .maybeSingle();
 
         if (error) throw error;
+
+        if (!data) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'Profile not found'
+            });
+        }
 
         res.status(200).json({
             status: 'success',
