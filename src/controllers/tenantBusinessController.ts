@@ -36,15 +36,15 @@ export const createBusiness = async (req: Request, res: Response) => {
                 id: userId,
                 full_name: 'New Owner',
                 role: 'owner',
-                status: 'active',
-                is_verified: true,
+                status: 'pending',
+                is_verified: false,
                 created_at: new Date().toISOString()
             }], { onConflict: 'id' });
         } else {
             // PROACTIVE: Ensure existing owner is active and verified when they create a business
             console.log(`[BUSINESS] Activating profile for user ${userId}`);
             await supabase.from('profiles')
-                .update({ status: 'active', is_verified: true })
+                .update({ status: 'pending', is_verified: false })
                 .eq('id', userId);
         }
 
