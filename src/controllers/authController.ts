@@ -94,6 +94,30 @@ export const verifyOtp = async (req: Request, res: Response) => {
                     console.error('[AUTH] Failed to create/upsert profile:', insertError);
                 } else {
                     console.log('[AUTH] Profile created/upserted successfully');
+                    
+                    // NEW: Check for pending registrations/promotions
+                    try {
+                        const { data: pending, error: pError } = await supabase
+                            .from('pending_registrations')
+                            .select('*')
+                            .eq('phone', phone)
+                            .maybeSingle();
+
+                        if (pending && !pError) {
+                            console.log(`[AUTH] Found pending registration for ${phone}. Promoting to ${pending.role}...`);
+                            await supabase.from('profiles').update({
+                                role: pending.role,
+                                full_name: pending.full_name !== 'Invited Admin' ? pending.full_name : 'New User',
+                                is_verified: pending.is_verified,
+                                status: pending.status || 'active'
+                            }).eq('id', user.id);
+
+                            // Clean up
+                            await supabase.from('pending_registrations').delete().eq('phone', phone);
+                        }
+                    } catch (pErr) {
+                        console.error('[AUTH] Pending check failed:', pErr);
+                    }
                 }
             } else {
                 // Update phone if missing

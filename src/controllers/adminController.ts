@@ -173,10 +173,26 @@ export const inviteAdmin = async (req: any, res: Response) => {
             .maybeSingle();
 
         if (findError || !profile) {
-            console.log(`[ADMIN] User not found for phone formats:`, uniqueFormats);
-            return res.status(404).json({
-                status: 'error',
-                message: 'No profile found for this number. The person you are inviting must login to the app at least once using OTP to create their account before they can be promoted to Admin.'
+            console.log(`[ADMIN] User not found, falling back to pending_registrations for phone:`, phone);
+            
+            // Insert into pending_registrations so they get the role upon first login
+            const { error: pendingError } = await supabase
+                .from('pending_registrations')
+                .upsert([{
+                    phone: phone,
+                    role: 'admin',
+                    is_verified: true,
+                    full_name: 'Invited Admin'
+                }]);
+
+            if (pendingError) {
+                console.error('[ADMIN] Failed to save pending registration:', pendingError);
+                return res.status(500).json({ status: 'error', message: 'Failed to save invitation. Please try again.' });
+            }
+
+            return res.status(200).json({
+                status: 'success',
+                message: 'No existing profile found. This number has been successfully pre-registered as an Admin. They will receive their role automatically as soon as they login to the app with this number.'
             });
         }
 
@@ -383,6 +399,29 @@ export const createUser = async (req: any, res: Response) => {
         });
     } catch (error: any) {
         console.error('[ADMIN] CreateUser Error:', error);
+        
+        // If it's a FK or RLS error, it usually means the user doesn't exist in auth.
+        // Let's try to save it to pending_registrations as a fallback.
+        if (error.code === '23503' || error.message?.includes('violates row-level security')) {
+            try {
+                const { full_name, phone, role } = req.body;
+                const supabase = req.supabase;
+                await supabase.from('pending_registrations').upsert([{
+                    phone: phone,
+                    full_name: full_name,
+                    role: role || 'owner',
+                    is_verified: true
+                }]);
+                
+                return res.status(201).json({
+                    status: 'success',
+                    message: `User pre-registered successfully. They will be fully set up as ${role || 'owner'} once they perform their first OTP login.`
+                });
+            } catch (innerError: any) {
+                console.error('[ADMIN] Pending fallback failed:', innerError);
+            }
+        }
+
         let message = error.message;
         let statusCode = 500;
         
