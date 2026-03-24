@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { Business } from '../types';
+import { notificationService } from '../services/notificationService';
 
 const COUNTRY_DEFAULTS: Record<string, { currency: string, timezone: string, language: string }> = {
     'IN': { currency: 'INR', timezone: 'Asia/Kolkata', language: 'hi' },
@@ -109,8 +110,26 @@ export const createBusiness = async (req: Request, res: Response) => {
 
         if (queueError) {
             console.error(`[BUSINESS] Failed to create default queue for business ${data.id}:`, queueError);
-            // We don't necessarily want to fail the whole business creation if just the queue fails,
-            // but we should definitely log it.
+        }
+
+        // NEW: Notify Platform Admins about the new business registration
+        try {
+            const { data: admins } = await supabase
+                .from('profiles')
+                .select('phone')
+                .eq('role', 'admin');
+
+            if (admins && admins.length > 0) {
+                const adminMsg = `🚀 New Business Alert: "${name}" has just registered on QueueUp and is pending verification. Please review it in the Admin Console.`;
+                // Notify all admins found
+                for (const admin of admins) {
+                    if (admin.phone) {
+                        await notificationService.sendWhatsApp(admin.phone, adminMsg);
+                    }
+                }
+            }
+        } catch (notifErr) {
+            console.error('[BUSINESS] Admin notification failed:', notifErr);
         }
 
         res.status(201).json({
