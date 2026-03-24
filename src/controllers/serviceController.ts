@@ -198,3 +198,52 @@ export const deleteService = async (req: Request, res: Response) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 };
+
+export const updateService = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const { name, description, duration_minutes, price, translations } = req.body;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // Verify ownership
+        const { data: service } = await supabase.from('services').select('business_id').eq('id', id).single();
+        if (!service) {
+            return res.status(404).json({ status: 'error', message: 'Service not found' });
+        }
+
+        const { data: business } = await supabase.from('businesses').select('owner_id').eq('id', service.business_id).single();
+        if (!business || business.owner_id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized to update this service' });
+        }
+
+        const updates: any = {};
+        if (name) updates.name = name;
+        if (description !== undefined) updates.description = description;
+        if (duration_minutes !== undefined) updates.duration_minutes = duration_minutes;
+        if (price !== undefined) updates.price = Number(price);
+        if (translations) updates.translations = translations;
+
+        const { data, error } = await supabase
+            .from('services')
+            .update(updates)
+            .eq('id', id)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Service updated successfully',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};

@@ -1,6 +1,6 @@
 
 import { Router } from 'express';
-import { createService, getServices, getMyServices, deleteService } from '../controllers/serviceController';
+import { createService, getServices, getMyServices, deleteService, updateService } from '../controllers/serviceController';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -11,6 +11,7 @@ router.get('/business/:businessId', getServices);
 // Protected (Owner)
 router.post('/', requireAuth, createService);
 router.get('/my', requireAuth, getMyServices);
+router.patch('/:id', requireAuth, updateService);
 router.delete('/:id', requireAuth, deleteService);
 
 export default router;
