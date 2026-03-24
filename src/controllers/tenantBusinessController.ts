@@ -116,17 +116,27 @@ export const createBusiness = async (req: Request, res: Response) => {
         try {
             const { data: admins } = await supabase
                 .from('profiles')
-                .select('phone')
+                .select('phone, full_name')
                 .eq('role', 'admin');
 
+            const adminMsg = `🚀 New Business Alert: "${name}" has just registered on QueueUp and is pending verification. Please review it in the Admin Console.`;
+            
+            let notifiedCount = 0;
+
             if (admins && admins.length > 0) {
-                const adminMsg = `🚀 New Business Alert: "${name}" has just registered on QueueUp and is pending verification. Please review it in the Admin Console.`;
                 // Notify all admins found
                 for (const admin of admins) {
                     if (admin.phone) {
-                        await notificationService.sendWhatsApp(admin.phone, adminMsg);
+                        const success = await notificationService.sendWhatsApp(admin.phone, adminMsg);
+                        if (success) notifiedCount++;
                     }
                 }
+            }
+
+            // Fallback: If no admins were notified, try the MASTER_ADMIN_PHONE from env
+            if (notifiedCount === 0 && process.env.MASTER_ADMIN_PHONE) {
+                console.log('[BUSINESS] No database admins notified. Notifying Master Admin from ENV.');
+                await notificationService.sendWhatsApp(process.env.MASTER_ADMIN_PHONE, adminMsg);
             }
         } catch (notifErr) {
             console.error('[BUSINESS] Admin notification failed:', notifErr);
