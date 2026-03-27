@@ -1,4 +1,4 @@
--- Migration: Fix pending_registrations schema and add resignation_requests
+-- Migration: Fix pending_registrations schema, RLS, and add resignation_requests
 -- 0. Ensure helper function exists
 CREATE OR REPLACE FUNCTION trigger_set_timestamp()
 RETURNS TRIGGER AS $$
@@ -8,7 +8,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- 1. Fix pending_registrations table (Add missing business_id)
+-- 1. Fix pending_registrations table (Add missing columns)
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='pending_registrations' AND column_name='business_id') THEN
@@ -20,7 +20,46 @@ BEGIN
     END IF;
 END $$;
 
--- 2. Create resignation_requests table
+-- 2. Repair RLS for pending_registrations
+ALTER TABLE public.pending_registrations ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Owners can insert into pending_registrations" ON public.pending_registrations;
+CREATE POLICY "Owners can insert into pending_registrations"
+ON public.pending_registrations FOR INSERT
+TO authenticated
+WITH CHECK (
+    EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE id = auth.uid()
+        AND role = 'owner'
+    )
+);
+
+DROP POLICY IF EXISTS "Owners can view pending_registrations" ON public.pending_registrations;
+CREATE POLICY "Owners can view pending_registrations"
+ON public.pending_registrations FOR SELECT
+TO authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE id = auth.uid()
+        AND role = 'owner'
+    )
+);
+
+DROP POLICY IF EXISTS "Owners can update pending_registrations" ON public.pending_registrations;
+CREATE POLICY "Owners can update pending_registrations"
+ON public.pending_registrations FOR UPDATE
+TO authenticated
+USING (
+    EXISTS (
+        SELECT 1 FROM public.profiles
+        WHERE id = auth.uid()
+        AND role = 'owner'
+    )
+);
+
+-- 3. Create resignation_requests table
 CREATE TABLE IF NOT EXISTS public.resignation_requests (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     employee_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
@@ -32,17 +71,17 @@ CREATE TABLE IF NOT EXISTS public.resignation_requests (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- 3. Sync updated_at
+-- 4. Sync updated_at
 DROP TRIGGER IF EXISTS set_timestamp_resignation_requests ON public.resignation_requests;
 CREATE TRIGGER set_timestamp_resignation_requests
 BEFORE UPDATE ON public.resignation_requests
 FOR EACH ROW
 EXECUTE PROCEDURE trigger_set_timestamp();
 
--- 4. Enable RLS
+-- 5. Enable RLS
 ALTER TABLE public.resignation_requests ENABLE ROW LEVEL SECURITY;
 
--- 5. Policies for resignation_requests
+-- 6. Policies for resignation_requests
 DROP POLICY IF EXISTS "Employees can view their own resignations" ON public.resignation_requests;
 CREATE POLICY "Employees can view their own resignations"
 ON public.resignation_requests FOR SELECT
