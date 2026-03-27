@@ -524,30 +524,30 @@ export const inviteEmployee = async (req: any, res: Response) => {
             if (pendingError) throw pendingError;
         }
 
-        // 3. Notify via WhatsApp
-        const msg = `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp. Please login to your dashboard here: https://queue-admin-182k.vercel.app/`;
+        // 3. Notify via SMS (Standard text is more reliable than WhatsApp for new accounts)
+        const msg = `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp. Login here: https://queue-admin-182k.vercel.app/`;
         
         if (notificationService.isMock) {
             return res.status(200).json({
                 status: 'success',
-                message: 'Employee added to database, but WhatsApp invitation could not be sent because Twilio is not configured in .env. Please update your TWILIO credentials.',
+                message: 'Employee added, but SMS could not be sent (Twilio not configured). Please update .env.',
                 notified: false
             });
         }
 
-        const notified = await notificationService.sendWhatsApp(phone, msg);
+        const notified = await notificationService.sendSMS(phone, msg);
 
         if (!notified) {
             return res.status(200).json({
                 status: 'success',
-                message: 'Employee added to database, but WhatsApp invitation failed to deliver. Please check your Twilio balance and number permissions.',
+                message: 'Employee added, but SMS failed to deliver. Check your Twilio balance/permissions.',
                 notified: false
             });
         }
 
         res.status(200).json({
             status: 'success',
-            message: 'Employee invited successfully via WhatsApp',
+            message: 'Employee invited successfully via SMS!',
             notified: true
         });
 
