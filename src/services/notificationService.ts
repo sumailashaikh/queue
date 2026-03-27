@@ -5,12 +5,14 @@ dotenv.config();
 
 // Interface for Notification Service
 export interface NotificationService {
+    isMock: boolean;
     sendSMS(to: string, message: string): Promise<boolean>;
     sendWhatsApp(to: string, message: string): Promise<boolean>;
 }
 
 // Mock Implementation (Console Log)
 class MockNotificationService implements NotificationService {
+    isMock = true;
     async sendSMS(to: string, message: string): Promise<boolean> {
         console.log(`[MOCK SMS] To: ${to}, Message: ${message}`);
         return true;
@@ -24,6 +26,7 @@ class MockNotificationService implements NotificationService {
 
 // Twilio Implementation
 class TwilioNotificationService implements NotificationService {
+    isMock = false;
     private client: any;
     private fromNumber: string;
 
