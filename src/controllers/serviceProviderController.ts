@@ -847,6 +847,22 @@ export const submitResignation = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Only employees can submit resignation' });
         }
 
+        // 1.5. Validate date and existing pending requests
+        if (new Date(requested_last_date) < new Date()) {
+            return res.status(400).json({ status: 'error', message: 'Requested last date cannot be in the past' });
+        }
+
+        const { data: existingPending } = await supabase
+            .from('resignation_requests')
+            .select('id')
+            .eq('employee_id', userId)
+            .eq('status', 'PENDING')
+            .maybeSingle();
+
+        if (existingPending) {
+            return res.status(400).json({ status: 'error', message: 'You already have a pending resignation request' });
+        }
+
         // 2. Submit request
         const { data, error } = await supabase
             .from('resignation_requests')
@@ -962,8 +978,30 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
 
         if (updateReqError) throw updateReqError;
 
-        // 3. If APPROVED, set employee to INACTIVE
+        // 3. If APPROVED, set employee to INACTIVE (with safety check)
         if (status === 'APPROVED') {
+            // Safety Check: Active Tasks
+            const { data: provider } = await supabase
+                .from('service_providers')
+                .select('id')
+                .eq('user_id', request.employee_id)
+                .single();
+
+            if (provider) {
+                const { count: taskCount } = await supabase
+                    .from('queue_entry_services')
+                    .select('*', { count: 'exact', head: true })
+                    .eq('assigned_provider_id', provider.id)
+                    .in('task_status', ['pending', 'in_progress']);
+
+                if (taskCount && taskCount > 0) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: `Safety Block: This employee has ${taskCount} active tasks. Please reassign or complete them before approving resignation.`
+                    });
+                }
+            }
+
             const { error: updateEmpError } = await supabase
                 .from('profiles')
                 .update({ status: 'INACTIVE' })
