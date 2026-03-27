@@ -8,6 +8,7 @@ const router = Router();
 router.use(requireAuth);
 
 router.post('/', serviceProviderController.createServiceProvider);
+router.get('/me', serviceProviderController.getMyProviderProfile); // ADD ME
 router.get('/leaves/status', serviceProviderController.getBulkLeaveStatus);
 router.get('/', serviceProviderController.getServiceProviders);
 router.patch('/:id', serviceProviderController.updateServiceProvider);
@@ -20,6 +21,12 @@ router.patch('/assignments/:id', serviceProviderController.assignProviderToEntry
 // Provider Leaves endpoints
 router.get('/:id/leaves', serviceProviderController.getProviderLeaves);
 router.post('/:id/leaves', serviceProviderController.addProviderLeave);
+router.patch('/leaves/:leaveId/status', serviceProviderController.updateLeaveStatus);
 router.delete('/leaves/:leaveId', serviceProviderController.deleteProviderLeave);
+
+// Resignation Resquests
+router.post('/resignation', serviceProviderController.submitResignation);
+router.get('/resignation/list', serviceProviderController.getResignationRequests);
+router.patch('/resignation/:requestId/status', serviceProviderController.updateResignationStatus);
 
 export default router;

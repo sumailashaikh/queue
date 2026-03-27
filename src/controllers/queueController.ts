@@ -27,6 +27,50 @@ export const getAllQueues = async (req: Request, res: Response) => {
     }
 };
 
+export const getMyTasks = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 1. Get today's date in local time (relative to business, but for now we just get UTC today or default)
+        const todayStr = new Date().toISOString().split('T')[0];
+
+        // 2. Fetch entries assigned to this user
+        // We look for assigned_to (Profile ID)
+        const { data, error } = await supabase
+            .from('queue_entries')
+            .select(`
+                *,
+                queue_entry_services (
+                    *,
+                    services (id, name)
+                ),
+                queues (
+                    id,
+                    name,
+                    business_id
+                )
+            `)
+            .or(`assigned_to.eq.${userId}`)
+            .eq('entry_date', todayStr)
+            .in('status', ['serving', 'waiting'])
+            .order('position', { ascending: true });
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            data: data || []
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const createQueue = async (req: Request, res: Response) => {
     try {
         const { name, description, service_id, business_id } = req.body;
@@ -760,6 +804,17 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
                 }
 
                 updates.assigned_provider_id = eligibleProviderId;
+                
+                // Also link to the user profile if the provider has one
+                const { data: provProfile } = await supabase
+                    .from('service_providers')
+                    .select('user_id')
+                    .eq('id', eligibleProviderId)
+                    .single();
+                
+                if (provProfile?.user_id) {
+                    updates.assigned_to = provProfile.user_id;
+                }
 
                 // Update per-service assignment in queue_entry_services
                 await supabase
@@ -772,9 +827,6 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
         if (status === 'serving') {
             const now = new Date();
             const duration = Number(currentEntry?.total_duration_minutes || 0);
-            // service_started_at will be set by startTask (for workflow) 
-            // or when we genuinely start the service.
-            // served_at represents the "Called" event.
             const estEnd = new Date(now.getTime() + duration * 60000);
             updates.estimated_end_at = estEnd.toISOString();
             updates.served_at = now.toISOString();
@@ -792,6 +844,11 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
         if (status === 'completed') {
             const now = new Date();
             updates.completed_at = now.toISOString();
+            updates.completed_by_id = userId;
+            
+            // Determine role
+            const { data: profile } = await supabase.from('profiles').select('role').eq('id', userId).single();
+            updates.completed_by_role = (profile?.role === 'owner' || profile?.role === 'admin') ? 'OWNER' : 'EMPLOYEE';
 
             // Fetch start and estimated end timestamps to calculate actual duration and delay
             const { data: timingData } = await supabase
@@ -1647,7 +1704,9 @@ export const completeTask = async (req: Request, res: Response) => {
                 task_status: 'done',
                 completed_at: now.toISOString(),
                 actual_minutes: actualMinutes,
-                delay_minutes: delayMinutes
+                delay_minutes: delayMinutes,
+                completed_by_id: req.user?.id,
+                completed_by_role: req.user?.role
             })
             .eq('id', id)
             .select()
@@ -1672,11 +1731,16 @@ export const completeTask = async (req: Request, res: Response) => {
 
         if (allDone) {
             // Auto-complete the whole entry
+            const { data: profile } = await supabase.from('profiles').select('role').eq('id', req.user?.id).single();
+            const role = (profile?.role === 'owner' || profile?.role === 'admin') ? 'OWNER' : 'EMPLOYEE';
+
             await supabase
                 .from('queue_entries')
                 .update({
                     status: 'completed',
-                    completed_at: now.toISOString()
+                    completed_at: now.toISOString(),
+                    completed_by_id: req.user?.id,
+                    completed_by_role: role
                 })
                 .eq('id', task.queue_entry_id);
 
@@ -1918,27 +1982,38 @@ export const initializeEntryTasks = async (req: Request, res: Response) => {
             return res.status(200).json({ status: 'success', message: 'Tasks already initialized' });
         }
 
-        // 2. Fetch entry and business info for default values
-        const { data: entry } = await supabase
+        // 2. Fetch entry and business info simply
+        const { data: entry, error: entryErr } = await supabase
             .from('queue_entries')
-            .select('*, queues(businesses(default_price, default_duration))')
+            .select(`
+                id,
+                queue_id
+            `)
             .eq('id', id)
             .single();
 
-        if (!entry) {
+        if (entryErr || !entry) {
+            console.error('[initializeEntryTasks] Entry not found:', id, entryErr);
             return res.status(404).json({ status: 'error', message: 'Entry not found' });
         }
+
+        const { data: queueData } = await supabase
+            .from('queues')
+            .select('business_id, businesses(default_price, default_duration)')
+            .eq('id', entry.queue_id)
+            .single();
 
         // 3. Insert default manual service slot
         await supabase.from('queue_entry_services').insert([{
             queue_entry_id: id,
             service_id: null,
-            price: entry.queues?.businesses?.default_price || 0,
-            duration_minutes: entry.queues?.businesses?.default_duration || 10
+            price: (queueData as any)?.businesses?.default_price || 0,
+            duration_minutes: (queueData as any)?.businesses?.default_duration || 10
         }]);
 
         res.status(200).json({ status: 'success', message: 'Tasks initialized' });
     } catch (error: any) {
+        console.error('[initializeEntryTasks] Global error:', error);
         res.status(500).json({ status: 'error', message: error.message });
     }
 };

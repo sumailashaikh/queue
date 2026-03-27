@@ -251,6 +251,31 @@ export const deleteServiceProvider = async (req: Request, res: Response) => {
     }
 };
 
+export const getMyProviderProfile = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { data, error } = await supabase
+            .from('service_providers')
+            .select('*, businesses(*), services:provider_services(services(*))')
+            .eq('user_id', userId)
+            .single();
+
+        if (error || !data) {
+            return res.status(404).json({ status: 'error', message: 'Provider profile not found' });
+        }
+
+        res.status(200).json({ status: 'success', data });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const assignProviderServices = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // provider_id
@@ -527,22 +552,28 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 2. Overlap check application level (in case DB exclusion constraints aren't sufficient/present)
+        // 2. Overlap check application level
         const { data: overlaps } = await supabase
             .from('provider_leaves')
             .select('id')
             .eq('provider_id', id)
             .lte('start_date', end_date)
-            .gte('end_date', start_date);
+            .gte('end_date', start_date)
+            .neq('status', 'REJECTED'); // Don't count rejected leaves
 
         if (overlaps && overlaps.length > 0) {
             return res.status(400).json({
                 status: 'error',
-                message: 'This provider already has a leave scheduled during these dates.'
+                message: 'This provider already has a leave scheduled or pending during these dates.'
             });
         }
 
-        // 3. Insert leave
+        // 3. Determine status based on role
+        const { data: profile } = await supabase.from('profiles').select('role, full_name').eq('id', userId).single();
+        const isAdminOrOwner = profile?.role === 'owner' || profile?.role === 'admin';
+        const status = isAdminOrOwner ? 'APPROVED' : 'PENDING';
+
+        // 4. Insert leave
         const { data, error } = await supabase
             .from('provider_leaves')
             .insert([{
@@ -551,16 +582,105 @@ export const addProviderLeave = async (req: Request, res: Response) => {
                 start_date,
                 end_date,
                 leave_type,
-                note
+                note,
+                status,
+                approved_by: isAdminOrOwner ? userId : null
             }])
             .select()
             .single();
 
         if (error) throw error;
 
+        // 5. Notify
+        if (!isAdminOrOwner) {
+            // Notify Owner
+            const { data: biz } = await supabase.from('businesses').select('owner_id, name').eq('id', provider.business_id).single();
+            if (biz?.owner_id) {
+                const { data: owner } = await supabase.from('profiles').select('phone').eq('id', biz.owner_id).single();
+                if (owner?.phone) {
+                    const msg = `New leave request from ${profile?.full_name || 'Employee'} for ${biz.name} from ${start_date} to ${end_date}.`;
+                    const { notificationService } = require('../services/notificationService');
+                    await notificationService.sendWhatsApp(owner.phone, msg);
+                }
+            }
+        }
+
         res.status(201).json({
             status: 'success',
-            message: 'Leave added successfully',
+            message: isAdminOrOwner ? 'Leave added successfully' : 'Leave request submitted successfully',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const updateLeaveStatus = async (req: Request, res: Response) => {
+    try {
+        const { leaveId } = req.params;
+        const { status } = req.body; // APPROVED or REJECTED
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        if (!['APPROVED', 'REJECTED'].includes(status)) {
+            return res.status(400).json({ status: 'error', message: 'Invalid status' });
+        }
+
+        // 1. Verify ownership
+        const { data: leave } = await supabase
+            .from('provider_leaves')
+            .select('*, service_providers(name, phone, user_id)')
+            .eq('id', leaveId)
+            .single();
+
+        if (!leave) {
+            return res.status(404).json({ status: 'error', message: 'Leave not found' });
+        }
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', leave.business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 2. Update status
+        const { data, error } = await supabase
+            .from('provider_leaves')
+            .update({ status, approved_by: userId })
+            .eq('id', leaveId)
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // 3. Notify Employee
+        let recipientPhone = leave.service_providers?.phone;
+        if (!recipientPhone && leave.service_providers?.user_id) {
+            const { data: empProfile } = await supabase.from('profiles').select('phone').eq('id', leave.service_providers.user_id).single();
+            recipientPhone = empProfile?.phone;
+        }
+
+        if (recipientPhone) {
+            const { notificationService } = require('../services/notificationService');
+            const msg = status === 'APPROVED' 
+                ? `Your leave request from ${leave.start_date} to ${leave.end_date} has been approved.`
+                : `Your leave request from ${leave.start_date} to ${leave.end_date} has been declined. Please contact your manager for further details.`;
+            await notificationService.sendWhatsApp(recipientPhone, msg);
+        }
+
+        res.status(200).json({
+            status: 'success',
+            message: `Leave ${status.toLowerCase()} successfully`,
             data
         });
 
@@ -695,6 +815,173 @@ export const getBulkLeaveStatus = async (req: Request, res: Response) => {
         res.status(200).json({
             status: 'success',
             data: results
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+// ----------------------------------------------------
+// Resignation Requests
+// ----------------------------------------------------
+
+export const submitResignation = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const { reason, requested_last_date } = req.body;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 1. Get employee details
+        const { data: employee } = await supabase
+            .from('profiles')
+            .select('id, business_id, full_name')
+            .eq('id', userId)
+            .single();
+
+        if (!employee || employee.role !== 'employee') {
+            return res.status(403).json({ status: 'error', message: 'Only employees can submit resignation' });
+        }
+
+        // 2. Submit request
+        const { data, error } = await supabase
+            .from('resignation_requests')
+            .insert([{
+                employee_id: userId,
+                business_id: employee.business_id,
+                reason,
+                requested_last_date,
+                status: 'PENDING'
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+
+        // 3. Notify Owner
+        const { data: business } = await supabase.from('businesses').select('owner_id').eq('id', employee.business_id).single();
+        if (business?.owner_id) {
+            const { data: owner } = await supabase.from('profiles').select('phone').eq('id', business.owner_id).single();
+            if (owner?.phone) {
+                const msg = `Resignation request received from ${employee.full_name}. Reason: ${reason || 'Not provided'}. Requested Last Date: ${requested_last_date || 'N/A'}.`;
+                const { notificationService } = require('../services/notificationService');
+                await notificationService.sendWhatsApp(owner.phone, msg);
+            }
+        }
+
+        res.status(201).json({
+            status: 'success',
+            message: 'Resignation request submitted successfully',
+            data
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const getResignationRequests = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const { business_id } = req.query;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        // 1. Verify owner
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 2. Fetch requests
+        const { data, error } = await supabase
+            .from('resignation_requests')
+            .select('*, profiles:employee_id(full_name, phone)')
+            .eq('business_id', business_id)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            data: data || []
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const updateResignationStatus = async (req: Request, res: Response) => {
+    try {
+        const { requestId } = req.params;
+        const { status } = req.body; // APPROVED or REJECTED
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!['APPROVED', 'REJECTED'].includes(status)) {
+            return res.status(400).json({ status: 'error', message: 'Invalid status' });
+        }
+
+        // 1. Verify request and ownership
+        const { data: request } = await supabase
+            .from('resignation_requests')
+            .select('*')
+            .eq('id', requestId)
+            .single();
+
+        if (!request) {
+            return res.status(404).json({ status: 'error', message: 'Request not found' });
+        }
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', request.business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 2. Update request
+        const { error: updateReqError } = await supabase
+            .from('resignation_requests')
+            .update({ status })
+            .eq('id', requestId);
+
+        if (updateReqError) throw updateReqError;
+
+        // 3. If APPROVED, set employee to INACTIVE
+        if (status === 'APPROVED') {
+            const { error: updateEmpError } = await supabase
+                .from('profiles')
+                .update({ status: 'INACTIVE' })
+                .eq('id', request.employee_id);
+
+            if (updateEmpError) throw updateEmpError;
+
+            // Notify Employee
+            const { data: emp } = await supabase.from('profiles').select('phone').eq('id', request.employee_id).single();
+            if (emp?.phone) {
+                const { notificationService } = require('../services/notificationService');
+                await notificationService.sendWhatsApp(emp.phone, `Your resignation has been approved. Your access to the system has been revoked.`);
+            }
+        }
+
+        res.status(200).json({
+            status: 'success',
+            message: `Resignation ${status.toLowerCase()} successfully`
         });
 
     } catch (error: any) {

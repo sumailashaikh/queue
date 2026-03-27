@@ -465,6 +465,157 @@ export const createUser = async (req: any, res: Response) => {
 };
 
 /**
+ * Invite an Employee to a business by phone number
+ */
+export const inviteEmployee = async (req: any, res: Response) => {
+    try {
+        const { phone, full_name, business_id, role } = req.body;
+        const supabase = req.supabase;
+        const userId = req.user?.id;
+
+        if (!phone || !business_id) {
+            return res.status(400).json({ status: 'error', message: 'Phone and Business ID are required' });
+        }
+
+        // 1. Verify ownership of business
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id, name')
+            .eq('id', business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 2. Check if user already exists in profiles
+        const { data: profile } = await supabase
+            .from('profiles')
+            .select('id, full_name')
+            .eq('phone', phone)
+            .maybeSingle();
+
+        if (profile) {
+            // Promote existing user
+            const { error: updateError } = await supabase
+                .from('profiles')
+                .update({ 
+                    role: role || 'employee', 
+                    business_id,
+                    status: 'INVITED' // Set to INVITED initially
+                })
+                .eq('id', profile.id);
+
+            if (updateError) throw updateError;
+        } else {
+            // Add to pending registrations
+            const { error: pendingError } = await supabase
+                .from('pending_registrations')
+                .upsert([{
+                    phone,
+                    role: role || 'employee',
+                    business_id,
+                    full_name: full_name || 'Invited Employee',
+                    is_verified: true,
+                    status: 'INVITED' // Explicitly set INVITED status
+                }]);
+
+            if (pendingError) throw pendingError;
+        }
+
+        // 3. Notify via WhatsApp
+        const msg = `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp. Please login to your dashboard here: https://queue-admin-182k.vercel.app/`;
+        await notificationService.sendWhatsApp(phone, msg);
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Employee invited successfully'
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+/**
+ * Deactivate an employee with safety check for active tasks
+ */
+export const deactivateEmployee = async (req: any, res: Response) => {
+    try {
+        const { employee_id } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        // 1. Fetch employee to confirm same business
+        const { data: employee } = await supabase
+            .from('profiles')
+            .select('id, business_id, full_name, phone')
+            .eq('id', employee_id)
+            .single();
+
+        if (!employee) {
+            return res.status(404).json({ status: 'error', message: 'Employee not found' });
+        }
+
+        const { data: owner } = await supabase.from('profiles').select('business_id').eq('id', userId).single();
+        if (employee.business_id !== owner?.business_id) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized: Cross-business deactivation blocked.' });
+        }
+
+        // 2. SAFETY CHECK: Check for active tasks
+        const { data: activeTasks } = await supabase
+            .from('queue_entry_services')
+            .select('id, queue_entry_id')
+            .eq('assigned_provider_id', employee.id) // Need to find provider ID first? 
+            // In my implementation, provider.user_id = profile.id. 
+            // Let's find the service_provider record for this profile.
+            .in('task_status', ['pending', 'in_progress']);
+
+        // Wait, I need the service_provider.id. 
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id')
+            .eq('user_id', employee.id)
+            .single();
+
+        if (provider) {
+            const { count: taskCount } = await supabase
+                .from('queue_entry_services')
+                .select('*', { count: 'exact', head: true })
+                .eq('assigned_provider_id', provider.id)
+                .in('task_status', ['pending', 'in_progress']);
+
+            if (taskCount && taskCount > 0) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: `Safety Block: This employee has ${taskCount} active tasks. Please reassign or complete them before deactivation.`
+                });
+            }
+        }
+
+        // 3. Deactivate
+        const { error: updateError } = await supabase
+            .from('profiles')
+            .update({ status: 'INACTIVE' })
+            .eq('id', employee_id);
+
+        if (updateError) throw updateError;
+
+        // 4. Notify (Optional)
+        await notificationService.sendWhatsApp(employee.phone, `Your access to ${owner?.business_id} has been revoked. Please contact your manager.`);
+
+        res.status(200).json({
+            status: 'success',
+            message: 'Employee deactivated successfully'
+        });
+
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+/**
  * Get platform-wide statistics (Admin Only)
  */
 export const getGlobalStats = async (req: any, res: Response) => {

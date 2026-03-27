@@ -64,91 +64,83 @@ export const verifyOtp = async (req: Request, res: Response) => {
         const user = data.user;
         const session = data.session;
 
-        let isNewUser = false;
-
-        // Check if user exists in profiles, if not create one
-        if (user) {
-            console.log(`[AUTH] Checking profile for user: ${user.id}`);
-            const { data: profile, error: profileError } = await supabase
-                .from('profiles')
-                .select('id')
-                .eq('id', user.id)
-                .single();
-
-            if (!profile || profileError) {
-                isNewUser = true;
-                console.log('[AUTH] Profile missing or error, creating/upserting profile...');
-                const { error: insertError } = await supabase.from('profiles').upsert([
-                    {
-                        id: user.id,
-                        full_name: 'New User',
-                        role: 'customer',
-                        phone: phone,
-                        status: 'pending',
-                        is_verified: false,
-                        ui_language: 'en',
-                        created_at: new Date().toISOString()
-                    }
-                ], { onConflict: 'id' });
-
-                if (insertError) {
-                    console.error('[AUTH] Failed to create/upsert profile:', insertError);
-                } else {
-                    console.log('[AUTH] Profile created/upserted successfully');
-                    
-                    // NEW: Check for pending registrations/promotions
-                    try {
-                        const { data: pending, error: pError } = await supabase
-                            .from('pending_registrations')
-                            .select('*')
-                            .eq('phone', phone)
-                            .maybeSingle();
-
-                        if (pending && !pError) {
-                            console.log(`[AUTH] Found pending registration for ${phone}. Promoting to ${pending.role}...`);
-                            await supabase.from('profiles').update({
-                                role: pending.role,
-                                full_name: pending.full_name !== 'Invited Admin' ? pending.full_name : 'New User',
-                                is_verified: pending.is_verified,
-                                status: pending.status || 'active'
-                            }).eq('id', user.id);
-
-                            // Clean up
-                            await supabase.from('pending_registrations').delete().eq('phone', phone);
-
-                            // Notify via WhatsApp
-                            const msg = `Welcome back! Your account has been automatically upgraded to ${pending.role} on QueueUp. You can now access your management tools.`;
-                            await notificationService.sendWhatsApp(phone, msg);
-                        }
-                    } catch (pErr) {
-                        console.error('[AUTH] Pending check failed:', pErr);
-                    }
-                }
-            } else {
-                // Update phone if missing
-                await supabase.from('profiles')
-                    .update({ phone: phone })
-                    .eq('id', user.id)
-                    .is('phone', null);
-            }
-        }
-
         if (!user) {
             return res.status(401).json({ status: 'error', message: 'Authentication failed' });
         }
 
-        // Fetch the final profile to return with the user object
-        const { data: finalProfile } = await supabase
+        // 1. Fetch existing profile OR check pending_registrations
+        const { data: profile } = await supabase
             .from('profiles')
             .select('*')
             .eq('id', user.id)
-            .single();
+            .maybeSingle();
+
+        const { data: pending } = await supabase
+            .from('pending_registrations')
+            .select('*')
+            .eq('phone', phone)
+            .maybeSingle();
+
+        // 2. Access Control: Only invited users or existing users can login
+        if (!profile && !pending) {
+            return res.status(403).json({ 
+                status: 'error', 
+                message: 'Access denied. Please contact your business owner to get an invitation.' 
+            });
+        }
+
+        let isNewUser = false;
+        let finalProfileData = profile;
+
+        // 3. Handle New User from Invitation
+        if (!profile && pending) {
+            isNewUser = true;
+            const { data: newProfile, error: insertError } = await supabase.from('profiles').insert([
+                {
+                    id: user.id,
+                    full_name: pending.full_name || 'New User',
+                    role: pending.role || 'employee',
+                    phone: phone,
+                    status: 'ACTIVE',
+                    is_verified: true,
+                    business_id: pending.business_id,
+                    created_at: new Date().toISOString()
+                }
+            ]).select().single();
+
+            if (insertError) throw insertError;
+            finalProfileData = newProfile;
+            await supabase.from('pending_registrations').delete().eq('phone', phone);
+        } else if (profile) {
+            // 4. Status Check for existing users
+            if (profile.status === 'INACTIVE' || profile.status === 'BLOCKED') {
+                return res.status(403).json({ 
+                    status: 'error', 
+                    message: `Your account is ${profile.status.toLowerCase()}. Access denied.` 
+                });
+            }
+
+            // Update status if INVITED to ACTIVE
+            if (profile.status === 'INVITED') {
+                const { data: activatedProfile } = await supabase.from('profiles')
+                    .update({ status: 'ACTIVE' })
+                    .eq('id', user.id)
+                    .select()
+                    .single();
+                finalProfileData = activatedProfile;
+            }
+
+            // Sync phone if missing
+            if (!profile.phone) {
+                await supabase.from('profiles').update({ phone: phone }).eq('id', user.id);
+            }
+        }
 
         res.status(200).json({
             status: 'success',
             message: 'Login successful',
             data: {
-                user: { ...user, ...finalProfile },
+                user: { ...user, ...finalProfileData },
                 session: session,
                 is_new_user: isNewUser
             }
