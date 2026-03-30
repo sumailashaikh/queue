@@ -525,6 +525,30 @@ export const inviteEmployee = async (req: any, res: Response) => {
             if (pendingError) throw pendingError;
         }
 
+        // 2b. Proactive: Link to service_providers table so they appear in the Providers list immediately
+        // (Even if they haven't logged in yet, we create the entry with the name provided)
+        try {
+            // Check if already in service_providers
+            const { data: existingSP } = await adminSupabase
+                .from('service_providers')
+                .select('id')
+                .eq('user_id', profile ? profile.id : null) // Only if profile exists
+                .maybeSingle();
+
+            if (!existingSP) {
+                console.log(`[ADMIN] Creating service_provider entry for ${full_name || 'Invited Employee'}`);
+                await adminSupabase.from('service_providers').insert({
+                    business_id,
+                    name: full_name || 'Invited Employee',
+                    user_id: profile ? profile.id : null, 
+                    status: 'active'
+                });
+            }
+        } catch (spError) {
+            console.error('[ADMIN] Could not auto-create service_provider:', spError);
+            // Non-blocking: We still want to return success for the invitation itself
+        }
+
         // 3. Notify via SMS (Standard text is more reliable than WhatsApp for new accounts)
         const msg = `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp. Login here: https://queue-admin-182k.vercel.app/`;
         

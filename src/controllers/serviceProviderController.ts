@@ -530,10 +530,10 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Missing required fields' });
         }
 
-        // 1. Verify ownership of the provider
+        // 1. Verify ownership OR self-application
         const { data: provider } = await supabase
             .from('service_providers')
-            .select('id, business_id')
+            .select('id, business_id, user_id')
             .eq('id', id)
             .single();
 
@@ -541,15 +541,18 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             return res.status(404).json({ status: 'error', message: 'Provider not found' });
         }
 
+        // Check if user is the owner of the business OR the provider themselves
         const { data: business } = await supabase
             .from('businesses')
-            .select('id')
+            .select('id, owner_id')
             .eq('id', provider.business_id)
-            .eq('owner_id', userId)
             .single();
 
-        if (!business) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        const isOwner = business?.owner_id === userId;
+        const isSelf = provider.user_id === userId;
+
+        if (!isOwner && !isSelf) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized: You can only apply for your own leave or for employees you own.' });
         }
 
         // 2. Overlap check application level
@@ -653,10 +656,15 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 2. Update status
+        // 2. Update status and optional reason
+        const { reason } = req.body;
         const { data, error } = await supabase
             .from('provider_leaves')
-            .update({ status, approved_by: userId })
+            .update({ 
+                status, 
+                approved_by: userId,
+                rejection_reason: status === 'REJECTED' ? reason : null 
+            })
             .eq('id', leaveId)
             .select()
             .single();
@@ -672,9 +680,15 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
         if (recipientPhone) {
             const { notificationService } = require('../services/notificationService');
-            const msg = status === 'APPROVED' 
-                ? `Your leave request from ${leave.start_date} to ${leave.end_date} has been approved.`
-                : `Your leave request from ${leave.start_date} to ${leave.end_date} has been declined. Please contact your manager for further details.`;
+            const { reason } = req.body;
+            let msg = '';
+            
+            if (status === 'APPROVED') {
+                msg = `Your leave request from ${leave.start_date} to ${leave.end_date} has been approved. Enjoy your time off!`;
+            } else {
+                msg = `Regarding your leave request from ${leave.start_date} to ${leave.end_date}: Unfortunately, it has been declined. ${reason ? `Reason: ${reason}. ` : ''}Please connect with your manager if you have questions.`;
+            }
+            
             await notificationService.sendWhatsApp(recipientPhone, msg);
         }
 
