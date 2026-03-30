@@ -477,40 +477,41 @@ export const inviteEmployee = async (req: any, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Phone and Business ID are required' });
         }
 
-        // 1. Verify ownership of business
-        const { data: business } = await supabase
+        // 1. Verify ownership of business using service role client to ensure RLS doesn't block identifying the owner
+        const adminSupabase = require('../config/supabaseClient').supabase;
+        
+        const { data: business } = await adminSupabase
             .from('businesses')
-            .select('id, name')
+            .select('id, name, owner_id')
             .eq('id', business_id)
-            .eq('owner_id', userId)
             .single();
 
-        if (!business) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        if (!business || business.owner_id !== userId) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized: Only the business owner can invite employees.' });
         }
 
-        // 2. Check if user already exists in profiles
-        const { data: profile } = await supabase
+        // 2. Check if user already exists in profiles (using adminSupabase to see all profiles)
+        const { data: profile } = await adminSupabase
             .from('profiles')
             .select('id, full_name')
             .eq('phone', phone)
             .maybeSingle();
 
         if (profile) {
-            // Promote existing user
-            const { error: updateError } = await supabase
+            // Promote existing user (using adminSupabase to bypass RLS profile update restrictions)
+            const { error: updateError } = await adminSupabase
                 .from('profiles')
                 .update({ 
                     role: role || 'employee', 
                     business_id,
-                    status: 'INVITED' // Set to INVITED initially
+                    status: 'INVITED' 
                 })
                 .eq('id', profile.id);
 
             if (updateError) throw updateError;
         } else {
-            // Add to pending registrations
-            const { error: pendingError } = await supabase
+            // Add to pending registrations (using adminSupabase)
+            const { error: pendingError } = await adminSupabase
                 .from('pending_registrations')
                 .upsert([{
                     phone,
@@ -518,7 +519,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
                     business_id,
                     full_name: full_name || 'Invited Employee',
                     is_verified: true,
-                    status: 'INVITED' // Explicitly set INVITED status
+                    status: 'INVITED'
                 }]);
 
             if (pendingError) throw pendingError;
@@ -563,10 +564,11 @@ export const deactivateEmployee = async (req: any, res: Response) => {
     try {
         const { employee_id } = req.params;
         const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         // 1. Fetch employee to confirm same business
-        const { data: employee } = await supabase
+        const adminSupabase = require('../config/supabaseClient').supabase;
+        
+        const { data: employee } = await adminSupabase
             .from('profiles')
             .select('id, business_id, full_name, phone')
             .eq('id', employee_id)
@@ -576,29 +578,27 @@ export const deactivateEmployee = async (req: any, res: Response) => {
             return res.status(404).json({ status: 'error', message: 'Employee not found' });
         }
 
-        const { data: owner } = await supabase.from('profiles').select('business_id').eq('id', userId).single();
-        if (employee.business_id !== owner?.business_id) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized: Cross-business deactivation blocked.' });
+        // 2. Fetch business owner profile to verify ownership
+        const { data: business } = await adminSupabase
+            .from('businesses')
+            .select('id')
+            .eq('id', employee.business_id)
+            .eq('owner_id', userId)
+            .single();
+            
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized: Only the business owner can manage their employees.' });
         }
 
         // 2. SAFETY CHECK: Check for active tasks
-        const { data: activeTasks } = await supabase
-            .from('queue_entry_services')
-            .select('id, queue_entry_id')
-            .eq('assigned_provider_id', employee.id) // Need to find provider ID first? 
-            // In my implementation, provider.user_id = profile.id. 
-            // Let's find the service_provider record for this profile.
-            .in('task_status', ['pending', 'in_progress']);
-
-        // Wait, I need the service_provider.id. 
-        const { data: provider } = await supabase
+        const { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id')
             .eq('user_id', employee.id)
             .single();
 
         if (provider) {
-            const { count: taskCount } = await supabase
+            const { count: taskCount } = await adminSupabase
                 .from('queue_entry_services')
                 .select('*', { count: 'exact', head: true })
                 .eq('assigned_provider_id', provider.id)
@@ -613,7 +613,7 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         }
 
         // 3. Deactivate
-        const { error: updateError } = await supabase
+        const { error: updateError } = await adminSupabase
             .from('profiles')
             .update({ status: 'INACTIVE' })
             .eq('id', employee_id);
