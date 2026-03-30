@@ -581,7 +581,7 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         // 2. Fetch business owner profile to verify ownership
         const { data: business } = await adminSupabase
             .from('businesses')
-            .select('id')
+            .select('id, name')
             .eq('id', employee.business_id)
             .eq('owner_id', userId)
             .single();
@@ -621,7 +621,9 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         if (updateError) throw updateError;
 
         // 4. Notify (Optional)
-        await notificationService.sendWhatsApp(employee.phone, `Your access to ${owner?.business_id} has been revoked. Please contact your manager.`);
+        if (employee.phone) {
+            await notificationService.sendWhatsApp(employee.phone, `Your access to ${business.name} has been revoked. Please contact your manager.`);
+        }
 
         res.status(200).json({
             status: 'success',
