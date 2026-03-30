@@ -4,7 +4,7 @@ import { supabase } from '../config/supabaseClient';
 export const createServiceProvider = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
-        const { business_id, name, phone, role, department } = req.body;
+        const { business_id, name, phone, role, department, translations } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         if (!userId) {
@@ -29,7 +29,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
 
         const { data, error } = await supabase
             .from('service_providers')
-            .insert([{ business_id, name, phone, role, department }])
+            .insert([{ business_id, name, phone, role, department, translations: translations || {} }])
             .select()
             .single();
 
