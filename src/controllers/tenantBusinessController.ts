@@ -175,16 +175,47 @@ export const getMyBusinesses = async (req: Request, res: Response) => {
             });
         }
 
-        const { data, error } = await supabase
-            .from('businesses')
-            .select(`
-                *,
-                currency,
-                timezone,
-                language
-            `)
-            .eq('owner_id', userId)
-            .order('created_at', { ascending: false });
+        // 1. Fetch user profile to check role and linked business
+        const { data: profile } = await supabase
+            .from('profiles')
+            .select('role, business_id')
+            .eq('id', userId)
+            .single();
+
+        let data;
+        let error;
+
+        if (profile?.role === 'employee' || profile?.role === 'staff') {
+            // If employee, return the business they are linked to
+            if (profile.business_id) {
+                const result = await supabase
+                    .from('businesses')
+                    .select('*, currency, timezone, language, country_code')
+                    .eq('id', profile.business_id)
+                    .single();
+                
+                data = result.data ? [result.data] : [];
+                error = result.error;
+            } else {
+                data = [];
+            }
+        } else {
+            // If owner (default), return businesses they own
+            const result = await supabase
+                .from('businesses')
+                .select(`
+                    *,
+                    currency,
+                    timezone,
+                    language,
+                    country_code
+                `)
+                .eq('owner_id', userId)
+                .order('created_at', { ascending: false });
+            
+            data = result.data;
+            error = result.error;
+        }
 
         if (error) throw error;
 
