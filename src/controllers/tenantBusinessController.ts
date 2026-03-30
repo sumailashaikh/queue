@@ -185,22 +185,25 @@ export const getMyBusinesses = async (req: Request, res: Response) => {
         let data;
         let error;
 
-        if (profile?.role === 'employee' || profile?.role === 'staff') {
-            // If employee, return the business they are linked to
-            if (profile.business_id) {
-                const result = await supabase
-                    .from('businesses')
-                    .select('*, currency, timezone, language, country_code')
-                    .eq('id', profile.business_id)
-                    .single();
-                
-                data = result.data ? [result.data] : [];
-                error = result.error;
-            } else {
-                data = [];
-            }
+        // Smart check: If they have a business_id, they are an employee/staff regardless of what the 'role' string says
+        // (This handles users whose role update failed due to old database constraints)
+        if (profile?.business_id) {
+            console.log(`[BUSINESS] User ${userId} has business_id ${profile.business_id}, fetching salon for employee...`);
+            const result = await supabase
+                .from('businesses')
+                .select('*, currency, timezone, language, country_code')
+                .eq('id', profile.business_id)
+                .single();
+            
+            data = result.data ? [result.data] : [];
+            error = result.error;
+        } else if (profile?.role === 'admin') {
+            // Admins see no specific business here (they use the admin console)
+            data = [];
+            error = null;
         } else {
-            // If owner (default), return businesses they own
+            // If they don't have a business_id, they must be an owner looking for their own businesses
+            console.log(`[BUSINESS] User ${userId} has no linked business_id, fetching owned businesses...`);
             const result = await supabase
                 .from('businesses')
                 .select(`
@@ -217,7 +220,7 @@ export const getMyBusinesses = async (req: Request, res: Response) => {
             error = result.error;
         }
 
-        if (error) throw error;
+        if (error && error.code !== 'PGRST116') throw error; // Ignore single search "not found" errors
 
         res.status(200).json({
             status: 'success',
