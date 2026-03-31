@@ -24,7 +24,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
             .single();
 
         if (bizError || !business) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized to add providers to this business' });
+            return res.status(403).json({ status: 'error', message: 'providers.err_unauthorized_add' });
         }
 
         const trimmedName = name.trim();
@@ -68,7 +68,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
                 
                 return res.status(200).json({
                     status: 'success',
-                    message: 'Existing provider reactivated successfully',
+                    message: 'providers.success_reactivate',
                     data
                 });
             }
@@ -84,7 +84,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
 
         res.status(201).json({
             status: 'success',
-            message: 'Service provider created successfully',
+            message: 'providers.success_add',
             data
         });
 
@@ -255,12 +255,12 @@ export const updateServiceProvider = async (req: Request, res: Response) => {
         if (error) throw error;
 
         if (!data) {
-            return res.status(404).json({ status: 'error', message: 'Service provider not found or unauthorized' });
+            return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
         }
 
         res.status(200).json({
             status: 'success',
-            message: 'Service provider updated successfully',
+            message: 'providers.success_update',
             data
         });
 
@@ -290,12 +290,12 @@ export const deleteServiceProvider = async (req: Request, res: Response) => {
         if (error) throw error;
 
         if (!data) {
-            return res.status(404).json({ status: 'error', message: 'Service provider not found or unauthorized' });
+            return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
         }
 
         res.status(200).json({
             status: 'success',
-            message: 'Service provider deactivated successfully'
+            message: 'providers.success_deactivate'
         });
 
     } catch (error: any) {
