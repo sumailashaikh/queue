@@ -469,7 +469,7 @@ export const createUser = async (req: any, res: Response) => {
  */
 export const inviteEmployee = async (req: any, res: Response) => {
     try {
-        const { phone, full_name, business_id, role } = req.body;
+        const { phone, full_name, business_id, role, custom_message } = req.body;
         const supabase = req.supabase;
         const userId = req.user?.id;
 
@@ -477,7 +477,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Phone and Business ID are required' });
         }
 
-        // 1. Verify ownership of business using service role client to ensure RLS doesn't block identifying the owner
+        // 1. Verify ownership of business
         const adminSupabase = require('../config/supabaseClient').supabase;
         
         const { data: business } = await adminSupabase
@@ -490,7 +490,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized: Only the business owner can invite employees.' });
         }
 
-        // 2. Check if user already exists in profiles (using adminSupabase to see all profiles)
+        // 2. Check if user already exists
         const { data: profile } = await adminSupabase
             .from('profiles')
             .select('id, full_name')
@@ -498,7 +498,6 @@ export const inviteEmployee = async (req: any, res: Response) => {
             .maybeSingle();
 
         if (profile) {
-            // Promote existing user (using adminSupabase to bypass RLS profile update restrictions)
             const { error: updateError } = await adminSupabase
                 .from('profiles')
                 .update({ 
@@ -510,7 +509,6 @@ export const inviteEmployee = async (req: any, res: Response) => {
 
             if (updateError) throw updateError;
         } else {
-            // Add to pending registrations (using adminSupabase)
             const { error: pendingError } = await adminSupabase
                 .from('pending_registrations')
                 .upsert([{
@@ -525,18 +523,15 @@ export const inviteEmployee = async (req: any, res: Response) => {
             if (pendingError) throw pendingError;
         }
 
-        // 2b. Proactive: Link to service_providers table so they appear in the Providers list immediately
-        // (Even if they haven't logged in yet, we create the entry with the name provided)
+        // 2b. Service Provider link
         try {
-            // Check if already in service_providers
             const { data: existingSP } = await adminSupabase
                 .from('service_providers')
                 .select('id')
-                .eq('user_id', profile ? profile.id : null) // Only if profile exists
+                .eq('user_id', profile ? profile.id : null)
                 .maybeSingle();
 
             if (!existingSP) {
-                console.log(`[ADMIN] Creating service_provider entry for ${full_name || 'Invited Employee'}`);
                 await adminSupabase.from('service_providers').insert({
                     business_id,
                     name: full_name || 'Invited Employee',
@@ -545,35 +540,28 @@ export const inviteEmployee = async (req: any, res: Response) => {
                 });
             }
         } catch (spError) {
-            console.error('[ADMIN] Could not auto-create service_provider:', spError);
-            // Non-blocking: We still want to return success for the invitation itself
+            console.error('[ADMIN] Auto-create service_provider fail:', spError);
         }
 
-        // 3. Notify via SMS (Standard text is more reliable than WhatsApp for new accounts)
-        const msg = `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp. Login here: https://queue-admin-182k.vercel.app/`;
+        // 3. Notify via Message (Custom or default)
+        const defaultMsg = `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp. Login here: https://queue-admin-182k.vercel.app/`;
+        const msg = custom_message || defaultMsg;
         
-        if (notificationService.isMock) {
-            return res.status(200).json({
-                status: 'success',
-                message: 'Employee added, but SMS could not be sent (Twilio not configured). Please update .env.',
-                notified: false
-            });
-        }
-
-        const notified = await notificationService.sendSMS(phone, msg);
-
-        if (!notified) {
-            return res.status(200).json({
-                status: 'success',
-                message: 'Employee added, but SMS failed to deliver. Check your Twilio balance/permissions.',
-                notified: false
-            });
+        // Attempt WhatsApp first, then fallback to SMS
+        const { notificationService } = require('../services/notificationService');
+        
+        let notified = false;
+        if (!notificationService.isMock) {
+            // Send WhatsApp
+            notified = await notificationService.sendWhatsApp(phone, msg);
+            // Also send SMS for redundancy
+            await notificationService.sendSMS(phone, msg);
         }
 
         res.status(200).json({
             status: 'success',
-            message: 'Employee invited successfully via SMS!',
-            notified: true
+            message: notified ? 'Employee invited successfully via WhatsApp/SMS!' : 'Employee added (Notification system in mock mode).',
+            notified: notified
         });
 
     } catch (error: any) {

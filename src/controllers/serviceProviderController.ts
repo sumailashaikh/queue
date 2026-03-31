@@ -11,8 +11,8 @@ export const createServiceProvider = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        if (!business_id || !name) {
-            return res.status(400).json({ status: 'error', message: 'Business ID and Name are required' });
+        if (!business_id || !name || !phone || !role || !department) {
+            return res.status(400).json({ status: 'error', message: 'providers.all_fields_required' });
         }
 
         // Verify ownership via RLS or explicit check
@@ -46,7 +46,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
             if (existing.is_active) {
                 return res.status(400).json({ 
                     status: 'error', 
-                    message: 'A provider with this name already exists and is currently active.' 
+                    message: 'providers.err_already_exists_active' 
                 });
             } else {
                 // Reactivate and update the existing record
@@ -237,6 +237,11 @@ export const updateServiceProvider = async (req: Request, res: Response) => {
 
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { name, phone, role, department } = updates;
+        if (!name || !phone || !role || !department) {
+            return res.status(400).json({ status: 'error', message: 'providers.all_fields_required' });
         }
 
         // RLS handles ownership, but we check if we got data back
@@ -648,7 +653,10 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             if (biz?.owner_id) {
                 const { data: owner } = await supabase.from('profiles').select('phone').eq('id', biz.owner_id).single();
                 if (owner?.phone) {
-                    const msg = `New leave request from ${profile?.full_name || 'Employee'} for ${biz.name} from ${start_date} to ${end_date}.`;
+                    const businessName = biz.name || 'Your Business';
+                    const employeeFullname = profile?.full_name || 'An Employee';
+                    const msg = `[QueueUp] New leave request from ${employeeFullname} for ${businessName} from ${start_date} to ${end_date}. Please review in your dashboard.`;
+                    
                     const { notificationService } = require('../services/notificationService');
                     await notificationService.sendWhatsApp(owner.phone, msg);
                 }
@@ -731,9 +739,9 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             let msg = '';
             
             if (status === 'APPROVED') {
-                msg = `Your leave request from ${leave.start_date} to ${leave.end_date} has been approved. Enjoy your time off!`;
+                msg = `Success! Your leave request from ${leave.start_date} to ${leave.end_date} has been APPROVED. Enjoy your time off!`;
             } else {
-                msg = `Regarding your leave request from ${leave.start_date} to ${leave.end_date}: Unfortunately, it has been declined. ${reason ? `Reason: ${reason}. ` : ''}Please connect with your manager if you have questions.`;
+                msg = `Update: Your leave request from ${leave.start_date} to ${leave.end_date} has been REJECTED. ${reason ? `Reason: ${reason}. ` : ''}Contact your manager if you have questions.`;
             }
             
             await notificationService.sendWhatsApp(recipientPhone, msg);
