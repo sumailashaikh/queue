@@ -236,26 +236,35 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
         // 1.5 Auto-Process No-Shows & Expirations (30-min grace period)
         const now = new Date();
         const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
-
-        // Auto mark no_show for today's past due appointments
         const primaryTimezone = businesses[0]?.timezone || 'UTC';
         const todayStr = getLocalDateString(primaryTimezone);
-        const { data: expiredAppointments } = await supabase
+
+        // A. Mark 'scheduled' (Pending) as 'expired' if 30 mins late
+        await supabase
+            .from('appointments')
+            .update({ status: 'expired' })
+            .in('business_id', businessIds)
+            .eq('status', 'scheduled')
+            .lt('start_time', thirtyMinsAgo)
+            .gte('start_time', todayStr + 'T00:00:00Z');
+
+        // B. Mark 'confirmed' as 'no_show' if 30 mins late
+        const { data: noShowAppointments } = await supabase
             .from('appointments')
             .update({ status: 'no_show' })
             .in('business_id', businessIds)
-            .in('status', ['scheduled', 'confirmed'])
+            .eq('status', 'confirmed')
             .lt('start_time', thirtyMinsAgo)
-            .gte('start_time', todayStr + 'T00:00:00Z') // Only today's
+            .gte('start_time', todayStr + 'T00:00:00Z')
             .select('id');
 
-        // Also sync with queue entries if any expired
-        if (expiredAppointments && expiredAppointments.length > 0) {
-            const expiredIds = expiredAppointments.map((a: { id: string }) => a.id);
+        // Sync no_shows with queue entries if any existed
+        if (noShowAppointments && noShowAppointments.length > 0) {
+            const noShowIds = noShowAppointments.map((a: { id: string }) => a.id);
             await supabase
                 .from('queue_entries')
                 .update({ status: 'no_show' })
-                .in('appointment_id', expiredIds)
+                .in('appointment_id', noShowIds)
                 .in('status', ['waiting', 'serving']);
         }
 
