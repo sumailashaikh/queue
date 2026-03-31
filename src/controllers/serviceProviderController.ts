@@ -30,14 +30,17 @@ export const createServiceProvider = async (req: Request, res: Response) => {
         const trimmedName = name.trim();
 
         // Check if a provider with this name already exists for this business (case-insensitive)
-        const { data: existing, error: checkError } = await supabase
+        // We use limit(1) instead of maybeSingle() to handle cases where duplicates might already exist
+        const { data: matches, error: checkError } = await supabase
             .from('service_providers')
             .select('id, is_active')
             .eq('business_id', business_id)
             .ilike('name', trimmedName)
-            .maybeSingle();
+            .limit(1);
 
         if (checkError) throw checkError;
+
+        const existing = matches && matches.length > 0 ? matches[0] : null;
 
         if (existing) {
             if (existing.is_active) {
