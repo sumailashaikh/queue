@@ -46,7 +46,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
             if (existing.is_active) {
                 return res.status(400).json({ 
                     status: 'error', 
-                    message: 'providers.err_already_exists_active' 
+                    message: 'providers.already_exists' 
                 });
             } else {
                 // Reactivate and update the existing record
@@ -242,6 +242,34 @@ export const updateServiceProvider = async (req: Request, res: Response) => {
         const { name, phone, role, department } = updates;
         if (!name || !phone || !role || !department) {
             return res.status(400).json({ status: 'error', message: 'providers.all_fields_required' });
+        }
+
+        const trimmedName = name.trim();
+
+        // 1. Ownership check (Implicit via user_id/RLS, but let's confirm the business_id of the record)
+        const { data: currentProvider, error: fetchError } = await supabase
+            .from('service_providers')
+            .select('business_id')
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !currentProvider) {
+            return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
+        }
+
+        // 2. Check for name collision with OTHER providers in the same business
+        const { data: collision, error: collisionError } = await supabase
+            .from('service_providers')
+            .select('id')
+            .eq('business_id', currentProvider.business_id)
+            .ilike('name', trimmedName)
+            .neq('id', id) // Exclude current record
+            .maybeSingle();
+
+        if (collisionError) throw collisionError;
+
+        if (collision) {
+            return res.status(400).json({ status: 'error', message: 'providers.already_exists' });
         }
 
         // RLS handles ownership, but we check if we got data back
