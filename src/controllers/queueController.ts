@@ -1704,9 +1704,7 @@ export const completeTask = async (req: Request, res: Response) => {
                 task_status: 'done',
                 completed_at: now.toISOString(),
                 actual_minutes: actualMinutes,
-                delay_minutes: delayMinutes,
-                completed_by_id: req.user?.id,
-                completed_by_role: req.user?.role
+                delay_minutes: delayMinutes
             })
             .eq('id', id)
             .select()
