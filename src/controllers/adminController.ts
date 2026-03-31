@@ -589,24 +589,24 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         const { employee_id } = req.params;
         const userId = req.user?.id;
 
-        // 1. Fetch employee to confirm same business
+        // 1. Fetch service provider to confirm existence and identify linked profile
         const adminSupabase = require('../config/supabaseClient').supabase;
         
-        const { data: employee } = await adminSupabase
-            .from('profiles')
-            .select('id, business_id, full_name, phone')
+        const { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, business_id, name, user_id')
             .eq('id', employee_id)
             .single();
 
-        if (!employee) {
-            return res.status(404).json({ status: 'error', message: 'Employee not found' });
+        if (!provider) {
+            return res.status(404).json({ status: 'error', message: 'Employee not found in service roster.' });
         }
 
         // 2. Fetch business owner profile to verify ownership
         const { data: business } = await adminSupabase
             .from('businesses')
-            .select('id, name')
-            .eq('id', employee.business_id)
+            .select('id, name, owner_id')
+            .eq('id', provider.business_id)
             .eq('owner_id', userId)
             .single();
             
@@ -614,39 +614,45 @@ export const deactivateEmployee = async (req: any, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized: Only the business owner can manage their employees.' });
         }
 
-        // 2. SAFETY CHECK: Check for active tasks
-        const { data: provider } = await adminSupabase
-            .from('service_providers')
-            .select('id')
-            .eq('user_id', employee.id)
-            .single();
+        // 3. SAFETY CHECK: Check for active tasks
+        const { count: taskCount } = await adminSupabase
+            .from('queue_entry_services')
+            .select('*', { count: 'exact', head: true })
+            .eq('assigned_provider_id', provider.id)
+            .in('task_status', ['pending', 'in_progress']);
 
-        if (provider) {
-            const { count: taskCount } = await adminSupabase
-                .from('queue_entry_services')
-                .select('*', { count: 'exact', head: true })
-                .eq('assigned_provider_id', provider.id)
-                .in('task_status', ['pending', 'in_progress']);
-
-            if (taskCount && taskCount > 0) {
-                return res.status(400).json({
-                    status: 'error',
-                    message: `Safety Block: This employee has ${taskCount} active tasks. Please reassign or complete them before deactivation.`
-                });
-            }
+        if (taskCount && taskCount > 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: `Safety Block: This employee has ${taskCount} active tasks. Please reassign or complete them before deactivation.`
+            });
         }
 
-        // 3. Deactivate
-        const { error: updateError } = await adminSupabase
-            .from('profiles')
-            .update({ status: 'INACTIVE' })
+        // 4. Deactivate Service Provider record
+        const { error: spError } = await adminSupabase
+            .from('service_providers')
+            .update({ is_active: false })
             .eq('id', employee_id);
 
-        if (updateError) throw updateError;
+        if (spError) throw spError;
 
-        // 4. Notify (Optional)
-        if (employee.phone) {
-            await notificationService.sendWhatsApp(employee.phone, `Your access to ${business.name} has been revoked. Please contact your manager.`);
+        // 5. Deactivate linked Profile if exists
+        if (provider.user_id) {
+            const { error: profileError } = await adminSupabase
+                .from('profiles')
+                .update({ status: 'INACTIVE' })
+                .eq('id', provider.user_id);
+                
+            if (profileError) {
+                console.error('[ADMIN] Failed to deactivate linked profile:', profileError);
+                // Non-blocking: We still deactivated the provider record
+            }
+
+            // Notify (Optional)
+            const { data: profile } = await adminSupabase.from('profiles').select('phone').eq('id', provider.user_id).single();
+            if (profile?.phone) {
+                await notificationService.sendWhatsApp(profile.phone, `Your access to ${business.name} has been revoked. Please contact your manager.`);
+            }
         }
 
         res.status(200).json({

@@ -27,6 +27,47 @@ export const createServiceProvider = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized to add providers to this business' });
         }
 
+        // Check if a provider with this name already exists for this business
+        const { data: existing, error: checkError } = await supabase
+            .from('service_providers')
+            .select('id, is_active')
+            .eq('business_id', business_id)
+            .eq('name', name)
+            .maybeSingle();
+
+        if (checkError) throw checkError;
+
+        if (existing) {
+            if (existing.is_active) {
+                return res.status(400).json({ 
+                    status: 'error', 
+                    message: 'A provider with this name already exists and is currently active.' 
+                });
+            } else {
+                // Reactivate and update the existing record
+                const { data, error: updateError } = await supabase
+                    .from('service_providers')
+                    .update({ 
+                        is_active: true,
+                        phone,
+                        role,
+                        department,
+                        translations: translations || {}
+                    })
+                    .eq('id', existing.id)
+                    .select()
+                    .single();
+
+                if (updateError) throw updateError;
+                
+                return res.status(200).json({
+                    status: 'success',
+                    message: 'Existing provider reactivated successfully',
+                    data
+                });
+            }
+        }
+
         const { data, error } = await supabase
             .from('service_providers')
             .insert([{ business_id, name, phone, role, department, translations: translations || {} }])
