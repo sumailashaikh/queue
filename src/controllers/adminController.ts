@@ -487,7 +487,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
             .single();
 
         if (!business || business.owner_id !== userId) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized: Only the business owner can invite employees.' });
+            return res.status(403).json({ status: 'error', message: 'providers.err_unauthorized_add' });
         }
 
         // 2. Check if user already exists
@@ -560,7 +560,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
 
         res.status(200).json({
             status: 'success',
-            message: notified ? 'Employee invited successfully via WhatsApp/SMS!' : 'Employee added (Notification system in mock mode).',
+            message: notified ? 'providers.success_invite' : 'providers.success_invite_mock',
             notified: notified
         });
 
@@ -587,7 +587,7 @@ export const deactivateEmployee = async (req: any, res: Response) => {
             .single();
 
         if (!provider) {
-            return res.status(404).json({ status: 'error', message: 'Employee not found in service roster.' });
+            return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
         }
 
         // 2. Fetch business owner profile to verify ownership
@@ -599,7 +599,7 @@ export const deactivateEmployee = async (req: any, res: Response) => {
             .single();
             
         if (!business) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized: Only the business owner can manage their employees.' });
+            return res.status(403).json({ status: 'error', message: 'providers.err_unauthorized_add' });
         }
 
         // 3. SAFETY CHECK: Check for active tasks
@@ -612,7 +612,8 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         if (taskCount && taskCount > 0) {
             return res.status(400).json({
                 status: 'error',
-                message: `Safety Block: This employee has ${taskCount} active tasks. Please reassign or complete them before deactivation.`
+                message: 'providers.err_active_tasks',
+                count: taskCount
             });
         }
 
@@ -645,7 +646,7 @@ export const deactivateEmployee = async (req: any, res: Response) => {
 
         res.status(200).json({
             status: 'success',
-            message: 'Employee deactivated successfully'
+            message: 'providers.success_deactivate'
         });
 
     } catch (error: any) {
