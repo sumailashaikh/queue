@@ -27,12 +27,14 @@ export const createServiceProvider = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized to add providers to this business' });
         }
 
-        // Check if a provider with this name already exists for this business
+        const trimmedName = name.trim();
+
+        // Check if a provider with this name already exists for this business (case-insensitive)
         const { data: existing, error: checkError } = await supabase
             .from('service_providers')
             .select('id, is_active')
             .eq('business_id', business_id)
-            .eq('name', name)
+            .ilike('name', trimmedName)
             .maybeSingle();
 
         if (checkError) throw checkError;
@@ -49,6 +51,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
                     .from('service_providers')
                     .update({ 
                         is_active: true,
+                        name: trimmedName, // Ensure name is trimmed
                         phone,
                         role,
                         department,
@@ -70,7 +73,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
 
         const { data, error } = await supabase
             .from('service_providers')
-            .insert([{ business_id, name, phone, role, department, translations: translations || {} }])
+            .insert([{ business_id, name: trimmedName, phone, role, department, translations: translations || {} }])
             .select()
             .single();
 
