@@ -2081,6 +2081,7 @@ export const restoreQueueEntry = async (req: Request, res: Response) => {
 export const initializeEntryTasks = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
+        const { provider_id } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         // 1. Check if tasks already exist
@@ -2114,13 +2115,20 @@ export const initializeEntryTasks = async (req: Request, res: Response) => {
             .eq('id', entry.queue_id)
             .single();
 
-        // 3. Insert default manual service slot
+        // 3. Insert default manual service slot (Assign provider immediately if provided)
         await supabase.from('queue_entry_services').insert([{
             queue_entry_id: id,
             service_id: null,
+            assigned_provider_id: provider_id || null,
             price: (queueData as any)?.businesses?.default_price || 0,
-            duration_minutes: (queueData as any)?.businesses?.default_duration || 10
+            duration_minutes: (queueData as any)?.businesses?.default_duration || 10,
+            task_status: provider_id ? 'pending' : 'pending' 
         }]);
+
+        // If provider was assigned, also sync it back to the entry level for legacy rows
+        if (provider_id) {
+            await supabase.from('queue_entries').update({ assigned_to: provider_id }).eq('id', id);
+        }
 
         res.status(200).json({ status: 'success', message: 'Tasks initialized' });
     } catch (error: any) {
