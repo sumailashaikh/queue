@@ -108,13 +108,17 @@ export const verifyOtp = async (req: Request, res: Response) => {
             isNewUser = true;
             console.log(`[AUTH] Creating new profile from pending registration for ${phone}`);
             
+            // Normalize phone number: Keep only digits and the optional leading + sign
+            // This prevents "profiles_phone_check" constraint violations (e.g., from spaces)
+            const normalizedPhone = phone.replace(/[^\d+]/g, '');
+
             // Use UPSERT to handle case where the trigger might have already inserted it
             const { data: newProfile, error: upsertError } = await supabase.from('profiles').upsert([
                 {
                     id: user.id,
                     full_name: pending.full_name || 'New User',
                     role: pending.role || 'employee',
-                    phone: phone,
+                    phone: normalizedPhone,
                     status: 'ACTIVE',
                     is_verified: true,
                     business_id: pending.business_id
@@ -158,8 +162,9 @@ export const verifyOtp = async (req: Request, res: Response) => {
             }
 
             // Sync phone if missing
-            if (!profile.phone || profile.phone !== phone) {
-                await supabase.from('profiles').update({ phone: phone }).eq('id', user.id);
+            const normalizedPhone = phone.replace(/[^\d+]/g, '');
+            if (!profile.phone || profile.phone !== normalizedPhone) {
+                await supabase.from('profiles').update({ phone: normalizedPhone }).eq('id', user.id);
             }
         }
 

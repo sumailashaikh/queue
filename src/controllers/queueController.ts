@@ -963,8 +963,10 @@ export const noShowQueueEntry = async (req: Request, res: Response) => {
         if (currentEntry.checked_in_at) {
             return res.status(400).json({ status: 'error', message: 'Cannot mark no-show: Customer has already checked in.' });
         }
-        if (['serving', 'completed', 'done', 'skipped'].includes(currentEntry.status)) {
-            return res.status(400).json({ status: 'error', message: `Cannot mark no-show: Entry is currently ${currentEntry.status}.` });
+        
+        // Allow marking 'serving' as no-show (e.g. if customer walks out after being called)
+        if (['completed', 'done', 'cancelled'].includes(currentEntry.status)) {
+            return res.status(400).json({ status: 'error', message: `Cannot mark no-show: Entry is already ${currentEntry.status}.` });
         }
 
         // 2. Update status and release provider lock
@@ -991,10 +993,13 @@ export const noShowQueueEntry = async (req: Request, res: Response) => {
         }
         // -----------------------------------
 
-        // Release lock in junction table if needed
+        // Release lock AND reset task status in junction table
         await supabase
             .from('queue_entry_services')
-            .update({ assigned_provider_id: null })
+            .update({ 
+                assigned_provider_id: null,
+                task_status: 'pending' // Reset tasks so "DONE" buttons disappear
+            })
             .eq('queue_entry_id', id);
 
         // 3. Send Notification
