@@ -1932,11 +1932,13 @@ export const restoreQueueEntry = async (req: Request, res: Response) => {
         }
 
         // Verify ownership
-        const { data: biz } = await supabase.from('businesses').select('owner_id').eq('id', entry.queues.business_id).single();
+        const { data: biz } = await supabase.from('businesses').select('owner_id, timezone').eq('id', entry.queues.business_id).single();
         if (biz?.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Forbidden' });
 
         // Verify it's from today (Only allow restoration for same-day no-shows)
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: biz?.timezone || 'UTC' });
+        const timezone = biz?.timezone || 'UTC';
+        const todayStr = getLocalDateString(timezone);
+
         if (entry.entry_date !== todayStr) {
             return res.status(400).json({
                 status: 'error',
@@ -1944,26 +1946,60 @@ export const restoreQueueEntry = async (req: Request, res: Response) => {
             });
         }
 
+        // 2. Find MAX position for today to "add to live queue" (at the end)
+        const { data: maxPosData } = await supabase
+            .from('queue_entries')
+            .select('position')
+            .eq('queue_id', entry.queue_id)
+            .eq('entry_date', todayStr)
+            .order('position', { ascending: false })
+            .limit(1);
+
+        const nextPosition = (maxPosData && maxPosData.length > 0) ? maxPosData[0].position + 1 : 1;
+
+        // 3. Update entry status and position
         const { data, error } = await supabase
             .from('queue_entries')
-            .update({ status: 'waiting' })
+            .update({ 
+                status: 'waiting',
+                position: nextPosition,
+                assigned_provider_id: null, // Reset provider just in case
+                service_started_at: null,    // Reset serving timestamps
+                served_at: null
+            })
             .eq('id', id)
             .select()
             .single();
 
         if (error) throw error;
 
-        // 2. Sync with Appointment (if linked)
+        // 4. Reset task status in junction table so they can be started/done again
+        await supabase
+            .from('queue_entry_services')
+            .update({ 
+                task_status: 'pending',
+                assigned_provider_id: null,
+                started_at: null,
+                completed_at: null,
+                actual_minutes: null,
+                delay_minutes: null
+            })
+            .eq('queue_entry_id', id);
+
+        // 5. Sync with Appointment (if linked)
         if (entry.appointment_id) {
             await supabase
                 .from('appointments')
-                .update({ status: 'confirmed' }) // Or 'checked_in'? Confirmed is safer as it represents "ready to be served"
+                .update({ status: 'confirmed' }) // Back to confirmed (waiting)
                 .eq('id', entry.appointment_id);
         }
 
+        // 6. Trigger position updates and notifications
+        await processQueueNotifications(entry.queue_id, todayStr, supabase);
+
         res.status(200).json({
             status: 'success',
-            message: 'Customer restored to live queue',
+            message: 'Customer restored and added to the end of the live queue',
             data
         });
 
@@ -1971,6 +2007,7 @@ export const restoreQueueEntry = async (req: Request, res: Response) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 };
+
 
 export const initializeEntryTasks = async (req: Request, res: Response) => {
     try {
