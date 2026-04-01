@@ -124,7 +124,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
                     full_name: pending.full_name || 'New User',
                     role: pending.role || 'employee',
                     phone: phone, // Already normalized at top
-                    status: 'ACTIVE',
+                    status: 'active',
                     is_verified: true,
                     business_id: pending.business_id
                 }
@@ -143,7 +143,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
         } else if (profile) {
             // 4. Status Check for existing users
-            if (profile.status === 'INACTIVE' || profile.status === 'BLOCKED') {
+            if (profile.status === 'inactive' || profile.status === 'blocked') {
                 console.log(`[AUTH] Blocked access for user ${user.id}. Status: ${profile.status}`);
                 return res.status(403).json({ 
                     status: 'error', 
@@ -151,10 +151,10 @@ export const verifyOtp = async (req: Request, res: Response) => {
                 });
             }
 
-            // Update status if INVITED to ACTIVE
-            if (profile.status === 'INVITED') {
+            // Update status if invited to active
+            if (profile.status === 'invited') {
                 const { data: activatedProfile, error: updateError } = await supabase.from('profiles')
-                    .update({ status: 'ACTIVE' })
+                    .update({ status: 'active' })
                     .eq('id', user.id)
                     .select()
                     .single();

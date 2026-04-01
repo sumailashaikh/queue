@@ -26,7 +26,7 @@ export const recomputeProviderDelays = async (providerId: string, businessId: st
             .from('appointments')
             .select('*')
             .eq('business_id', businessId)
-            .eq('provider_id', providerId)
+            // .eq('provider_id', providerId) // TODO: Join with appointment_services if expert assigned at booking
             .eq('appointment_date', todayStr)
             .in('status', ['scheduled', 'confirmed', 'checked_in'])
             .order('appointment_time', { ascending: true });
