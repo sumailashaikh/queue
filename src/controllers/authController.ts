@@ -4,7 +4,7 @@ import { notificationService } from '../services/notificationService';
 
 export const sendOtp = async (req: Request, res: Response) => {
     try {
-        const { phone } = req.body;
+        let { phone } = req.body;
         console.log(`[AUTH] Received OTP request for phone: ${phone}`);
 
         if (!phone) {
@@ -14,6 +14,10 @@ export const sendOtp = async (req: Request, res: Response) => {
                 message: 'Phone number is required'
             });
         }
+
+        // Normalize phone number early: strictly digits and leading +
+        phone = phone.replace(/[^\d+]/g, '');
+        console.log(`[AUTH] Normalized phone: ${phone}`);
 
         console.log('[AUTH] Calling supabase.auth.signInWithOtp...');
         const start = Date.now();
@@ -44,7 +48,7 @@ export const sendOtp = async (req: Request, res: Response) => {
 
 export const verifyOtp = async (req: Request, res: Response) => {
     try {
-        const { phone, otp } = req.body;
+        let { phone, otp } = req.body;
 
         if (!phone || !otp) {
             return res.status(400).json({
@@ -53,8 +57,13 @@ export const verifyOtp = async (req: Request, res: Response) => {
             });
         }
 
+        // Normalize phone number early to ensure DB lookups match correctly
+        // This resolves "Service configuration error" caused by lookup failures
+        const originalPhone = phone; // Keep for verifyOtp if needed
+        phone = phone.replace(/[^\d+]/g, '');
+
         const { data, error } = await supabase.auth.verifyOtp({
-            phone,
+            phone: originalPhone, // Supabase might be strict about which number it sent to
             token: otp,
             type: 'sms'
         });
@@ -108,17 +117,13 @@ export const verifyOtp = async (req: Request, res: Response) => {
             isNewUser = true;
             console.log(`[AUTH] Creating new profile from pending registration for ${phone}`);
             
-            // Normalize phone number: Keep only digits and the optional leading + sign
-            // This prevents "profiles_phone_check" constraint violations (e.g., from spaces)
-            const normalizedPhone = phone.replace(/[^\d+]/g, '');
-
             // Use UPSERT to handle case where the trigger might have already inserted it
             const { data: newProfile, error: upsertError } = await supabase.from('profiles').upsert([
                 {
                     id: user.id,
                     full_name: pending.full_name || 'New User',
                     role: pending.role || 'employee',
-                    phone: normalizedPhone,
+                    phone: phone, // Already normalized at top
                     status: 'ACTIVE',
                     is_verified: true,
                     business_id: pending.business_id
@@ -162,9 +167,8 @@ export const verifyOtp = async (req: Request, res: Response) => {
             }
 
             // Sync phone if missing
-            const normalizedPhone = phone.replace(/[^\d+]/g, '');
-            if (!profile.phone || profile.phone !== normalizedPhone) {
-                await supabase.from('profiles').update({ phone: normalizedPhone }).eq('id', user.id);
+            if (!profile.phone || profile.phone !== phone) {
+                await supabase.from('profiles').update({ phone: phone }).eq('id', user.id);
             }
         }
 
