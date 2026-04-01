@@ -552,16 +552,21 @@ export const inviteEmployee = async (req: any, res: Response) => {
         
         let notified = false;
         if (!notificationService.isMock) {
-            // Send WhatsApp
-            notified = await notificationService.sendWhatsApp(phone, msg);
-            // Also send SMS for redundancy
+            const whatsappSent = await notificationService.sendWhatsApp(phone, msg);
+            const smsSent = await notificationService.sendSMS(phone, msg);
+            notified = whatsappSent || smsSent;
+        } else {
+            // If in mock mode, we still "notified" (mock-notified) the user
+            await notificationService.sendWhatsApp(phone, msg);
             await notificationService.sendSMS(phone, msg);
+            notified = true;
         }
 
         res.status(200).json({
             status: 'success',
-            message: notified ? 'providers.success_invite' : 'providers.success_invite_mock',
-            notified: notified
+            message: notified ? (notificationService.isMock ? 'providers.success_invite_mock' : 'providers.success_invite') : 'providers.err_notify_fail',
+            notified: notified,
+            is_mock: notificationService.isMock
         });
 
     } catch (error: any) {
