@@ -579,8 +579,10 @@ export const getTodayQueue = async (req: Request, res: Response) => {
                 `)
                 .eq('business_id', qData.business_id)
                 .in('status', ['scheduled', 'confirmed'])
+                .is('checked_in_at', null) // CRITICAL: Stop flipping back restored/checked-in guests
                 .lt('start_time', thirtyMinsAgo)
                 .gt('start_time', startOfToday.toISOString()); // Only today's scheduled
+
 
             if (expiredAppts && expiredAppts.length > 0) {
                 for (const appt of expiredAppts) {
@@ -2027,9 +2029,14 @@ export const restoreQueueEntry = async (req: Request, res: Response) => {
         if (entry.appointment_id) {
             await supabase
                 .from('appointments')
-                .update({ status: 'confirmed' }) // Back to confirmed (waiting)
+                .update({ 
+                    status: 'checked_in',    // Use 'checked_in' to break the loop (getTodayQueue only looks for 'confirmed')
+                    checked_in_at: new Date().toISOString() // Backup marker
+                }) 
                 .eq('id', entry.appointment_id);
         }
+
+
 
         // 6. Trigger position updates and notifications
         await processQueueNotifications(entry.queue_id, todayStr, supabase);
