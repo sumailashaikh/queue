@@ -14,3 +14,7 @@ export const supabase = createClient(
     supabaseUrl || '',
     supabaseKey || ''
 );
+
+// Admin client for bypassing RLS in safe backend operations
+const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+export const adminSupabase = serviceRoleKey ? createClient(supabaseUrl || '', serviceRoleKey) : supabase;

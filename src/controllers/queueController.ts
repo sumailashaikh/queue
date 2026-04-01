@@ -36,16 +36,27 @@ export const getMyTasks = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 1. Get today's date in local time (relative to business, but for now we just get UTC today or default)
+        // 1. Find the provider record for this user
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id')
+            .eq('user_id', userId)
+            .single();
+
+        if (!provider) {
+            return res.status(200).json({ status: 'success', data: [] });
+        }
+
+        // 2. Fetch today's date in local time
         const todayStr = new Date().toISOString().split('T')[0];
 
-        // 2. Fetch entries assigned to this user
-        // We look for assigned_to (Profile ID)
+        // 2. Fetch ENTRIES where this provider is assigned to ANY service
+        // OR where they are the primary assigned_to
         const { data, error } = await supabase
             .from('queue_entries')
             .select(`
                 *,
-                queue_entry_services (
+                queue_entry_services!inner (
                     *,
                     services (id, name)
                 ),
@@ -55,7 +66,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
                     business_id
                 )
             `)
-            .or(`assigned_to.eq.${userId}`)
+            .or(`assigned_to.eq.${userId},queue_entry_services.assigned_provider_id.eq.${provider.id}`)
             .eq('entry_date', todayStr)
             .in('status', ['serving', 'waiting'])
             .order('position', { ascending: true });
@@ -1485,7 +1496,21 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
             }
         }
 
-        const { data, error } = await supabase
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        // 1. Ownership Check
+        const { data: task, error: fetchError } = await req.supabase
+            .from('queue_entry_services')
+            .select('id, queue_entry_id, queue_entries!inner(queue_id, queues!inner(business_id))')
+            .eq('id', id)
+            .single();
+
+        if (fetchError || !task) {
+            return res.status(404).json({ status: 'error', message: 'Task not found or access denied' });
+        }
+
+        // 2. Perform the update with admin client to bypass RLS/Constraint issues
+        const { data, error } = await adminSupabase
             .from('queue_entry_services')
             .update({ assigned_provider_id: provider_id || null })
             .eq('id', id)

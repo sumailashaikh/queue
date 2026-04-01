@@ -103,24 +103,28 @@ export const getServiceProviders = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        let query = supabase.from('service_providers').select('*, services:provider_services(services(id, name))');
-
-        if (business_id) {
-            query = query.eq('business_id', business_id);
+        const { adminSupabase } = require('../config/supabaseClient');
+        
+        let targetBusinessId = business_id;
+        
+        // 1. Ownership & Permission check
+        if (targetBusinessId) {
+            const { data: biz } = await req.supabase.from('businesses').select('id').eq('id', targetBusinessId).single();
+            if (!biz) return res.status(403).json({ status: 'error', message: 'Forbidden' });
         } else {
-            // If no business_id provided, find businesses owned by user
-            const { data: businesses } = await supabase
-                .from('businesses')
-                .select('id')
-                .eq('owner_id', userId);
-
-            if (businesses && businesses.length > 0) {
-                const businessIds = businesses.map((b: any) => b.id);
-                query = query.in('business_id', businessIds);
-            } else {
+            // Find businesses owned by user first (using authenticated client to check RLS)
+            const { data: businesses } = await req.supabase.from('businesses').select('id');
+            if (!businesses || businesses.length === 0) {
                 return res.status(200).json({ status: 'success', data: [] });
             }
+            targetBusinessId = businesses[0].id; // Fallback to first if not provided
         }
+
+        // 2. Fetch using adminSupabase to see ALL providers (including those without user_id yet)
+        let query = adminSupabase
+            .from('service_providers')
+            .select('*, services:provider_services(services(id, name))')
+            .eq('business_id', targetBusinessId);
 
         const { data: providers, error } = await query.order('name', { ascending: true });
 
