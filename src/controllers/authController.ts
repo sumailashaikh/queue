@@ -63,7 +63,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
         phone = phone.replace(/[^\d+]/g, '');
 
         const { data, error } = await supabase.auth.verifyOtp({
-            phone: originalPhone, // Supabase might be strict about which number it sent to
+            phone: phone, // Must match normalized phone from signInWithOtp
             token: otp,
             type: 'sms'
         });
