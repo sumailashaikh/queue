@@ -560,40 +560,48 @@ export const getTodayQueue = async (req: Request, res: Response) => {
             startOfToday.setHours(0, 0, 0, 0);
 
             // 1.5 Auto-Process No-Shows for Appointments (30-min grace)
-            // Find today's appointments that are past due but not checked in
+            // Find today's appointments that are past due
             const { data: expiredAppts } = await supabase
                 .from('appointments')
-                .update({ status: 'no_show' })
-                .eq('business_id', qData.business_id)
-                .in('status', ['scheduled', 'confirmed'])
-                .lt('start_time', thirtyMinsAgo)
-                .gt('start_time', startOfToday.toISOString()) // Only today's scheduled
                 .select(`
                     id, 
                     user_id, 
                     guest_name, 
                     guest_phone,
+                    status,
+                    start_time,
                     profiles:user_id (full_name, phone),
                     appointment_services (
                         price,
                         duration_minutes,
                         services!service_id (id, name)
                     )
-                `);
+                `)
+                .eq('business_id', qData.business_id)
+                .in('status', ['scheduled', 'confirmed'])
+                .lt('start_time', thirtyMinsAgo)
+                .gt('start_time', startOfToday.toISOString()); // Only today's scheduled
 
             if (expiredAppts && expiredAppts.length > 0) {
                 for (const appt of expiredAppts) {
                     const { data: existingEntry } = await supabase
                         .from('queue_entries')
-                        .select('id')
+                        .select('id, status')
                         .eq('appointment_id', appt.id)
                         .single();
 
+                    // CRITICAL FIX: Only auto-no-show if NO entry exists OR if entry is still just 'waiting' 
+                    // AND NOT manually handled or restored.
+                    // If entry is 'serving', 'completed', or has been manually handled, SKIP auto-no-show.
                     if (!existingEntry) {
                         const total_duration = (appt as any).appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
                         const total_price = (appt as any).appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
                         const serviceNames = (appt as any).appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Appointment Service';
 
+                        // 1. Mark Appointment as No-Show
+                        await supabase.from('appointments').update({ status: 'no_show' }).eq('id', appt.id);
+
+                        // 2. Insert No-Show Queue Entry
                         await supabase.from('queue_entries').insert([{
                             queue_id: id,
                             appointment_id: appt.id,
@@ -608,11 +616,15 @@ export const getTodayQueue = async (req: Request, res: Response) => {
                             position: 0,
                             ticket_number: 'A-NS'
                         }]);
-                    } else {
+                    } else if (existingEntry.status === 'waiting') {
+                        // If it's still waiting and past due, mark both as no-show
+                        await supabase.from('appointments').update({ status: 'no_show' }).eq('id', appt.id);
                         await supabase.from('queue_entries').update({ status: 'no_show' }).eq('id', existingEntry.id);
                     }
+                    // Else: If status is 'serving', 'completed', 'no_show' (already), or 'restored' (waiting but handled), we don't flip it.
                 }
             }
+
         }
 
         // 1.6 Auto-Process Skipped Entries (7 minute rule)
@@ -1673,20 +1685,44 @@ export const startTask = async (req: Request, res: Response) => {
 export const completeTask = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // queue_entry_service_id
+        const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
-        // 1. Fetch task details to check started_at
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 1. Fetch task details and business owner info
         const { data: task, error: taskError } = await supabase
             .from('queue_entry_services')
             .select(`
                 *,
-                queue_entries!inner (id, appointment_id, queues!inner(business_id))
+                queue_entries!inner (
+                    id, 
+                    appointment_id, 
+                    queues!inner(
+                        business_id,
+                        businesses!inner(owner_id)
+                    )
+                )
             `)
             .eq('id', id)
             .single();
 
         if (taskError || !task) {
             return res.status(404).json({ status: 'error', message: 'Task not found' });
+        }
+
+        // PERMISSION CHECK: Must be the assigned provider OR the business owner
+        const ownerId = task.queue_entries?.queues?.businesses?.owner_id;
+        const isOwner = ownerId === userId;
+        const isAssignedProvider = task.assigned_provider_id === userId;
+
+        if (!isOwner && !isAssignedProvider) {
+            return res.status(403).json({ 
+                status: 'error', 
+                message: 'You do not have permission to complete this task. Only the assigned employee or owner can do this.' 
+            });
         }
 
         if (!task.started_at) {
@@ -1703,6 +1739,9 @@ export const completeTask = async (req: Request, res: Response) => {
         const delayMinutes = Math.max(0, actualMinutes - (task.duration_minutes || 0));
 
         // 3. Mark task as done
+        const { data: profile } = await supabase.from('profiles').select('role').eq('id', userId).single();
+        const userRole = (profile?.role === 'owner' || profile?.role === 'admin' || isOwner) ? 'OWNER' : 'EMPLOYEE';
+
         const { data: updatedTask, error: updateError } = await supabase
             .from('queue_entry_services')
             .update({
@@ -1710,8 +1749,8 @@ export const completeTask = async (req: Request, res: Response) => {
                 completed_at: now.toISOString(),
                 actual_minutes: actualMinutes,
                 delay_minutes: delayMinutes,
-                completed_by_id: req.user?.id,
-                completed_by_role: req.user?.role
+                completed_by_id: userId,
+                completed_by_role: userRole
             })
             .eq('id', id)
             .select()
@@ -1736,16 +1775,13 @@ export const completeTask = async (req: Request, res: Response) => {
 
         if (allDone) {
             // Auto-complete the whole entry
-            const { data: profile } = await supabase.from('profiles').select('role').eq('id', req.user?.id).single();
-            const role = (profile?.role === 'owner' || profile?.role === 'admin') ? 'OWNER' : 'EMPLOYEE';
-
             await supabase
                 .from('queue_entries')
                 .update({
                     status: 'completed',
                     completed_at: now.toISOString(),
-                    completed_by_id: req.user?.id,
-                    completed_by_role: role
+                    completed_by_id: userId,
+                    completed_by_role: userRole
                 })
                 .eq('id', task.queue_entry_id);
 
@@ -1770,6 +1806,7 @@ export const completeTask = async (req: Request, res: Response) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 };
+
 
 export const skipQueueEntry = async (req: Request, res: Response) => {
     try {
