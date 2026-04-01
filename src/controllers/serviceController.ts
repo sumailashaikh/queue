@@ -54,7 +54,7 @@ export const createService = async (req: Request, res: Response) => {
 
         if (existingServices && existingServices.length > 0) {
             console.log(`[DEBUG] Duplicate found: ${existingServices.length} matching rows.`);
-            return res.status(400).json({ status: 'error', message: 'A service with this name already exists' });
+            return res.status(400).json({ status: 'error', message: 'services.err_duplicate' });
         }
 
         const { data, error } = await supabase
