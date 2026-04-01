@@ -44,7 +44,7 @@ export const createServiceProvider = async (req: Request, res: Response) => {
 
         if (existing) {
             if (existing.is_active) {
-                return res.status(400).json({ 
+                return res.status(409).json({ 
                     status: 'error', 
                     message: 'providers.already_exists' 
                 });

@@ -117,8 +117,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
                     phone: phone,
                     status: 'ACTIVE',
                     is_verified: true,
-                    business_id: pending.business_id,
-                    updated_at: new Date().toISOString()
+                    business_id: pending.business_id
                 }
             ], { onConflict: 'id' }).select().single();
 
