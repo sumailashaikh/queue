@@ -307,17 +307,31 @@ export const deleteServiceProvider = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // Soft delete
-        const { data, error } = await supabase
+        // 1. SAFETY CHECK: Check for active tasks
+        const { count: taskCount } = await supabase
+            .from('queue_entry_services')
+            .select('*', { count: 'exact', head: true })
+            .eq('assigned_provider_id', id)
+            .in('task_status', ['pending', 'in_progress']);
+
+        if (taskCount && taskCount > 0) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'providers.err_active_tasks',
+                count: taskCount
+            });
+        }
+
+        // 2. Soft delete
+        const { data, error, count } = await supabase
             .from('service_providers')
             .update({ is_active: false })
             .eq('id', id)
-            .select()
-            .single();
+            .select('*', { count: 'exact', head: true });
 
         if (error) throw error;
 
-        if (!data) {
+        if (count === 0) {
             return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
         }
 
@@ -327,7 +341,8 @@ export const deleteServiceProvider = async (req: Request, res: Response) => {
         });
 
     } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+        console.error('[SP] Delete Provider Error:', error);
+        res.status(500).json({ status: 'error', message: error.message || 'providers.err_generic' });
     }
 };
 

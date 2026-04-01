@@ -565,7 +565,8 @@ export const inviteEmployee = async (req: any, res: Response) => {
         });
 
     } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+        console.error('[ADMIN] Invite Employee Error:', error);
+        res.status(500).json({ status: 'error', message: error.message || 'providers.err_generic' });
     }
 };
 
@@ -618,12 +619,17 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         }
 
         // 4. Deactivate Service Provider record
-        const { error: spError } = await adminSupabase
+        const { error: spError, count: spCount } = await adminSupabase
             .from('service_providers')
             .update({ is_active: false })
-            .eq('id', employee_id);
+            .eq('id', employee_id)
+            .select('*', { count: 'exact', head: true });
 
         if (spError) throw spError;
+        
+        if (spCount === 0) {
+            return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
+        }
 
         // 5. Deactivate linked Profile if exists
         if (provider.user_id) {
@@ -640,6 +646,7 @@ export const deactivateEmployee = async (req: any, res: Response) => {
             // Notify (Optional)
             const { data: profile } = await adminSupabase.from('profiles').select('phone').eq('id', provider.user_id).single();
             if (profile?.phone) {
+                const { notificationService } = require('../services/notificationService');
                 await notificationService.sendWhatsApp(profile.phone, `Your access to ${business.name} has been revoked. Please contact your manager.`);
             }
         }
@@ -650,7 +657,8 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         });
 
     } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+        console.error('[ADMIN] Deactivate Employee Error:', error);
+        res.status(500).json({ status: 'error', message: error.message || 'providers.err_generic' });
     }
 };
 
