@@ -503,7 +503,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
                 .update({ 
                     role: role || 'employee', 
                     business_id,
-                    status: 'INVITED' 
+                    status: 'invited' 
                 })
                 .eq('id', profile.id);
 
@@ -517,7 +517,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
                     business_id,
                     full_name: full_name || 'Invited Employee',
                     is_verified: true,
-                    status: 'INVITED'
+                    status: 'invited'
                 }]);
 
             if (pendingError) throw pendingError;
@@ -528,15 +528,16 @@ export const inviteEmployee = async (req: any, res: Response) => {
             const { data: existingSP } = await adminSupabase
                 .from('service_providers')
                 .select('id')
-                .eq('user_id', profile ? profile.id : null)
+                .eq('phone', phone) // Match by phone for invitations
                 .maybeSingle();
 
             if (!existingSP) {
                 await adminSupabase.from('service_providers').insert({
                     business_id,
                     name: full_name || 'Invited Employee',
+                    phone: phone,
                     user_id: profile ? profile.id : null, 
-                    status: 'active'
+                    is_active: true
                 });
             }
         } catch (spError) {
