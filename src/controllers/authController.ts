@@ -69,20 +69,30 @@ export const verifyOtp = async (req: Request, res: Response) => {
         }
 
         // 1. Fetch existing profile OR check pending_registrations
-        const { data: profile } = await supabase
+        // We do this AFTER verifyOtp to ensure we have the auth.uid()
+        const { data: profile, error: profileError } = await supabase
             .from('profiles')
             .select('*')
             .eq('id', user.id)
             .maybeSingle();
 
-        const { data: pending } = await supabase
+        if (profileError) {
+            console.error('[AUTH] Error fetching profile:', profileError);
+        }
+
+        const { data: pending, error: pendingError } = await supabase
             .from('pending_registrations')
             .select('*')
             .eq('phone', phone)
             .maybeSingle();
 
+        if (pendingError) {
+            console.error('[AUTH] Error fetching pending registration:', pendingError);
+        }
+
         // 2. Access Control: Only invited users or existing users can login
         if (!profile && !pending) {
+            console.log(`[AUTH] Access denied for phone ${phone}. No profile or pending registration found.`);
             return res.status(403).json({ 
                 status: 'error', 
                 message: 'Access denied. Please contact your business owner to get an invitation.' 
@@ -92,10 +102,14 @@ export const verifyOtp = async (req: Request, res: Response) => {
         let isNewUser = false;
         let finalProfileData = profile;
 
-        // 3. Handle New User from Invitation
+        // 3. Handle New User from Invitation or Trigger
+        // If profile doesn't exist yet (or trigger hasn't finished), but we have a pending invite
         if (!profile && pending) {
             isNewUser = true;
-            const { data: newProfile, error: insertError } = await supabase.from('profiles').insert([
+            console.log(`[AUTH] Creating new profile from pending registration for ${phone}`);
+            
+            // Use UPSERT to handle case where the trigger might have already inserted it
+            const { data: newProfile, error: upsertError } = await supabase.from('profiles').upsert([
                 {
                     id: user.id,
                     full_name: pending.full_name || 'New User',
@@ -104,16 +118,25 @@ export const verifyOtp = async (req: Request, res: Response) => {
                     status: 'ACTIVE',
                     is_verified: true,
                     business_id: pending.business_id,
-                    created_at: new Date().toISOString()
+                    updated_at: new Date().toISOString()
                 }
-            ]).select().single();
+            ], { onConflict: 'id' }).select().single();
 
-            if (insertError) throw insertError;
+            if (upsertError) {
+                console.error('[AUTH] Profile upsert failed:', upsertError);
+                throw upsertError;
+            }
+            
             finalProfileData = newProfile;
-            await supabase.from('pending_registrations').delete().eq('phone', phone);
+            
+            // Clean up pending registration
+            const { error: deleteError } = await supabase.from('pending_registrations').delete().eq('phone', phone);
+            if (deleteError) console.error('[AUTH] Failed to delete pending registration:', deleteError);
+
         } else if (profile) {
             // 4. Status Check for existing users
             if (profile.status === 'INACTIVE' || profile.status === 'BLOCKED') {
+                console.log(`[AUTH] Blocked access for user ${user.id}. Status: ${profile.status}`);
                 return res.status(403).json({ 
                     status: 'error', 
                     message: `Your account is ${profile.status.toLowerCase()}. Access denied.` 
@@ -122,20 +145,26 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
             // Update status if INVITED to ACTIVE
             if (profile.status === 'INVITED') {
-                const { data: activatedProfile } = await supabase.from('profiles')
+                const { data: activatedProfile, error: updateError } = await supabase.from('profiles')
                     .update({ status: 'ACTIVE' })
                     .eq('id', user.id)
                     .select()
                     .single();
-                finalProfileData = activatedProfile;
+                
+                if (updateError) {
+                    console.error('[AUTH] Failed to activate profile:', updateError);
+                } else {
+                    finalProfileData = activatedProfile;
+                }
             }
 
             // Sync phone if missing
-            if (!profile.phone) {
+            if (!profile.phone || profile.phone !== phone) {
                 await supabase.from('profiles').update({ phone: phone }).eq('id', user.id);
             }
         }
 
+        console.log(`[AUTH] Login successful for user: ${user.id}, Role: ${finalProfileData?.role}`);
         res.status(200).json({
             status: 'success',
             message: 'Login successful',
@@ -147,9 +176,14 @@ export const verifyOtp = async (req: Request, res: Response) => {
         });
 
     } catch (error: any) {
-        res.status(401).json({
+        console.error('[AUTH] verifyOtp critical error:', error);
+        
+        // Differentiate between Auth errors (bad OTP) and Server errors
+        const isAuthError = error.status === 400 || error.message?.toLowerCase().includes('otp') || error.message?.toLowerCase().includes('verification');
+        
+        res.status(isAuthError ? 401 : 500).json({
             status: 'error',
-            message: error.message
+            message: error.message || 'An unexpected error occurred'
         });
     }
 };
