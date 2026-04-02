@@ -79,28 +79,42 @@ export const getMyTasks = async (req: Request, res: Response) => {
         // 2. Fetch today's date in local time
         const todayStr = new Date().toISOString().split('T')[0];
 
-        // 2. Fetch ENTRIES where this provider is assigned to ANY service
-        // OR where they are the primary assigned_to
-        const { data, error } = await adminSupabase
-            .from('queue_entries')
-            .select(`
+        // 2. Fetch tasks via two safe queries (avoid PostgREST .or raw parser issues with UUIDs)
+        const baseSelect = `
+            *,
+            queue_entry_services!inner (
                 *,
-                queue_entry_services!inner (
-                    *,
-                    services (id, name)
-                ),
-                queues (
-                    id,
-                    name,
-                    business_id
-                )
-            `)
-            .or(`assigned_to.eq.${userId},queue_entry_services.assigned_provider_id.eq.${provider.id}`)
-            .eq('entry_date', todayStr)
-            .in('status', ['serving', 'waiting'])
-            .order('position', { ascending: true });
+                services (id, name)
+            ),
+            queues (
+                id,
+                name,
+                business_id
+            )
+        `;
 
-        if (error) throw error;
+        const [primaryAssigned, serviceAssigned] = await Promise.all([
+            adminSupabase
+                .from('queue_entries')
+                .select(baseSelect)
+                .eq('assigned_to', userId)
+                .eq('entry_date', todayStr)
+                .in('status', ['serving', 'waiting']),
+            adminSupabase
+                .from('queue_entries')
+                .select(baseSelect)
+                .eq('queue_entry_services.assigned_provider_id', provider.id)
+                .eq('entry_date', todayStr)
+                .in('status', ['serving', 'waiting'])
+        ]);
+
+        if (primaryAssigned.error) throw primaryAssigned.error;
+        if (serviceAssigned.error) throw serviceAssigned.error;
+
+        const mergedMap = new Map<string, any>();
+        (primaryAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
+        (serviceAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
+        const data = Array.from(mergedMap.values()).sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
 
         res.status(200).json({
             status: 'success',
