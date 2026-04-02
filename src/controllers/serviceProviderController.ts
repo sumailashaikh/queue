@@ -1,6 +1,29 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 
+const isMissingColumnError = (error: any, columnName: string) => {
+    const message = String(error?.message || '').toLowerCase();
+    return message.includes(`'${columnName.toLowerCase()}'`) && message.includes('column');
+};
+
+const validateTextByLanguage = (text: string, language: string): boolean => {
+    if (!text || !text.trim()) return true;
+    const baseLang = (language || 'en').split('-')[0].toLowerCase();
+    const commonPattern = "0-9\\s\\.,!?'\"()&@#%*+=\\-\\/\\[\\]{}|_\\\\";
+    const patterns: Record<string, string> = {
+        en: `a-zA-Z${commonPattern}`,
+        es: `a-zA-ZáéíóúüñÁÉÍÓÚÜÑ${commonPattern}`,
+        hi: `\\u0900-\\u097F${commonPattern}`,
+        ar: `\\u0600-\\u06FF\\u0750-\\u077F\\u08A0-\\u08FF\\uFB50-\\uFDFF\\uFE70-\\uFEFF${commonPattern}`
+    };
+    const pattern = patterns[baseLang] || patterns.en;
+    try {
+        return new RegExp(`^[${pattern}]*$`, 'u').test(text);
+    } catch {
+        return new RegExp(`^[${pattern}]*$`).test(text);
+    }
+};
+
 export const createServiceProvider = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
@@ -740,25 +763,45 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         }
 
         // 3. Determine status based on role
-        const { data: profile } = await supabase.from('profiles').select('role, full_name').eq('id', userId).single();
+        const { data: profile } = await supabase.from('profiles').select('role, full_name, ui_language').eq('id', userId).single();
         const isAdminOrOwner = profile?.role === 'owner' || profile?.role === 'admin';
         const status = isAdminOrOwner ? 'APPROVED' : 'PENDING';
 
+        if (note && !validateTextByLanguage(note, profile?.ui_language || 'en')) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'common.err_invalid_chars'
+            });
+        }
+
         // 4. Insert leave
-        const { data, error } = await supabase
+        const payload: any = {
+            provider_id: provider.id,
+            business_id: provider.business_id,
+            start_date,
+            end_date,
+            leave_type,
+            note,
+            status,
+            approved_by: isAdminOrOwner ? userId : null
+        };
+        let { data, error } = await supabase
             .from('provider_leaves')
-            .insert([{
-                provider_id: provider.id,
-                business_id: provider.business_id,
-                start_date,
-                end_date,
-                leave_type,
-                note,
-                status,
-                approved_by: isAdminOrOwner ? userId : null
-            }])
+            .insert([payload])
             .select()
             .single();
+
+        // Backward-compatibility: some DBs don't yet have approved_by.
+        if (error && isMissingColumnError(error, 'approved_by')) {
+            delete payload.approved_by;
+            const retry = await supabase
+                .from('provider_leaves')
+                .insert([payload])
+                .select()
+                .single();
+            data = retry.data as any;
+            error = retry.error as any;
+        }
 
         if (error) throw error;
 
@@ -829,16 +872,41 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
         // 2. Update status and optional reason
         const { reason } = req.body;
-        const { data, error } = await supabase
+        const updatePayload: any = {
+            status,
+            approved_by: userId,
+            rejection_reason: status === 'REJECTED' ? reason : null
+        };
+        let { data, error } = await supabase
             .from('provider_leaves')
-            .update({ 
-                status, 
-                approved_by: userId,
-                rejection_reason: status === 'REJECTED' ? reason : null 
-            })
+            .update(updatePayload)
             .eq('id', leaveId)
             .select()
             .single();
+
+        // Backward-compatibility: columns may not exist on older DBs.
+        if (error && isMissingColumnError(error, 'approved_by')) {
+            delete updatePayload.approved_by;
+            const retry = await supabase
+                .from('provider_leaves')
+                .update(updatePayload)
+                .eq('id', leaveId)
+                .select()
+                .single();
+            data = retry.data as any;
+            error = retry.error as any;
+        }
+        if (error && isMissingColumnError(error, 'rejection_reason')) {
+            delete updatePayload.rejection_reason;
+            const retry = await supabase
+                .from('provider_leaves')
+                .update(updatePayload)
+                .eq('id', leaveId)
+                .select()
+                .single();
+            data = retry.data as any;
+            error = retry.error as any;
+        }
 
         if (error) throw error;
 
