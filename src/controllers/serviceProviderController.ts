@@ -626,14 +626,33 @@ export const assignProviderToEntry = async (req: Request, res: Response) => {
 
 export const getProviderLeaves = async (req: Request, res: Response) => {
     try {
-        const { id } = req.params; // provider_id
+        const { id } = req.params; // provider_id or user_id
         const { business_id } = req.query; // optional but recommended
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        // Resolve provider when frontend passes auth user id instead of provider id.
+        let providerId = id;
+        const { data: providerById } = await adminSupabase
+            .from('service_providers')
+            .select('id')
+            .eq('id', id)
+            .maybeSingle();
+        if (!providerById) {
+            const { data: providerByUser } = await adminSupabase
+                .from('service_providers')
+                .select('id')
+                .eq('user_id', id)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            if (providerByUser) providerId = providerByUser.id;
+        }
 
         let query = supabase
             .from('provider_leaves')
             .select('*')
-            .eq('provider_id', id);
+            .eq('provider_id', providerId);
 
         if (business_id) {
             query = query.eq('business_id', business_id);
@@ -654,10 +673,11 @@ export const getProviderLeaves = async (req: Request, res: Response) => {
 
 export const addProviderLeave = async (req: Request, res: Response) => {
     try {
-        const { id } = req.params; // provider_id
+        const { id } = req.params; // provider_id or user_id
         const { start_date, end_date, leave_type, note } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
@@ -667,12 +687,23 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Missing required fields' });
         }
 
-        // 1. Verify ownership OR self-application
-        const { data: provider } = await supabase
+        // 1. Resolve provider by id OR user_id, then verify ownership/self
+        let { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, business_id, user_id')
             .eq('id', id)
-            .single();
+            .maybeSingle();
+
+        if (!provider) {
+            const byUser = await adminSupabase
+                .from('service_providers')
+                .select('id, business_id, user_id')
+                .eq('user_id', id)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            provider = byUser.data;
+        }
 
         if (!provider) {
             return res.status(404).json({ status: 'error', message: 'Provider not found' });
@@ -696,7 +727,7 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         const { data: overlaps } = await supabase
             .from('provider_leaves')
             .select('id')
-            .eq('provider_id', id)
+            .eq('provider_id', provider.id)
             .lte('start_date', end_date)
             .gte('end_date', start_date)
             .neq('status', 'REJECTED'); // Don't count rejected leaves
@@ -717,7 +748,7 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         const { data, error } = await supabase
             .from('provider_leaves')
             .insert([{
-                provider_id: id,
+                provider_id: provider.id,
                 business_id: provider.business_id,
                 start_date,
                 end_date,

@@ -31,6 +31,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
@@ -52,7 +53,6 @@ export const getMyTasks = async (req: Request, res: Response) => {
                 .maybeSingle();
             const normalizedPhone = (profile?.phone || '').replace(/[^\d+]/g, '');
             if (normalizedPhone) {
-                const { adminSupabase } = require('../config/supabaseClient');
                 const { data: providerByPhone } = await adminSupabase
                     .from('service_providers')
                     .select('id, user_id')
@@ -81,7 +81,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
 
         // 2. Fetch ENTRIES where this provider is assigned to ANY service
         // OR where they are the primary assigned_to
-        const { data, error } = await supabase
+        const { data, error } = await adminSupabase
             .from('queue_entries')
             .select(`
                 *,
