@@ -1473,17 +1473,19 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
+        const { adminSupabase } = require('../config/supabaseClient');
+
         // 0. Validate if provider is on leave for this task's date
         if (provider_id) {
-            const { data: taskStr } = await supabase
+            const { data: taskStr } = await adminSupabase
                 .from('queue_entry_services')
                 .select('queue_entries!inner(entry_date)')
                 .eq('id', id)
-                .single();
+                .maybeSingle();
 
             if (taskStr && taskStr.queue_entries?.entry_date) {
                 const entryDate = taskStr.queue_entries.entry_date;
-                const { data: leaves } = await supabase
+                const { data: leaves } = await adminSupabase
                     .from('provider_leaves')
                     .select('id')
                     .eq('provider_id', provider_id)
@@ -1496,17 +1498,40 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
             }
         }
 
-        const { adminSupabase } = require('../config/supabaseClient');
-
-        // 1. Ownership Check
-        const { data: task, error: fetchError } = await req.supabase
+        // 1. Fetch task with admin client (avoid RLS no-row .single errors)
+        const { data: task, error: fetchError } = await adminSupabase
             .from('queue_entry_services')
             .select('id, queue_entry_id, queue_entries!inner(queue_id, queues!inner(business_id))')
             .eq('id', id)
-            .single();
+            .maybeSingle();
 
         if (fetchError || !task) {
             return res.status(404).json({ status: 'error', message: 'Task not found or access denied' });
+        }
+
+        // 1b. Owner/Admin guard
+        const businessId = task.queue_entries?.queues?.business_id;
+        if (!businessId) {
+            return res.status(400).json({ status: 'error', message: 'Invalid task/business context' });
+        }
+
+        const { data: roleProfile } = await adminSupabase
+            .from('profiles')
+            .select('role')
+            .eq('id', userId)
+            .maybeSingle();
+        const isAdmin = roleProfile?.role === 'admin';
+
+        if (!isAdmin) {
+            const { data: business, error: businessErr } = await adminSupabase
+                .from('businesses')
+                .select('owner_id')
+                .eq('id', businessId)
+                .maybeSingle();
+
+            if (businessErr || !business || business.owner_id !== userId) {
+                return res.status(403).json({ status: 'error', message: 'Unauthorized to assign provider' });
+            }
         }
 
         // 2. Perform the update with admin client to bypass RLS/Constraint issues
