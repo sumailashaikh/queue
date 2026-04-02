@@ -37,11 +37,40 @@ export const getMyTasks = async (req: Request, res: Response) => {
         }
 
         // 1. Find the provider record for this user
-        const { data: provider } = await supabase
+        let { data: provider } = await supabase
             .from('service_providers')
             .select('id')
             .eq('user_id', userId)
-            .single();
+            .maybeSingle();
+
+        // Fallback by phone for newly invited employees not linked yet.
+        if (!provider) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('phone')
+                .eq('id', userId)
+                .maybeSingle();
+            const normalizedPhone = (profile?.phone || '').replace(/[^\d+]/g, '');
+            if (normalizedPhone) {
+                const { adminSupabase } = require('../config/supabaseClient');
+                const { data: providerByPhone } = await adminSupabase
+                    .from('service_providers')
+                    .select('id, user_id')
+                    .eq('phone', normalizedPhone)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+                if (providerByPhone) {
+                    if (!providerByPhone.user_id) {
+                        await adminSupabase
+                            .from('service_providers')
+                            .update({ user_id: userId })
+                            .eq('id', providerByPhone.id);
+                    }
+                    provider = { id: providerByPhone.id } as any;
+                }
+            }
+        }
 
         if (!provider) {
             return res.status(200).json({ status: 'success', data: [] });

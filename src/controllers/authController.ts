@@ -209,6 +209,36 @@ export const verifyOtp = async (req: Request, res: Response) => {
             }
         }
 
+        // 5. Ensure invited provider row is linked to this auth user (critical for employee dashboard/tasks/leaves)
+        try {
+            const adminSupabase = require('../config/supabaseClient').supabase;
+            const normalizedPhone = phone.replace(/[^\d+]/g, '');
+            const { data: existingLinked } = await adminSupabase
+                .from('service_providers')
+                .select('id')
+                .eq('user_id', user.id)
+                .maybeSingle();
+
+            if (!existingLinked && normalizedPhone) {
+                const { data: providerByPhone } = await adminSupabase
+                    .from('service_providers')
+                    .select('id, user_id')
+                    .eq('phone', normalizedPhone)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+
+                if (providerByPhone && !providerByPhone.user_id) {
+                    await adminSupabase
+                        .from('service_providers')
+                        .update({ user_id: user.id })
+                        .eq('id', providerByPhone.id);
+                }
+            }
+        } catch (linkErr: any) {
+            console.warn('[AUTH] service_provider user link skipped:', linkErr?.message || linkErr);
+        }
+
         console.log(`[AUTH] Login successful for user: ${user.id}, Role: ${finalProfileData?.role}`);
         res.status(200).json({
             status: 'success',

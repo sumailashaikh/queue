@@ -359,11 +359,49 @@ export const getMyProviderProfile = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        const { data, error } = await supabase
+        let { data, error } = await supabase
             .from('service_providers')
             .select('*, businesses(*), services:provider_services(services(*))')
             .eq('user_id', userId)
-            .single();
+            .maybeSingle();
+
+        // Fallback for invited employees whose provider row was created by phone before first login.
+        if (!data) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('phone')
+                .eq('id', userId)
+                .maybeSingle();
+
+            const normalizedPhone = (profile?.phone || '').replace(/[^\d+]/g, '');
+            if (normalizedPhone) {
+                const { adminSupabase } = require('../config/supabaseClient');
+                const { data: phoneProvider } = await adminSupabase
+                    .from('service_providers')
+                    .select('id, user_id')
+                    .eq('phone', normalizedPhone)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+
+                if (phoneProvider) {
+                    if (!phoneProvider.user_id) {
+                        await adminSupabase
+                            .from('service_providers')
+                            .update({ user_id: userId })
+                            .eq('id', phoneProvider.id);
+                    }
+
+                    const relinked = await supabase
+                        .from('service_providers')
+                        .select('*, businesses(*), services:provider_services(services(*))')
+                        .eq('id', phoneProvider.id)
+                        .maybeSingle();
+                    data = relinked.data;
+                    error = relinked.error as any;
+                }
+            }
+        }
 
         if (error || !data) {
             return res.status(404).json({ status: 'error', message: 'Provider profile not found' });
