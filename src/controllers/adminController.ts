@@ -473,8 +473,10 @@ export const inviteEmployee = async (req: any, res: Response) => {
         const { phone, full_name, business_id, role, custom_message } = req.body;
         const supabase = req.supabase;
         const userId = req.user?.id;
+        const normalizedPhone = String(phone || '').replace(/[^\d+]/g, '');
+        const safeRole = (role || 'employee').toLowerCase();
 
-        if (!phone || !business_id) {
+        if (!normalizedPhone || !business_id) {
             return res.status(400).json({ status: 'error', message: 'Phone and Business ID are required' });
         }
 
@@ -495,31 +497,59 @@ export const inviteEmployee = async (req: any, res: Response) => {
         const { data: profile } = await adminSupabase
             .from('profiles')
             .select('id, full_name')
-            .eq('phone', phone)
+            .eq('phone', normalizedPhone)
             .maybeSingle();
 
         if (profile) {
-            const { error: updateError } = await adminSupabase
+            let { error: updateError } = await adminSupabase
                 .from('profiles')
                 .update({ 
-                    role: role || 'employee', 
+                    role: safeRole, 
                     business_id,
                     status: 'invited' 
                 })
                 .eq('id', profile.id);
 
+            // Backward-compatibility for older DBs where profiles.status doesn't allow 'invited'
+            if (updateError && String(updateError.message || '').toLowerCase().includes('check constraint')) {
+                const retry = await adminSupabase
+                    .from('profiles')
+                    .update({
+                        role: safeRole,
+                        business_id,
+                        status: 'pending'
+                    })
+                    .eq('id', profile.id);
+                updateError = retry.error as any;
+            }
+
             if (updateError) throw updateError;
         } else {
-            const { error: pendingError } = await adminSupabase
+            let { error: pendingError } = await adminSupabase
                 .from('pending_registrations')
                 .upsert([{
-                    phone,
-                    role: role || 'employee',
+                    phone: normalizedPhone,
+                    role: safeRole,
                     business_id,
                     full_name: full_name || 'Invited Employee',
                     is_verified: true,
                     status: 'invited'
                 }]);
+
+            // Backward-compatibility for DBs where pending_registrations.status expects uppercase
+            if (pendingError && String(pendingError.message || '').toLowerCase().includes('check constraint')) {
+                const retry = await adminSupabase
+                    .from('pending_registrations')
+                    .upsert([{
+                        phone: normalizedPhone,
+                        role: safeRole,
+                        business_id,
+                        full_name: full_name || 'Invited Employee',
+                        is_verified: true,
+                        status: 'INVITED'
+                    }]);
+                pendingError = retry.error as any;
+            }
 
             if (pendingError) throw pendingError;
         }
@@ -529,14 +559,14 @@ export const inviteEmployee = async (req: any, res: Response) => {
             const { data: existingSP } = await adminSupabase
                 .from('service_providers')
                 .select('id')
-                .eq('phone', phone) // Match by phone for invitations
+                .eq('phone', normalizedPhone) // Match by phone for invitations
                 .maybeSingle();
 
             if (!existingSP) {
                 await adminSupabase.from('service_providers').insert({
                     business_id,
                     name: full_name || 'Invited Employee',
-                    phone: phone,
+                    phone: normalizedPhone,
                     user_id: profile ? profile.id : null, 
                     is_active: true
                 });
@@ -553,9 +583,9 @@ export const inviteEmployee = async (req: any, res: Response) => {
         try {
             await adminSupabase.from('employee_invites').insert({
                 token,
-                phone,
+                phone: normalizedPhone,
                 business_id,
-                role: role || 'employee',
+                role: safeRole,
                 full_name: full_name || null,
                 custom_message: custom_message || null,
                 created_by: userId || null
@@ -576,13 +606,13 @@ export const inviteEmployee = async (req: any, res: Response) => {
         
         let notified = false;
         if (!notificationService.isMock) {
-            const whatsappSent = await notificationService.sendWhatsApp(phone, msg);
-            const smsSent = await notificationService.sendSMS(phone, msg);
+            const whatsappSent = await notificationService.sendWhatsApp(normalizedPhone, msg);
+            const smsSent = await notificationService.sendSMS(normalizedPhone, msg);
             notified = whatsappSent || smsSent;
         } else {
             // If in mock mode, we still "notified" (mock-notified) the user
-            await notificationService.sendWhatsApp(phone, msg);
-            await notificationService.sendSMS(phone, msg);
+            await notificationService.sendWhatsApp(normalizedPhone, msg);
+            await notificationService.sendSMS(normalizedPhone, msg);
             notified = true;
         }
 

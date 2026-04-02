@@ -188,8 +188,8 @@ export const verifyOtp = async (req: Request, res: Response) => {
                 });
             }
 
-            // Update status if invited to active
-            if (profile.status === 'invited') {
+            // Update status to active for invited/pending onboarding states
+            if (profile.status === 'invited' || profile.status === 'pending') {
                 const { data: activatedProfile, error: updateError } = await supabase.from('profiles')
                     .update({ status: 'active' })
                     .eq('id', user.id)
