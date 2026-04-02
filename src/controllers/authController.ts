@@ -48,7 +48,7 @@ export const sendOtp = async (req: Request, res: Response) => {
 
 export const verifyOtp = async (req: Request, res: Response) => {
     try {
-        let { phone, otp } = req.body;
+        let { phone, otp, invite_token } = req.body as any;
 
         if (!phone || !otp) {
             return res.status(400).json({
@@ -106,6 +106,43 @@ export const verifyOtp = async (req: Request, res: Response) => {
                 status: 'error', 
                 message: 'Access denied. Please contact your business owner to get an invitation.' 
             });
+        }
+
+        // Optional: consume one-time invite token (if provided). This enforces token-based onboarding.
+        // Legacy invites still work via pending_registrations, but token consumption gives one-time-link security.
+        if (invite_token) {
+            try {
+                const adminSupabase = require('../config/supabaseClient').supabase;
+                const { data: invite } = await adminSupabase
+                    .from('employee_invites')
+                    .select('token, phone, expires_at, used_at')
+                    .eq('token', invite_token)
+                    .maybeSingle();
+
+                if (!invite) {
+                    return res.status(403).json({ status: 'error', message: 'Invalid or expired invite link.' });
+                }
+                if (invite.used_at) {
+                    return res.status(403).json({ status: 'error', message: 'This invite link has already been used.' });
+                }
+                if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
+                    return res.status(403).json({ status: 'error', message: 'This invite link has expired.' });
+                }
+                const invitePhone = (invite.phone || '').replace(/[^\d+]/g, '');
+                if (invitePhone && invitePhone !== phone) {
+                    return res.status(403).json({ status: 'error', message: 'Invite link does not match this phone number.' });
+                }
+
+                await adminSupabase
+                    .from('employee_invites')
+                    .update({ used_at: new Date().toISOString(), used_by: user.id })
+                    .eq('token', invite_token);
+            } catch (e: any) {
+                // If table doesn't exist yet, ignore (legacy mode)
+                if (!String(e?.message || '').includes('employee_invites')) {
+                    console.error('[AUTH] Failed to consume invite token:', e?.message || e);
+                }
+            }
         }
 
         let isNewUser = false;

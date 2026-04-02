@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
+import crypto from 'crypto';
 
 /**
  * Get all users registered on the platform
@@ -544,9 +545,31 @@ export const inviteEmployee = async (req: any, res: Response) => {
             console.error('[ADMIN] Auto-create service_provider fail:', spError);
         }
 
-        // 3. Notify via Message (Custom or default)
-        const defaultMsg = `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp. Login here: https://queue-admin-182k.vercel.app/`;
-        const msg = custom_message || defaultMsg;
+        // 3. Create one-time invite token + link (secure, expires)
+        const token = crypto.randomBytes(24).toString('hex');
+        const origin = (req.headers.origin as string) || process.env.FRONTEND_URL || 'https://queue-admin-182k.vercel.app';
+        const inviteUrl = `${origin.replace(/\/$/, '')}/invite?token=${token}`;
+
+        try {
+            await adminSupabase.from('employee_invites').insert({
+                token,
+                phone,
+                business_id,
+                role: role || 'employee',
+                full_name: full_name || null,
+                custom_message: custom_message || null,
+                created_by: userId || null
+            });
+        } catch (e) {
+            // If the table doesn't exist yet in a tenant DB, still allow invite (legacy flow)
+            console.warn('[ADMIN] employee_invites insert failed (legacy fallback):', (e as any)?.message);
+        }
+
+        // 4. Notify via Message (Custom or default). Include invite link.
+        const defaultMsg =
+            `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp.\n` +
+            `Open your invite link to login with OTP:\n${inviteUrl}`;
+        const msg = custom_message ? `${custom_message}\n\n${inviteUrl}` : defaultMsg;
         
         // Attempt WhatsApp first, then fallback to SMS
         const { notificationService } = require('../services/notificationService');
@@ -567,7 +590,8 @@ export const inviteEmployee = async (req: any, res: Response) => {
             status: 'success',
             message: notified ? (notificationService.isMock ? 'providers.success_invite_mock' : 'providers.success_invite') : 'providers.err_notify_fail',
             notified: notified,
-            is_mock: notificationService.isMock
+            is_mock: notificationService.isMock,
+            invite_url: inviteUrl
         });
 
     } catch (error: any) {
