@@ -1646,10 +1646,15 @@ export const markNoShow = async (req: Request, res: Response) => {
 export const startTask = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // queue_entry_service_id
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const userId = req.user?.id;
+        const { adminSupabase } = require('../config/supabaseClient');
 
-        // 1. Fetch task and entry details
-        const { data: task, error: taskError } = await supabase
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        // 1. Fetch task (admin client: employees often lack RLS read on queue_entry_services)
+        const { data: task, error: taskError } = await adminSupabase
             .from('queue_entry_services')
             .select(`
                 *,
@@ -1660,14 +1665,39 @@ export const startTask = async (req: Request, res: Response) => {
                     customer_name, 
                     phone, 
                     user_id,
+                    appointment_id,
                     queues!inner (business_id)
                 )
             `)
             .eq('id', id)
-            .single();
+            .maybeSingle();
 
         if (taskError || !task) {
             return res.status(404).json({ status: 'error', message: 'Task not found' });
+        }
+
+        const businessId = task.queue_entries?.queues?.business_id;
+        const { data: business } = await adminSupabase
+            .from('businesses')
+            .select('owner_id')
+            .eq('id', businessId)
+            .maybeSingle();
+        const isOwner = business?.owner_id === userId;
+        const { data: myProvider } = await adminSupabase
+            .from('service_providers')
+            .select('id')
+            .eq('user_id', userId)
+            .maybeSingle();
+        const isAssignedEmployee =
+            !!task.assigned_provider_id &&
+            !!myProvider?.id &&
+            task.assigned_provider_id === myProvider.id;
+
+        if (!isOwner && !isAssignedEmployee) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'You do not have permission to modify this task.'
+            });
         }
 
         const providerId = task.assigned_provider_id;
@@ -1678,7 +1708,7 @@ export const startTask = async (req: Request, res: Response) => {
         // 1.5 Validate if provider is on leave for this task's date
         if (task.queue_entries?.entry_date) {
             const entryDate = task.queue_entries.entry_date;
-            const { data: leaves } = await supabase
+            const { data: leaves } = await adminSupabase
                 .from('provider_leaves')
                 .select('id')
                 .eq('provider_id', providerId)
@@ -1692,7 +1722,7 @@ export const startTask = async (req: Request, res: Response) => {
 
         // 2. STRICTOR PROVIDER LOCK
         // Check if provider has ANY task 'in_progress' for this business today
-        const { data: rawBusyTasks } = await supabase
+        const { data: rawBusyTasks } = await adminSupabase
             .from('queue_entry_services')
             .select(`
                 id,
@@ -1723,7 +1753,7 @@ export const startTask = async (req: Request, res: Response) => {
         const duration = Number(task.duration_minutes || 0);
         const estEnd = new Date(now.getTime() + duration * 60000);
 
-        const { data: updatedTask, error: updateError } = await supabase
+        const { data: updatedTask, error: updateError } = await adminSupabase
             .from('queue_entry_services')
             .update({
                 task_status: 'in_progress',
@@ -1737,14 +1767,13 @@ export const startTask = async (req: Request, res: Response) => {
         if (updateError) throw updateError;
 
         // 3.5 Recompute delays for this provider's upcoming appointments
-        const businessId = task.queue_entries.queues.business_id;
-        await recomputeProviderDelays(providerId, businessId, estEnd).catch((err: Error) => {
+        await recomputeProviderDelays(providerId, businessId as string, estEnd).catch((err: Error) => {
             console.error('[queueController] Failed to recompute delays in startTask:', err);
         });
 
         // 4. Update parent entry status to 'serving' if it's currently 'waiting'
         if (task.queue_entries.status === 'waiting') {
-            await supabase
+            await adminSupabase
                 .from('queue_entries')
                 .update({
                     status: 'serving',
@@ -1755,7 +1784,7 @@ export const startTask = async (req: Request, res: Response) => {
 
             // Sync with parent appointment
             if (task.queue_entries.appointment_id) {
-                await supabase
+                await adminSupabase
                     .from('appointments')
                     .update({ status: 'in_service' })
                     .eq('id', task.queue_entries.appointment_id);
@@ -1782,13 +1811,14 @@ export const completeTask = async (req: Request, res: Response) => {
         const { id } = req.params; // queue_entry_service_id
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 1. Fetch task details and business owner info
-        const { data: task, error: taskError } = await supabase
+        // 1. Fetch task details and business owner info (admin client: employee RLS + correct service id required)
+        const { data: task, error: taskError } = await adminSupabase
             .from('queue_entry_services')
             .select(`
                 *,
@@ -1802,18 +1832,26 @@ export const completeTask = async (req: Request, res: Response) => {
                 )
             `)
             .eq('id', id)
-            .single();
+            .maybeSingle();
 
         if (taskError || !task) {
             return res.status(404).json({ status: 'error', message: 'Task not found' });
         }
 
-        // PERMISSION CHECK: Must be the assigned provider OR the business owner
+        // PERMISSION CHECK: Must be the assigned provider (service_providers.id) OR the business owner
         const ownerId = task.queue_entries?.queues?.businesses?.owner_id;
         const isOwner = ownerId === userId;
-        const isAssignedProvider = task.assigned_provider_id === userId;
+        const { data: myProvider } = await adminSupabase
+            .from('service_providers')
+            .select('id')
+            .eq('user_id', userId)
+            .maybeSingle();
+        const isAssignedEmployee =
+            !!task.assigned_provider_id &&
+            !!myProvider?.id &&
+            task.assigned_provider_id === myProvider.id;
 
-        if (!isOwner && !isAssignedProvider) {
+        if (!isOwner && !isAssignedEmployee) {
             return res.status(403).json({ 
                 status: 'error', 
                 message: 'You do not have permission to complete this task. Only the assigned employee or owner can do this.' 
@@ -1837,7 +1875,7 @@ export const completeTask = async (req: Request, res: Response) => {
         const { data: profile } = await supabase.from('profiles').select('role').eq('id', userId).single();
         const userRole = (profile?.role === 'owner' || profile?.role === 'admin' || isOwner) ? 'OWNER' : 'EMPLOYEE';
 
-        const { data: updatedTask, error: updateError } = await supabase
+        const { data: updatedTask, error: updateError } = await adminSupabase
             .from('queue_entry_services')
             .update({
                 task_status: 'done',
@@ -1861,7 +1899,7 @@ export const completeTask = async (req: Request, res: Response) => {
         }
 
         // 4. Check if ALL tasks for this entry are done
-        const { data: allTasks } = await supabase
+        const { data: allTasks } = await adminSupabase
             .from('queue_entry_services')
             .select('task_status')
             .eq('queue_entry_id', task.queue_entry_id);
@@ -1870,7 +1908,7 @@ export const completeTask = async (req: Request, res: Response) => {
 
         if (allDone) {
             // Auto-complete the whole entry
-            await supabase
+            await adminSupabase
                 .from('queue_entries')
                 .update({
                     status: 'completed',
@@ -1882,7 +1920,7 @@ export const completeTask = async (req: Request, res: Response) => {
 
             // Sync with parent appointment
             if (task.queue_entries.appointment_id) {
-                await supabase
+                await adminSupabase
                     .from('appointments')
                     .update({
                         status: 'completed',

@@ -2,8 +2,19 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 
 const isMissingColumnError = (error: any, columnName: string) => {
-    const message = String(error?.message || '').toLowerCase();
-    return message.includes(`'${columnName.toLowerCase()}'`) && message.includes('column');
+    const message = String(error?.message || error?.error || (error as any)?.hint || '').toLowerCase();
+    const col = columnName.toLowerCase();
+    if (!message) return false;
+    const mentionsCol =
+        message.includes(`'${col}'`) ||
+        message.includes(`"${col}"`) ||
+        message.includes(`column '${col}'`) ||
+        (message.includes('could not find') && message.includes(col) && message.includes('column'));
+    const schemaIssue =
+        message.includes('column') ||
+        message.includes('schema cache') ||
+        message.includes('does not exist');
+    return mentionsCol && schemaIssue;
 };
 
 const validateTextByLanguage = (text: string, language: string): boolean => {
@@ -710,6 +721,11 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Missing required fields' });
         }
 
+        const todayStr = new Date().toISOString().split('T')[0];
+        if (start_date < todayStr || end_date < todayStr) {
+            return res.status(400).json({ status: 'error', message: 'providers.err_leave_past_dates' });
+        }
+
         // 1. Resolve provider by id OR user_id, then verify ownership/self
         let { data: provider } = await adminSupabase
             .from('service_providers')
@@ -746,15 +762,27 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized: You can only apply for your own leave or for employees you own.' });
         }
 
-        // 2. Overlap check application level
-        const { data: overlaps } = await supabase
+        // 2. Overlap check application level (avoid .neq(status) if column missing)
+        let overlapsRes = await supabase
             .from('provider_leaves')
             .select('id')
             .eq('provider_id', provider.id)
             .lte('start_date', end_date)
             .gte('end_date', start_date)
-            .neq('status', 'REJECTED'); // Don't count rejected leaves
+            .neq('status', 'REJECTED');
 
+        if (overlapsRes.error && isMissingColumnError(overlapsRes.error, 'status')) {
+            overlapsRes = await supabase
+                .from('provider_leaves')
+                .select('id')
+                .eq('provider_id', provider.id)
+                .lte('start_date', end_date)
+                .gte('end_date', start_date);
+        }
+
+        if (overlapsRes.error) throw overlapsRes.error;
+
+        const overlaps = overlapsRes.data;
         if (overlaps && overlaps.length > 0) {
             return res.status(400).json({
                 status: 'error',
@@ -785,22 +813,22 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             status,
             approved_by: isAdminOrOwner ? userId : null
         };
-        let { data, error } = await supabase
-            .from('provider_leaves')
-            .insert([payload])
-            .select()
-            .single();
-
-        // Backward-compatibility: some DBs don't yet have approved_by.
-        if (error && isMissingColumnError(error, 'approved_by')) {
-            delete payload.approved_by;
-            const retry = await supabase
-                .from('provider_leaves')
-                .insert([payload])
-                .select()
-                .single();
-            data = retry.data as any;
-            error = retry.error as any;
+        let data: any = null;
+        let error: any = null;
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const res = await supabase.from('provider_leaves').insert([payload]).select().single();
+            data = res.data;
+            error = res.error;
+            if (!error) break;
+            if (isMissingColumnError(error, 'approved_by')) {
+                delete payload.approved_by;
+                continue;
+            }
+            if (isMissingColumnError(error, 'status')) {
+                delete payload.status;
+                continue;
+            }
+            break;
         }
 
         if (error) throw error;
