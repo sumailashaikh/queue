@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
 import crypto from 'crypto';
+import { countBlockingLiveQueueTasks } from '../utils/liveQueueTaskCount';
 
 /**
  * Get all users registered on the platform
@@ -554,25 +555,36 @@ export const inviteEmployee = async (req: any, res: Response) => {
             if (pendingError) throw pendingError;
         }
 
-        // 2b. Service Provider link
-        try {
-            const { data: existingSP } = await adminSupabase
-                .from('service_providers')
-                .select('id')
-                .eq('phone', normalizedPhone) // Match by phone for invitations
-                .maybeSingle();
+        // 2b. Service Provider for this business only (phone can exist at another business)
+        const displayName = String(full_name || 'Invited Employee').trim() || 'Invited Employee';
+        const { data: existingRows } = await adminSupabase
+            .from('service_providers')
+            .select('id, user_id')
+            .eq('business_id', business_id)
+            .eq('phone', normalizedPhone)
+            .order('created_at', { ascending: false })
+            .limit(1);
+        const existingSP = existingRows?.[0];
 
-            if (!existingSP) {
-                await adminSupabase.from('service_providers').insert({
-                    business_id,
-                    name: full_name || 'Invited Employee',
-                    phone: normalizedPhone,
-                    user_id: profile ? profile.id : null, 
-                    is_active: true
-                });
-            }
-        } catch (spError) {
-            console.error('[ADMIN] Auto-create service_provider fail:', spError);
+        if (existingSP) {
+            const { error: spUpErr } = await adminSupabase
+                .from('service_providers')
+                .update({
+                    name: displayName,
+                    is_active: true,
+                    user_id: profile?.id || existingSP.user_id || null
+                })
+                .eq('id', existingSP.id);
+            if (spUpErr) throw spUpErr;
+        } else {
+            const { error: spInErr } = await adminSupabase.from('service_providers').insert({
+                business_id,
+                name: displayName,
+                phone: normalizedPhone,
+                user_id: profile ? profile.id : null,
+                is_active: true
+            });
+            if (spInErr) throw spInErr;
         }
 
         // 3. Create one-time invite token + link (secure, expires)
@@ -663,14 +675,10 @@ export const deactivateEmployee = async (req: any, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'providers.err_unauthorized_add' });
         }
 
-        // 3. SAFETY CHECK: Check for active tasks
-        const { count: taskCount } = await adminSupabase
-            .from('queue_entry_services')
-            .select('*', { count: 'exact', head: true })
-            .eq('assigned_provider_id', provider.id)
-            .in('task_status', ['pending', 'in_progress']);
+        // 3. SAFETY CHECK: Live queue only (today + waiting/serving). Old pending rows must not block deactivate.
+        const taskCount = await countBlockingLiveQueueTasks(adminSupabase, provider.id, provider.business_id);
 
-        if (taskCount && taskCount > 0) {
+        if (taskCount > 0) {
             return res.status(400).json({
                 status: 'error',
                 message: 'providers.err_active_tasks',

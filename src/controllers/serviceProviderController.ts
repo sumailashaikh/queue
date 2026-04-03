@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
+import { countBlockingLiveQueueTasks } from '../utils/liveQueueTaskCount';
 
 const isMissingColumnError = (error: any, columnName: string) => {
     const message = String(error?.message || error?.error || (error as any)?.hint || '').toLowerCase();
@@ -345,14 +346,21 @@ export const deleteServiceProvider = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 1. SAFETY CHECK: Check for active tasks
-        const { count: taskCount } = await supabase
-            .from('queue_entry_services')
-            .select('*', { count: 'exact', head: true })
-            .eq('assigned_provider_id', id)
-            .in('task_status', ['pending', 'in_progress']);
+        const { data: provRow, error: provFetchErr } = await supabase
+            .from('service_providers')
+            .select('business_id')
+            .eq('id', id)
+            .maybeSingle();
 
-        if (taskCount && taskCount > 0) {
+        if (provFetchErr) throw provFetchErr;
+        if (!provRow) {
+            return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
+        }
+
+        const { adminSupabase } = require('../config/supabaseClient');
+        const taskCount = await countBlockingLiveQueueTasks(adminSupabase, id, provRow.business_id);
+
+        if (taskCount > 0) {
             return res.status(400).json({
                 status: 'error',
                 message: 'providers.err_active_tasks',
