@@ -893,6 +893,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
     try {
         const { leaveId } = req.params;
         const { status } = req.body; // APPROVED or REJECTED
+        const reasonRaw = String(req.body?.reason || '').trim();
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -902,6 +903,13 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
         if (!['APPROVED', 'REJECTED'].includes(status)) {
             return res.status(400).json({ status: 'error', message: 'Invalid status' });
+        }
+
+        if (status === 'REJECTED' && !reasonRaw) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Rejection reason is required'
+            });
         }
 
         // 1. Verify ownership
@@ -927,11 +935,10 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
         }
 
         // 2. Update status and optional reason
-        const { reason } = req.body;
         const updatePayload: any = {
             status,
             approved_by: userId,
-            rejection_reason: status === 'REJECTED' ? reason : null
+            rejection_reason: status === 'REJECTED' ? reasonRaw : null
         };
         let { data, error } = await supabase
             .from('provider_leaves')
@@ -964,6 +971,12 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             error = retry.error as any;
         }
 
+        if (error && isMissingColumnError(error, 'status')) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Leave approval is unavailable because this database is missing the provider_leaves.status column. Please run the latest leave migration.'
+            });
+        }
         if (error) throw error;
 
         // 3. Notify Employee
@@ -975,13 +988,12 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
         if (recipientPhone) {
             const { notificationService } = require('../services/notificationService');
-            const { reason } = req.body;
             let msg = '';
 
             if (status === 'APPROVED') {
                 msg = `Success! Your leave request from ${leave.start_date} to ${leave.end_date} has been APPROVED. Enjoy your time off!`;
             } else {
-                msg = `Update: Your leave request from ${leave.start_date} to ${leave.end_date} has been REJECTED. ${reason ? `Reason: ${reason}. ` : ''}Contact your manager if you have questions.`;
+                msg = `Update: Your leave request from ${leave.start_date} to ${leave.end_date} has been REJECTED. ${reasonRaw ? `Reason: ${reasonRaw}. ` : ''}Contact your manager if you have questions.`;
             }
 
             const to = String(recipientPhone).replace(/[^\d+]/g, '');
