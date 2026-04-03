@@ -3,18 +3,23 @@ import { supabase } from '../config/supabaseClient';
 import { countBlockingLiveQueueTasks } from '../utils/liveQueueTaskCount';
 
 const isMissingColumnError = (error: any, columnName: string) => {
-    const message = String(error?.message || error?.error || (error as any)?.hint || '').toLowerCase();
+    const raw = error?.message || error?.error || (error as any)?.details || (error as any)?.hint || '';
+    const message = String(raw).toLowerCase();
     const col = columnName.toLowerCase();
     if (!message) return false;
+    // PostgREST: "Could not find the 'status' column..."; Postgres: "column provider_leaves.status does not exist"
     const mentionsCol =
         message.includes(`'${col}'`) ||
         message.includes(`"${col}"`) ||
         message.includes(`column '${col}'`) ||
-        (message.includes('could not find') && message.includes(col) && message.includes('column'));
+        message.includes(`.${col}`) ||
+        message.includes(` ${col} `) ||
+        (message.includes(col) && (message.includes('provider_leave') || message.includes('provider_leav')));
     const schemaIssue =
         message.includes('column') ||
         message.includes('schema cache') ||
-        message.includes('does not exist');
+        message.includes('does not exist') ||
+        message.includes('undefined column');
     return mentionsCol && schemaIssue;
 };
 
@@ -779,16 +784,18 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             .gte('end_date', start_date)
             .neq('status', 'REJECTED');
 
-        if (overlapsRes.error && isMissingColumnError(overlapsRes.error, 'status')) {
-            overlapsRes = await supabase
-                .from('provider_leaves')
-                .select('id')
-                .eq('provider_id', provider.id)
-                .lte('start_date', end_date)
-                .gte('end_date', start_date);
+        if (overlapsRes.error) {
+            if (isMissingColumnError(overlapsRes.error, 'status')) {
+                overlapsRes = await supabase
+                    .from('provider_leaves')
+                    .select('id')
+                    .eq('provider_id', provider.id)
+                    .lte('start_date', end_date)
+                    .gte('end_date', start_date);
+            } else {
+                throw overlapsRes.error;
+            }
         }
-
-        if (overlapsRes.error) throw overlapsRes.error;
 
         const overlaps = overlapsRes.data;
         if (overlaps && overlaps.length > 0) {

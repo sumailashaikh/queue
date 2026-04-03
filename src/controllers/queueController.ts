@@ -37,10 +37,10 @@ export const getMyTasks = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 1. Find the provider record for this user
+        // 1. Find the provider record for this user (business_id for local “today” + filters)
         let { data: provider } = await supabase
             .from('service_providers')
-            .select('id')
+            .select('id, business_id')
             .eq('user_id', userId)
             .maybeSingle();
 
@@ -55,7 +55,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
             if (normalizedPhone) {
                 const { data: providerByPhone } = await adminSupabase
                     .from('service_providers')
-                    .select('id, user_id')
+                    .select('id, user_id, business_id')
                     .eq('phone', normalizedPhone)
                     .order('created_at', { ascending: false })
                     .limit(1)
@@ -67,7 +67,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
                             .update({ user_id: userId })
                             .eq('id', providerByPhone.id);
                     }
-                    provider = { id: providerByPhone.id } as any;
+                    provider = { id: providerByPhone.id, business_id: providerByPhone.business_id } as any;
                 }
             }
         }
@@ -76,8 +76,27 @@ export const getMyTasks = async (req: Request, res: Response) => {
             return res.status(200).json({ status: 'success', data: [] });
         }
 
-        // 2. Fetch today's date in local time
-        const todayStr = new Date().toISOString().split('T')[0];
+        if (!(provider as any).business_id && provider.id) {
+            const { data: pRow } = await adminSupabase
+                .from('service_providers')
+                .select('business_id')
+                .eq('id', provider.id)
+                .maybeSingle();
+            if (pRow?.business_id) (provider as any).business_id = pRow.business_id;
+        }
+
+        // 2. Today's date in the business timezone (matches queue entry_date)
+        let todayStr = new Date().toISOString().split('T')[0];
+        const bizId = (provider as any).business_id;
+        if (bizId) {
+            const { data: bizTz } = await adminSupabase
+                .from('businesses')
+                .select('timezone')
+                .eq('id', bizId)
+                .maybeSingle();
+            const tz = bizTz?.timezone || 'UTC';
+            todayStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
+        }
 
         // 2. Fetch tasks via two safe queries (avoid PostgREST .or raw parser issues with UUIDs)
         const baseSelect = `
@@ -114,7 +133,30 @@ export const getMyTasks = async (req: Request, res: Response) => {
         const mergedMap = new Map<string, any>();
         (primaryAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
         (serviceAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
-        const data = Array.from(mergedMap.values()).sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
+
+        const providerId = provider.id;
+        const hasOpenWorkForProvider = (entry: any) => {
+            const services = entry.queue_entry_services || [];
+            const mine = services.filter((s: any) => s.assigned_provider_id === providerId);
+            if (mine.length > 0) {
+                return mine.some(
+                    (s: any) => s.task_status !== 'done' && s.task_status !== 'cancelled'
+                );
+            }
+            if (entry.assigned_to === userId) {
+                if (services.length === 0) {
+                    return entry.status === 'waiting' || entry.status === 'serving';
+                }
+                return services.some(
+                    (s: any) => s.task_status !== 'done' && s.task_status !== 'cancelled'
+                );
+            }
+            return false;
+        };
+
+        const data = Array.from(mergedMap.values())
+            .filter(hasOpenWorkForProvider)
+            .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
 
         res.status(200).json({
             status: 'success',
