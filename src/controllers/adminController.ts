@@ -613,25 +613,33 @@ export const inviteEmployee = async (req: any, res: Response) => {
             `Open your invite link to login with OTP:\n${inviteUrl}`;
         const msg = custom_message ? `${custom_message}\n\n${inviteUrl}` : defaultMsg;
         
-        // Attempt WhatsApp first, then fallback to SMS
         const { notificationService } = require('../services/notificationService');
-        
-        let notified = false;
-        if (!notificationService.isMock) {
-            const whatsappSent = await notificationService.sendWhatsApp(normalizedPhone, msg);
-            const smsSent = await notificationService.sendSMS(normalizedPhone, msg);
-            notified = whatsappSent || smsSent;
-        } else {
-            // If in mock mode, we still "notified" (mock-notified) the user
-            await notificationService.sendWhatsApp(normalizedPhone, msg);
-            await notificationService.sendSMS(normalizedPhone, msg);
-            notified = true;
+
+        const notifyResult = await notificationService.sendInviteNotification(normalizedPhone, msg);
+        const notified = notifyResult.notified;
+        const smsErr = String(notifyResult.sms?.error || '');
+        const waErr = String(notifyResult.whatsapp?.error || '');
+        const errBlob = `${smsErr} ${waErr}`.toLowerCase();
+        let notify_hint: string | null = null;
+        if (!notified) {
+            if (/21608|21211|unverified|not verified|verify.*caller|trial.*number/i.test(errBlob)) {
+                notify_hint = 'twilio_trial_destination_not_verified';
+            } else if (/20003|20001|authenticate|invalid.*sid|invalid.*token|permission denied/i.test(errBlob)) {
+                notify_hint = 'twilio_auth_mismatch';
+            }
         }
 
         res.status(200).json({
             status: 'success',
             message: notified ? (notificationService.isMock ? 'providers.success_invite_mock' : 'providers.success_invite') : 'providers.err_notify_fail',
-            notified: notified,
+            notified,
+            sms_sent: notifyResult.sms?.ok === true,
+            whatsapp_sent: notifyResult.whatsapp?.ok === true,
+            notify_errors: {
+                sms: notifyResult.sms?.error || null,
+                whatsapp: notifyResult.whatsapp?.error || null
+            },
+            notify_hint,
             is_mock: notificationService.isMock,
             invite_url: inviteUrl
         });
