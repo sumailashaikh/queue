@@ -120,6 +120,12 @@ export const createServiceProvider = async (req: Request, res: Response) => {
             .select()
             .single();
 
+        if (error && isMissingColumnError(error, 'status')) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Leave approval is unavailable because this database is missing the provider_leaves.status column. Please run the latest leave migration.'
+            });
+        }
         if (error) throw error;
 
         res.status(201).json({
@@ -863,9 +869,11 @@ export const addProviderLeave = async (req: Request, res: Response) => {
                     const businessName = biz.name || 'Your Business';
                     const employeeFullname = profile?.full_name || 'An Employee';
                     const msg = `[QueueUp] New leave request from ${employeeFullname} for ${businessName} from ${start_date} to ${end_date}. Please review in your dashboard.`;
-                    
+
                     const { notificationService } = require('../services/notificationService');
-                    await notificationService.sendWhatsApp(owner.phone, msg);
+                    const to = String(owner.phone).replace(/[^\d+]/g, '');
+                    await notificationService.sendWhatsApp(to, msg);
+                    await notificationService.sendSMS(to, msg);
                 }
             }
         }
@@ -969,14 +977,16 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             const { notificationService } = require('../services/notificationService');
             const { reason } = req.body;
             let msg = '';
-            
+
             if (status === 'APPROVED') {
                 msg = `Success! Your leave request from ${leave.start_date} to ${leave.end_date} has been APPROVED. Enjoy your time off!`;
             } else {
                 msg = `Update: Your leave request from ${leave.start_date} to ${leave.end_date} has been REJECTED. ${reason ? `Reason: ${reason}. ` : ''}Contact your manager if you have questions.`;
             }
-            
-            await notificationService.sendWhatsApp(recipientPhone, msg);
+
+            const to = String(recipientPhone).replace(/[^\d+]/g, '');
+            await notificationService.sendWhatsApp(to, msg);
+            await notificationService.sendSMS(to, msg);
         }
 
         res.status(200).json({
