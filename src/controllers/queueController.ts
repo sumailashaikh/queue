@@ -38,11 +38,16 @@ export const getMyTasks = async (req: Request, res: Response) => {
         }
 
         // 1. Find the provider record for this user (business_id for local “today” + filters)
-        let { data: provider } = await supabase
+        // Avoid single-row coercion here because older data can contain duplicate
+        // provider rows linked to the same user_id.
+        const providerRes = await supabase
             .from('service_providers')
             .select('id, business_id')
             .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(1)
             .maybeSingle();
+        let provider = providerRes.data;
 
         // Fallback by phone for newly invited employees not linked yet.
         if (!provider) {
@@ -1725,11 +1730,14 @@ export const startTask = async (req: Request, res: Response) => {
             .eq('id', businessId)
             .maybeSingle();
         const isOwner = business?.owner_id === userId;
-        const { data: myProvider } = await adminSupabase
+        const myProviderRes = await adminSupabase
             .from('service_providers')
             .select('id')
             .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(1)
             .maybeSingle();
+        const myProvider = myProviderRes.data;
         const isAssignedEmployee =
             !!task.assigned_provider_id &&
             !!myProvider?.id &&

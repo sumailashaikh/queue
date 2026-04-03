@@ -831,7 +831,12 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         let data: any = null;
         let error: any = null;
         for (let attempt = 0; attempt < 5; attempt++) {
-            const res = await supabase.from('provider_leaves').insert([payload]).select().single();
+            const res = await supabase
+                .from('provider_leaves')
+                .insert([payload])
+                .select()
+                .limit(1)
+                .maybeSingle();
             data = res.data;
             error = res.error;
             if (!error) break;
