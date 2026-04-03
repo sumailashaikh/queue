@@ -2,6 +2,24 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { countBlockingLiveQueueTasks } from '../utils/liveQueueTaskCount';
 
+/** Human-readable dates for SMS (en-US, date-only safe). */
+function formatLeaveDateForMessage(isoOrDate: string): string {
+    const s = String(isoOrDate || '')
+        .trim()
+        .slice(0, 10);
+    if (!s || s.length < 8) return String(isoOrDate || '').trim() || 'your requested dates';
+    const d = new Date(`${s}T12:00:00`);
+    if (Number.isNaN(d.getTime())) return s;
+    return d.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' });
+}
+
+function formatLeaveRangeForMessage(start: string, end: string): string {
+    const a = formatLeaveDateForMessage(start);
+    const b = formatLeaveDateForMessage(end);
+    if (a === b) return a;
+    return `${a} through ${b}`;
+}
+
 const isMissingColumnError = (error: any, columnName: string) => {
     const raw = error?.message || error?.error || (error as any)?.details || (error as any)?.hint || '';
     const message = String(raw).toLowerCase();
@@ -988,12 +1006,19 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
         if (recipientPhone) {
             const { notificationService } = require('../services/notificationService');
+            const firstName = String(leave.service_providers?.name || 'there').trim().split(/\s+/)[0];
+            const when = formatLeaveRangeForMessage(leave.start_date, leave.end_date);
             let msg = '';
 
             if (status === 'APPROVED') {
-                msg = `Success! Your leave request from ${leave.start_date} to ${leave.end_date} has been APPROVED. Enjoy your time off!`;
+                msg =
+                    `[QueueUp] Hello ${firstName}, your time-off request for ${when} has been approved. ` +
+                    `Thank you for coordinating with the team.`;
             } else {
-                msg = `Update: Your leave request from ${leave.start_date} to ${leave.end_date} has been REJECTED. ${reasonRaw ? `Reason: ${reasonRaw}. ` : ''}Contact your manager if you have questions.`;
+                msg =
+                    `[QueueUp] Hello ${firstName}, we are unable to approve your time-off request for ${when}. ` +
+                    `${reasonRaw ? `Your manager shared this note: "${reasonRaw}" ` : ''}` +
+                    `If you have questions or would like to suggest different dates, please reach out through the salon. Thank you for your understanding.`;
             }
 
             const to = String(recipientPhone).replace(/[^\d+]/g, '');
