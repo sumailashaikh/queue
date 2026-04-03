@@ -108,17 +108,19 @@ export const verifyOtp = async (req: Request, res: Response) => {
             });
         }
 
-        // Optional: consume one-time invite token (if provided). This enforces token-based onboarding.
-        // Legacy invites still work via pending_registrations, but token consumption gives one-time-link security.
+        // Optional: validate one-time invite token now; apply to profile after profile/pending resolution
+        // (so former owners become employees: role + business_id are written on successful OTP).
+        let validatedInvite: { token: string; business_id: string; role: string; full_name: string | null } | null = null;
         if (invite_token) {
             try {
                 const adminSupabase = require('../config/supabaseClient').supabase;
-                const { data: invite } = await adminSupabase
+                const { data: invite, error: invErr } = await adminSupabase
                     .from('employee_invites')
-                    .select('token, phone, expires_at, used_at')
+                    .select('token, phone, expires_at, used_at, business_id, role, full_name')
                     .eq('token', invite_token)
                     .maybeSingle();
 
+                if (invErr) throw invErr;
                 if (!invite) {
                     return res.status(403).json({ status: 'error', message: 'Invalid or expired invite link.' });
                 }
@@ -133,15 +135,16 @@ export const verifyOtp = async (req: Request, res: Response) => {
                     return res.status(403).json({ status: 'error', message: 'Invite link does not match this phone number.' });
                 }
 
-                await adminSupabase
-                    .from('employee_invites')
-                    .update({ used_at: new Date().toISOString(), used_by: user.id })
-                    .eq('token', invite_token);
+                validatedInvite = {
+                    token: invite_token,
+                    business_id: invite.business_id,
+                    role: invite.role || 'employee',
+                    full_name: invite.full_name
+                };
             } catch (e: any) {
-                // If table doesn't exist yet, ignore (legacy mode)
-                if (!String(e?.message || '').includes('employee_invites')) {
-                    console.error('[AUTH] Failed to consume invite token:', e?.message || e);
-                }
+                // Table missing in legacy DBs: continue without token-based role enforcement
+                console.warn('[AUTH] Invite token validation skipped:', e?.message || e);
+                validatedInvite = null;
             }
         }
 
@@ -209,10 +212,82 @@ export const verifyOtp = async (req: Request, res: Response) => {
             }
         }
 
+        // 4b. Existing account + pending row (e.g. phone mismatch on invite): become employee if no owned business
+        try {
+            const adminSupabase = require('../config/supabaseClient').supabase;
+            if (profile && pending?.business_id) {
+                const { data: ownedBiz } = await adminSupabase
+                    .from('businesses')
+                    .select('id')
+                    .eq('owner_id', user.id)
+                    .limit(1);
+                if (!ownedBiz?.length) {
+                    const pendRole = String(pending.role || 'employee').toLowerCase();
+                    const { data: merged, error: mErr } = await adminSupabase
+                        .from('profiles')
+                        .update({
+                            role: pendRole,
+                            business_id: pending.business_id,
+                            status: 'active',
+                            is_verified: true,
+                            full_name: pending.full_name || profile.full_name
+                        })
+                        .eq('id', user.id)
+                        .select()
+                        .single();
+                    if (!mErr && merged) {
+                        finalProfileData = merged;
+                        await adminSupabase.from('pending_registrations').delete().eq('phone', phone);
+                    }
+                }
+            }
+        } catch (mergeErr: any) {
+            console.warn('[AUTH] Pending registration merge skipped:', mergeErr?.message || mergeErr);
+        }
+
+        // 4c. Apply validated invite link — sets role + business_id (fixes former owners still marked owner)
+        try {
+            const adminSupabase = require('../config/supabaseClient').supabase;
+            if (validatedInvite) {
+                const inviteRole = String(validatedInvite.role || 'employee').toLowerCase();
+                const { data: upserted, error: invUpErr } = await adminSupabase
+                    .from('profiles')
+                    .upsert(
+                        {
+                            id: user.id,
+                            role: inviteRole,
+                            business_id: validatedInvite.business_id,
+                            status: 'active',
+                            is_verified: true,
+                            phone,
+                            full_name:
+                                finalProfileData?.full_name ||
+                                validatedInvite.full_name ||
+                                profile?.full_name ||
+                                'Team Member'
+                        },
+                        { onConflict: 'id' }
+                    )
+                    .select()
+                    .single();
+                if (invUpErr) throw invUpErr;
+                if (upserted) finalProfileData = upserted;
+                await adminSupabase.from('pending_registrations').delete().eq('phone', phone);
+                await adminSupabase
+                    .from('employee_invites')
+                    .update({ used_at: new Date().toISOString(), used_by: user.id })
+                    .eq('token', validatedInvite.token);
+            }
+        } catch (invApplyErr: any) {
+            console.error('[AUTH] Failed to apply employee invite to profile:', invApplyErr);
+            throw invApplyErr;
+        }
+
         // 5. Ensure invited provider row is linked to this auth user (critical for employee dashboard/tasks/leaves)
         try {
             const adminSupabase = require('../config/supabaseClient').supabase;
             const normalizedPhone = phone.replace(/[^\d+]/g, '');
+            const employerBizId = finalProfileData?.business_id;
             const { data: existingLinked } = await adminSupabase
                 .from('service_providers')
                 .select('id')
@@ -220,13 +295,14 @@ export const verifyOtp = async (req: Request, res: Response) => {
                 .maybeSingle();
 
             if (!existingLinked && normalizedPhone) {
-                const { data: providerByPhone } = await adminSupabase
+                let provQuery = adminSupabase
                     .from('service_providers')
                     .select('id, user_id')
                     .eq('phone', normalizedPhone)
                     .order('created_at', { ascending: false })
-                    .limit(1)
-                    .maybeSingle();
+                    .limit(1);
+                if (employerBizId) provQuery = provQuery.eq('business_id', employerBizId);
+                const { data: providerByPhone } = await provQuery.maybeSingle();
 
                 if (providerByPhone && !providerByPhone.user_id) {
                     await adminSupabase
