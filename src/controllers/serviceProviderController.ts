@@ -1389,22 +1389,14 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 2. Update request
-        const { error: updateReqError } = await supabase
-            .from('resignation_requests')
-            .update({ status })
-            .eq('id', requestId);
-
-        if (updateReqError) throw updateReqError;
-
-        // 3. If APPROVED, set employee to INACTIVE (with safety check)
+        // 2. If APPROVED, run safety checks BEFORE updating status
         if (status === 'APPROVED') {
-            // Safety Check: Active Tasks
+            // Safety check: active tasks assigned to this employee
             const { data: provider } = await supabase
                 .from('service_providers')
                 .select('id')
                 .eq('user_id', request.employee_id)
-                .single();
+                .maybeSingle();
 
             if (provider) {
                 const { count: taskCount } = await supabase
@@ -1420,7 +1412,25 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
                     });
                 }
             }
+        }
 
+        // 3. Update resignation request after all validations pass
+        const { error: updateReqError } = await supabase
+            .from('resignation_requests')
+            .update({ status })
+            .eq('id', requestId);
+
+        if (updateReqError) throw updateReqError;
+
+        const { data: emp } = await supabase
+            .from('profiles')
+            .select('phone, full_name')
+            .eq('id', request.employee_id)
+            .single();
+        const { notificationService } = require('../services/notificationService');
+
+        // 4. Apply post-status effects + notify employee
+        if (status === 'APPROVED') {
             const { error: updateEmpError } = await supabase
                 .from('profiles')
                 .update({ status: 'INACTIVE' })
@@ -1428,11 +1438,20 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
 
             if (updateEmpError) throw updateEmpError;
 
-            // Notify Employee
-            const { data: emp } = await supabase.from('profiles').select('phone').eq('id', request.employee_id).single();
             if (emp?.phone) {
-                const { notificationService } = require('../services/notificationService');
-                await notificationService.sendWhatsApp(emp.phone, `Your resignation has been approved. Your access to the system has been revoked.`);
+                const approvedMsg = `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. Your access to the system has been revoked.`;
+                await Promise.allSettled([
+                    notificationService.sendWhatsApp(emp.phone, approvedMsg),
+                    notificationService.sendSMS(emp.phone, approvedMsg)
+                ]);
+            }
+        } else if (status === 'REJECTED') {
+            if (emp?.phone) {
+                const rejectedMsg = `Hi ${emp.full_name || 'Employee'}, your resignation request has been rejected by the business owner. Please contact the owner for details.`;
+                await Promise.allSettled([
+                    notificationService.sendWhatsApp(emp.phone, rejectedMsg),
+                    notificationService.sendSMS(emp.phone, rejectedMsg)
+                ]);
             }
         }
 
