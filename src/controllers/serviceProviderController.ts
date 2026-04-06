@@ -1399,11 +1399,30 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
                 .maybeSingle();
 
             if (provider) {
-                const { count: taskCount } = await supabase
+                const { data: bizInfo } = await supabase
+                    .from('businesses')
+                    .select('timezone')
+                    .eq('id', request.business_id)
+                    .maybeSingle();
+                const timezone = bizInfo?.timezone || 'UTC';
+                const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+
+                const { data: activeTasks, error: activeTasksError } = await supabase
                     .from('queue_entry_services')
-                    .select('*', { count: 'exact', head: true })
+                    .select(`
+                        id,
+                        queue_entries!inner (
+                            entry_date,
+                            status
+                        )
+                    `)
                     .eq('assigned_provider_id', provider.id)
-                    .in('task_status', ['pending', 'in_progress']);
+                    .in('task_status', ['pending', 'in_progress'])
+                    .eq('queue_entries.entry_date', todayStr)
+                    .in('queue_entries.status', ['waiting', 'serving', 'skipped']);
+
+                if (activeTasksError) throw activeTasksError;
+                const taskCount = activeTasks?.length || 0;
 
                 if (taskCount && taskCount > 0) {
                     return res.status(400).json({
@@ -1427,6 +1446,14 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
             .select('phone, full_name')
             .eq('id', request.employee_id)
             .single();
+        const { data: empProvider } = await supabase
+            .from('service_providers')
+            .select('phone')
+            .eq('user_id', request.employee_id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        const employeePhone = emp?.phone || empProvider?.phone;
         const { notificationService } = require('../services/notificationService');
 
         // 4. Apply post-status effects + notify employee
@@ -1438,19 +1465,25 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
 
             if (updateEmpError) throw updateEmpError;
 
-            if (emp?.phone) {
+            // Remove employee from provider list after approved resignation
+            await supabase
+                .from('service_providers')
+                .update({ is_active: false })
+                .eq('user_id', request.employee_id);
+
+            if (employeePhone) {
                 const approvedMsg = `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. Your access to the system has been revoked.`;
                 await Promise.allSettled([
-                    notificationService.sendWhatsApp(emp.phone, approvedMsg),
-                    notificationService.sendSMS(emp.phone, approvedMsg)
+                    notificationService.sendWhatsApp(employeePhone, approvedMsg),
+                    notificationService.sendSMS(employeePhone, approvedMsg)
                 ]);
             }
         } else if (status === 'REJECTED') {
-            if (emp?.phone) {
+            if (employeePhone) {
                 const rejectedMsg = `Hi ${emp.full_name || 'Employee'}, your resignation request has been rejected by the business owner. Please contact the owner for details.`;
                 await Promise.allSettled([
-                    notificationService.sendWhatsApp(emp.phone, rejectedMsg),
-                    notificationService.sendSMS(emp.phone, rejectedMsg)
+                    notificationService.sendWhatsApp(employeePhone, rejectedMsg),
+                    notificationService.sendSMS(employeePhone, rejectedMsg)
                 ]);
             }
         }

@@ -21,9 +21,11 @@ export const sendOtp = async (req: Request, res: Response) => {
 
         console.log('[AUTH] Calling supabase.auth.signInWithOtp...');
         const start = Date.now();
-        const { error } = await supabase.auth.signInWithOtp({
-            phone
-        });
+        const otpPromise = supabase.auth.signInWithOtp({ phone });
+        const timeoutPromise = new Promise<{ error: Error }>((resolve) =>
+            setTimeout(() => resolve({ error: new Error('OTP service timeout. Please try again.') }), 15000)
+        );
+        const { error } = await Promise.race([otpPromise, timeoutPromise]);
         const duration = Date.now() - start;
 
         if (error) {
@@ -184,7 +186,8 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
         } else if (profile) {
             // 4. Status Check for existing users
-            if (profile.status === 'inactive' || profile.status === 'blocked') {
+            const normalizedStatus = String(profile.status || '').toLowerCase();
+            if (['inactive', 'blocked', 'resigned', 'terminated'].includes(normalizedStatus)) {
                 console.log(`[AUTH] Blocked access for user ${user.id}. Status: ${profile.status}`);
                 return res.status(403).json({ 
                     status: 'error', 
