@@ -1458,21 +1458,33 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
 
         // 4. Apply post-status effects + notify employee
         if (status === 'APPROVED') {
-            const { error: updateEmpError } = await supabase
-                .from('profiles')
-                .update({ status: 'INACTIVE' })
-                .eq('id', request.employee_id);
+            const { data: bizInfo } = await supabase
+                .from('businesses')
+                .select('timezone')
+                .eq('id', request.business_id)
+                .maybeSingle();
+            const timezone = bizInfo?.timezone || 'UTC';
+            const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+            const requestedLastDate = String(request.requested_last_date || '');
+            const shouldDeactivateNow = !!requestedLastDate && todayStr >= requestedLastDate;
 
-            if (updateEmpError) throw updateEmpError;
+            if (shouldDeactivateNow) {
+                const { error: updateEmpError } = await supabase
+                    .from('profiles')
+                    .update({ status: 'INACTIVE' })
+                    .eq('id', request.employee_id);
+                if (updateEmpError) throw updateEmpError;
 
-            // Remove employee from provider list after approved resignation
-            await supabase
-                .from('service_providers')
-                .update({ is_active: false })
-                .eq('user_id', request.employee_id);
+                await supabase
+                    .from('service_providers')
+                    .update({ is_active: false })
+                    .eq('user_id', request.employee_id);
+            }
 
             if (employeePhone) {
-                const approvedMsg = `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. Your access to the system has been revoked.`;
+                const approvedMsg = shouldDeactivateNow
+                    ? `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. Your access to the system has been revoked.`
+                    : `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. You can continue working until ${requestedLastDate}. Access will be disabled after your last working date.`;
                 await Promise.allSettled([
                     notificationService.sendWhatsApp(employeePhone, approvedMsg),
                     notificationService.sendSMS(employeePhone, approvedMsg)

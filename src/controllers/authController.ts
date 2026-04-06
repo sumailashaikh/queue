@@ -41,9 +41,13 @@ export const sendOtp = async (req: Request, res: Response) => {
 
     } catch (error: any) {
         console.error('[AUTH] sendOtp caught error:', error.message);
+        const raw = String(error?.message || '').toLowerCase();
+        const safeMessage = (raw.includes('63038') || raw.includes('daily messages limit') || raw.includes('twilio'))
+            ? 'OTP service is temporarily busy. Please try again after some time.'
+            : (error.message || 'Failed to send OTP');
         res.status(400).json({
             status: 'error',
-            message: error.message
+            message: safeMessage
         });
     }
 };
@@ -77,6 +81,36 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
         if (!user) {
             return res.status(401).json({ status: 'error', message: 'Authentication failed' });
+        }
+
+        // Guard approved resignations by effective last working date.
+        const { data: approvedResignation } = await supabase
+            .from('resignation_requests')
+            .select('id, requested_last_date, business_id')
+            .eq('employee_id', user.id)
+            .eq('status', 'APPROVED')
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+        if (approvedResignation) {
+            const { data: bizInfo } = await supabase
+                .from('businesses')
+                .select('timezone')
+                .eq('id', approvedResignation.business_id)
+                .maybeSingle();
+            const timezone = bizInfo?.timezone || 'UTC';
+            const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+            const requestedLastDate = String(approvedResignation.requested_last_date || '');
+            const shouldBlockNow = !!requestedLastDate && todayStr >= requestedLastDate;
+
+            if (shouldBlockNow) {
+                await supabase.from('profiles').update({ status: 'INACTIVE' }).eq('id', user.id);
+                await supabase.from('service_providers').update({ is_active: false }).eq('user_id', user.id);
+                return res.status(403).json({
+                    status: 'error',
+                    message: 'Your resignation has been approved and your last working date has passed. Access is disabled.'
+                });
+            }
         }
 
         // 1. Fetch existing profile OR check pending_registrations
@@ -186,7 +220,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
         } else if (profile) {
             // 4. Status Check for existing users
-            const normalizedStatus = String(profile.status || '').toLowerCase();
+            const normalizedStatus = String(profile.status || '').trim().toLowerCase();
             if (['inactive', 'blocked', 'resigned', 'terminated'].includes(normalizedStatus)) {
                 console.log(`[AUTH] Blocked access for user ${user.id}. Status: ${profile.status}`);
                 return res.status(403).json({ 
