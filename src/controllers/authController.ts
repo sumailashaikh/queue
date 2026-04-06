@@ -111,6 +111,8 @@ export const verifyOtp = async (req: Request, res: Response) => {
         // Optional: validate one-time invite token now; apply to profile after profile/pending resolution
         // (so former owners become employees: role + business_id are written on successful OTP).
         let validatedInvite: { token: string; business_id: string; role: string; full_name: string | null } | null = null;
+        // Invite token applies role/business when valid. Stale tokens in mobile localStorage must not
+        // block normal owner/admin login — ignore invalid/expired/used/mismatch and continue.
         if (invite_token) {
             try {
                 const adminSupabase = require('../config/supabaseClient').supabase;
@@ -122,25 +124,24 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
                 if (invErr) throw invErr;
                 if (!invite) {
-                    return res.status(403).json({ status: 'error', message: 'Invalid or expired invite link.' });
+                    console.warn('[AUTH] Ignoring unknown invite_token (client may have stale PWA storage)');
+                } else if (invite.used_at) {
+                    console.warn('[AUTH] Ignoring already-used invite_token');
+                } else if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
+                    console.warn('[AUTH] Ignoring expired invite_token');
+                } else {
+                    const invitePhone = (invite.phone || '').replace(/[^\d+]/g, '');
+                    if (invitePhone && invitePhone !== phone) {
+                        console.warn('[AUTH] Ignoring invite_token (phone mismatch)');
+                    } else {
+                        validatedInvite = {
+                            token: invite_token,
+                            business_id: invite.business_id,
+                            role: invite.role || 'employee',
+                            full_name: invite.full_name
+                        };
+                    }
                 }
-                if (invite.used_at) {
-                    return res.status(403).json({ status: 'error', message: 'This invite link has already been used.' });
-                }
-                if (invite.expires_at && new Date(invite.expires_at).getTime() < Date.now()) {
-                    return res.status(403).json({ status: 'error', message: 'This invite link has expired.' });
-                }
-                const invitePhone = (invite.phone || '').replace(/[^\d+]/g, '');
-                if (invitePhone && invitePhone !== phone) {
-                    return res.status(403).json({ status: 'error', message: 'Invite link does not match this phone number.' });
-                }
-
-                validatedInvite = {
-                    token: invite_token,
-                    business_id: invite.business_id,
-                    role: invite.role || 'employee',
-                    full_name: invite.full_name
-                };
             } catch (e: any) {
                 // Table missing in legacy DBs: continue without token-based role enforcement
                 console.warn('[AUTH] Invite token validation skipped:', e?.message || e);
