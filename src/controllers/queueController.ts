@@ -334,7 +334,7 @@ export const joinQueue = async (req: Request, res: Response) => {
         // 1. Calculate current Wait Time for Closing Time Protection
         const { data: entriesAhead } = await supabase
             .from('queue_entries')
-            .select('status, total_duration_minutes, served_at')
+            .select('status, total_duration_minutes, served_at, joined_at')
             .eq('queue_id', queue_id)
             .eq('entry_date', todayStr)
             .in('status', ['waiting', 'serving']);
@@ -345,8 +345,9 @@ export const joinQueue = async (req: Request, res: Response) => {
             const plannedDuration = Number(e.total_duration_minutes || 10);
             if (e.status === 'serving') {
                 // Count only the remaining time for currently serving guests.
-                const servedAtMs = e.served_at ? new Date(e.served_at).getTime() : nowMs;
-                const elapsedMins = Math.max(0, Math.round((nowMs - servedAtMs) / 60000));
+                const startedAt = e.served_at || e.joined_at;
+                const startedAtMs = startedAt ? new Date(startedAt).getTime() : nowMs;
+                const elapsedMins = Math.max(0, Math.round((nowMs - startedAtMs) / 60000));
                 const remainingMins = Math.max(0, plannedDuration - elapsedMins);
                 currentWaitTimeTotal += remainingMins;
                 return;
