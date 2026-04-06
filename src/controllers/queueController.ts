@@ -334,14 +334,24 @@ export const joinQueue = async (req: Request, res: Response) => {
         // 1. Calculate current Wait Time for Closing Time Protection
         const { data: entriesAhead } = await supabase
             .from('queue_entries')
-            .select('total_duration_minutes')
+            .select('status, total_duration_minutes, served_at')
             .eq('queue_id', queue_id)
             .eq('entry_date', todayStr)
             .in('status', ['waiting', 'serving']);
 
         let currentWaitTimeTotal = 0;
+        const nowMs = Date.now();
         entriesAhead?.forEach((e: any) => {
-            currentWaitTimeTotal += (e.total_duration_minutes || 10);
+            const plannedDuration = Number(e.total_duration_minutes || 10);
+            if (e.status === 'serving') {
+                // Count only the remaining time for currently serving guests.
+                const servedAtMs = e.served_at ? new Date(e.served_at).getTime() : nowMs;
+                const elapsedMins = Math.max(0, Math.round((nowMs - servedAtMs) / 60000));
+                const remainingMins = Math.max(0, plannedDuration - elapsedMins);
+                currentWaitTimeTotal += remainingMins;
+                return;
+            }
+            currentWaitTimeTotal += plannedDuration;
         });
 
         // Fetch active providers count to divide wait time (Capacity)
