@@ -1895,6 +1895,8 @@ export const completeTask = async (req: Request, res: Response) => {
             .from('service_providers')
             .select('id')
             .eq('user_id', userId)
+            .order('created_at', { ascending: false })
+            .limit(1)
             .maybeSingle();
         const isAssignedEmployee =
             !!task.assigned_provider_id &&

@@ -20,6 +20,46 @@ function formatLeaveRangeForMessage(start: string, end: string): string {
     return `${a} through ${b}`;
 }
 
+function baseLang(input?: string): 'en' | 'es' | 'hi' | 'ar' {
+    const l = String(input || 'en').toLowerCase().split('-')[0];
+    if (l === 'es' || l === 'hi' || l === 'ar') return l;
+    return 'en';
+}
+
+function leaveRequestToOwnerMessage(language: string, employeeName: string, businessName: string, start: string, end: string, note?: string): string {
+    const when = `${start} - ${end}`;
+    const noteText = String(note || '').trim();
+    const safeEmployee = employeeName || 'Employee';
+    const safeBusiness = businessName || 'Business';
+    const lang = baseLang(language);
+    if (lang === 'hi') {
+        return `[QueueUp] ${safeEmployee} ने ${safeBusiness} में ${when} के लिए छुट्टी का अनुरोध भेजा है। कृपया डैशबोर्ड में समीक्षा करें.${noteText ? ` नोट: "${noteText}"` : ''}`;
+    }
+    if (lang === 'ar') {
+        return `[QueueUp] أرسل ${safeEmployee} طلب إجازة لدى ${safeBusiness} للفترة ${when}. يرجى المراجعة من لوحة التحكم.${noteText ? ` الملاحظة: "${noteText}"` : ''}`;
+    }
+    if (lang === 'es') {
+        return `[QueueUp] ${safeEmployee} envió una solicitud de permiso para ${safeBusiness} del ${when}. Revísala en el panel.${noteText ? ` Nota: "${noteText}"` : ''}`;
+    }
+    return `[QueueUp] ${safeEmployee} submitted a leave request for ${safeBusiness} (${when}). Please review it in your dashboard.${noteText ? ` Note: "${noteText}"` : ''}`;
+}
+
+function leaveDecisionToEmployeeMessage(language: string, firstName: string, when: string, approved: boolean, reason?: string): string {
+    const name = firstName || 'there';
+    const note = String(reason || '').trim();
+    const lang = baseLang(language);
+    if (approved) {
+        if (lang === 'hi') return `[QueueUp] नमस्ते ${name}, ${when} के लिए आपका अवकाश अनुरोध स्वीकृत हो गया है। धन्यवाद।`;
+        if (lang === 'ar') return `[QueueUp] مرحباً ${name}، تمت الموافقة على طلب إجازتك للفترة ${when}. شكراً لك.`;
+        if (lang === 'es') return `[QueueUp] Hola ${name}, tu solicitud de permiso para ${when} fue aprobada. Gracias.`;
+        return `[QueueUp] Hello ${name}, your time-off request for ${when} has been approved. Thank you.`;
+    }
+    if (lang === 'hi') return `[QueueUp] नमस्ते ${name}, ${when} के लिए आपका अवकाश अनुरोध स्वीकृत नहीं हो सका।${note ? ` प्रबंधक संदेश: "${note}"` : ''} कृपया नई तारीख़ के साथ फिर प्रयास करें।`;
+    if (lang === 'ar') return `[QueueUp] مرحباً ${name}، تعذر الموافقة على طلب إجازتك للفترة ${when}.${note ? ` رسالة المدير: "${note}"` : ''} يرجى المحاولة بتاريخ آخر.`;
+    if (lang === 'es') return `[QueueUp] Hola ${name}, no pudimos aprobar tu solicitud de permiso para ${when}.${note ? ` Mensaje del responsable: "${note}"` : ''} Inténtalo con otras fechas.`;
+    return `[QueueUp] Hello ${name}, we could not approve your time-off request for ${when}.${note ? ` Manager note: "${note}"` : ''} Please try with alternate dates.`;
+}
+
 const isMissingColumnError = (error: any, columnName: string) => {
     const raw = error?.message || error?.error || (error as any)?.details || (error as any)?.hint || '';
     const message = String(raw).toLowerCase();
@@ -745,7 +785,7 @@ export const getProviderLeaves = async (req: Request, res: Response) => {
 export const addProviderLeave = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // provider_id or user_id
-        const { start_date, end_date, leave_type, note } = req.body;
+        const { start_date, end_date, leave_type, note, ui_language } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
         const { adminSupabase } = require('../config/supabaseClient');
@@ -882,16 +922,26 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             // Notify Owner
             const { data: biz } = await supabase.from('businesses').select('owner_id, name').eq('id', provider.business_id).single();
             if (biz?.owner_id) {
-                const { data: owner } = await supabase.from('profiles').select('phone').eq('id', biz.owner_id).single();
+                const { data: owner } = await supabase.from('profiles').select('phone, ui_language').eq('id', biz.owner_id).single();
                 if (owner?.phone) {
                     const businessName = biz.name || 'Your Business';
                     const employeeFullname = profile?.full_name || 'An Employee';
-                    const msg = `[QueueUp] New leave request from ${employeeFullname} for ${businessName} from ${start_date} to ${end_date}. Please review in your dashboard.`;
+                    const requestLang = profile?.ui_language || ui_language || 'en';
+                    const msg = leaveRequestToOwnerMessage(
+                        requestLang,
+                        employeeFullname,
+                        businessName,
+                        start_date,
+                        end_date,
+                        note
+                    );
 
                     const { notificationService } = require('../services/notificationService');
                     const to = String(owner.phone).replace(/[^\d+]/g, '');
-                    await notificationService.sendWhatsApp(to, msg);
-                    await notificationService.sendSMS(to, msg);
+                    await Promise.allSettled([
+                        notificationService.sendWhatsApp(to, msg),
+                        notificationService.sendSMS(to, msg)
+                    ]);
                 }
             }
         }
@@ -1004,32 +1054,40 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             recipientPhone = empProfile?.phone;
         }
 
+        let notificationSent = false;
         if (recipientPhone) {
             const { notificationService } = require('../services/notificationService');
             const firstName = String(leave.service_providers?.name || 'there').trim().split(/\s+/)[0];
             const when = formatLeaveRangeForMessage(leave.start_date, leave.end_date);
-            let msg = '';
-
-            if (status === 'APPROVED') {
-                msg =
-                    `[QueueUp] Hello ${firstName}, your time-off request for ${when} has been approved. ` +
-                    `Thank you for coordinating with the team.`;
-            } else {
-                msg =
-                    `[QueueUp] Hello ${firstName}, we are unable to approve your time-off request for ${when}. ` +
-                    `${reasonRaw ? `Your manager shared this note: "${reasonRaw}" ` : ''}` +
-                    `If you have questions or would like to suggest different dates, please reach out through the salon. Thank you for your understanding.`;
-            }
+            const { data: approverProfile } = await supabase
+                .from('profiles')
+                .select('ui_language')
+                .eq('id', userId)
+                .maybeSingle();
+            const msg = leaveDecisionToEmployeeMessage(
+                approverProfile?.ui_language || 'en',
+                firstName,
+                when,
+                status === 'APPROVED',
+                reasonRaw
+            );
 
             const to = String(recipientPhone).replace(/[^\d+]/g, '');
-            await notificationService.sendWhatsApp(to, msg);
-            await notificationService.sendSMS(to, msg);
+            const [waRes, smsRes] = await Promise.allSettled([
+                notificationService.sendWhatsApp(to, msg),
+                notificationService.sendSMS(to, msg)
+            ]);
+            const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
+            const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
+            notificationSent = !!(waOk || smsOk);
         }
 
         res.status(200).json({
             status: 'success',
-            message: `Leave ${status.toLowerCase()} successfully`,
-            data
+            message: 'providers.success_leave_status_updated',
+            data,
+            leave_status: status,
+            notification_sent: notificationSent
         });
 
     } catch (error: any) {
