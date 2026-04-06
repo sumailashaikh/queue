@@ -1629,10 +1629,13 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
             .from('queue_entry_services')
             .update({ assigned_provider_id: provider_id || null })
             .eq('id', id)
-            .select()
-            .single();
+            .select('id, assigned_provider_id')
+            .maybeSingle();
 
         if (error) throw error;
+        if (!data) {
+            return res.status(404).json({ status: 'error', message: 'Task not found or already updated' });
+        }
 
         res.status(200).json({
             status: 'success',

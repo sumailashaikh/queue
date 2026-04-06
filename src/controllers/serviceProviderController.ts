@@ -1245,7 +1245,7 @@ export const submitResignation = async (req: Request, res: Response) => {
         // 1. Get employee details
         const { data: employee } = await supabase
             .from('profiles')
-            .select('id, business_id, full_name')
+            .select('id, business_id, full_name, role, phone, ui_language')
             .eq('id', userId)
             .single();
 
@@ -1284,15 +1284,28 @@ export const submitResignation = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        // 3. Notify Owner
+        // 3. Notify Owner + Employee confirmation
         const { data: business } = await supabase.from('businesses').select('owner_id').eq('id', employee.business_id).single();
+        const { notificationService } = require('../services/notificationService');
+        const notificationJobs: Promise<any>[] = [];
+
         if (business?.owner_id) {
             const { data: owner } = await supabase.from('profiles').select('phone').eq('id', business.owner_id).single();
             if (owner?.phone) {
                 const msg = `Resignation request received from ${employee.full_name}. Reason: ${reason || 'Not provided'}. Requested Last Date: ${requested_last_date || 'N/A'}.`;
-                const { notificationService } = require('../services/notificationService');
-                await notificationService.sendWhatsApp(owner.phone, msg);
+                notificationJobs.push(notificationService.sendWhatsApp(owner.phone, msg));
+                notificationJobs.push(notificationService.sendSMS(owner.phone, msg));
             }
+        }
+
+        if (employee?.phone) {
+            const empMsg = `Your resignation request has been submitted successfully. Requested last date: ${requested_last_date || 'N/A'}. We will notify you once the business owner reviews it.`;
+            notificationJobs.push(notificationService.sendWhatsApp(employee.phone, empMsg));
+            notificationJobs.push(notificationService.sendSMS(employee.phone, empMsg));
+        }
+
+        if (notificationJobs.length > 0) {
+            await Promise.allSettled(notificationJobs);
         }
 
         res.status(201).json({
