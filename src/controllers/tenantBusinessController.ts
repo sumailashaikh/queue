@@ -438,6 +438,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
             .select(`
                 *,
                 queue_entry_services!queue_entry_id (
+                    task_status,
                     services!service_id (name, translations)
                 )
             `)
@@ -473,16 +474,30 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
         // We'll return them separately or combined depending on frontend need.
         // Combined is better for a single "Up Next" list.
         const unified = [
-            ...(queueEntries?.map((e: any) => ({
-                id: e.id,
-                type: 'queue',
-                display_token: e.ticket_number,
-                customer_name: e.customer_name,
-                status: e.status,
-                time: e.joined_at,
-                service_name: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || e.service_name || 'Walk-in',
-                translations: e.queue_entry_services?.map((as: any) => as.services?.translations).filter(Boolean) || []
-            })) || []),
+            ...(queueEntries?.map((e: any) => {
+                // Normalize stale active statuses when all child tasks are already terminal.
+                // This keeps TV mode counts accurate even if older rows were not auto-closed.
+                const taskStatuses = (e.queue_entry_services || [])
+                    .map((s: any) => String(s?.task_status || '').toLowerCase())
+                    .filter(Boolean);
+                const hasTasks = taskStatuses.length > 0;
+                const terminalTaskStatuses = new Set(['done', 'completed', 'cancelled', 'skipped']);
+                const allTasksTerminal = hasTasks && taskStatuses.every((s: string) => terminalTaskStatuses.has(s));
+                const normalizedStatus = allTasksTerminal && (e.status === 'waiting' || e.status === 'serving')
+                    ? 'completed'
+                    : e.status;
+
+                return {
+                    id: e.id,
+                    type: 'queue',
+                    display_token: e.ticket_number,
+                    customer_name: e.customer_name,
+                    status: normalizedStatus,
+                    time: e.joined_at,
+                    service_name: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || e.service_name || 'Walk-in',
+                    translations: e.queue_entry_services?.map((as: any) => as.services?.translations).filter(Boolean) || []
+                };
+            }) || []),
             ...(appointments?.map((a: any) => {
                 const customerName = a.guest_name ||
                     (Array.isArray(a.profiles) ? a.profiles[0]?.full_name : a.profiles?.full_name) ||

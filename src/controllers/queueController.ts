@@ -1959,7 +1959,11 @@ export const completeTask = async (req: Request, res: Response) => {
             .select('task_status')
             .eq('queue_entry_id', task.queue_entry_id);
 
-        const allDone = allTasks?.every((t: any) => t.task_status === 'done');
+        const terminalTaskStatuses = new Set(['done', 'completed', 'cancelled', 'skipped']);
+        const allDone = (allTasks || []).length > 0 && (allTasks || []).every((t: any) => {
+            const status = String(t?.task_status || '').toLowerCase();
+            return terminalTaskStatuses.has(status);
+        });
 
         if (allDone) {
             // Auto-complete the whole entry
