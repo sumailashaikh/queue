@@ -432,7 +432,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
 
         const queueIds = (business.queues || []).map((q: any) => q.id);
 
-        // 2. Fetch Active Queue Entries Today
+        // 2. Fetch Queue Entries Today (include completed for TV metrics)
         const { data: queueEntries, error: qError } = await supabase
             .from('queue_entries')
             .select(`
@@ -443,7 +443,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
             `)
             .in('queue_id', queueIds)
             .eq('entry_date', todayStr)
-            .in('status', ['waiting', 'serving'])
+            .in('status', ['waiting', 'serving', 'completed'])
             .order('position', { ascending: true });
 
         if (qError) throw qError;
@@ -496,7 +496,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                     type: 'appointment',
                     display_token: 'BOOKED',
                     customer_name: customerName,
-                    status: a.status === 'confirmed' ? 'waiting' : 'serving', // Map to queue status for simplicity
+                    status: a.status === 'confirmed' ? 'waiting' : 'completed',
                     time: a.start_time,
                     service_name: serviceNames,
                     translations: serviceTranslations
