@@ -1456,6 +1456,8 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
         const employeePhone = emp?.phone || empProvider?.phone;
         const { notificationService } = require('../services/notificationService');
 
+        let notificationSent = false;
+
         // 4. Apply post-status effects + notify employee
         if (status === 'APPROVED') {
             const { data: bizInfo } = await supabase
@@ -1485,24 +1487,31 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
                 const approvedMsg = shouldDeactivateNow
                     ? `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. Your access to the system has been revoked.`
                     : `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. You can continue working until ${requestedLastDate}. Access will be disabled after your last working date.`;
-                await Promise.allSettled([
+                const [waRes, smsRes] = await Promise.allSettled([
                     notificationService.sendWhatsApp(employeePhone, approvedMsg),
                     notificationService.sendSMS(employeePhone, approvedMsg)
                 ]);
+                const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
+                const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
+                notificationSent = !!(waOk || smsOk);
             }
         } else if (status === 'REJECTED') {
             if (employeePhone) {
                 const rejectedMsg = `Hi ${emp.full_name || 'Employee'}, your resignation request has been rejected by the business owner. Please contact the owner for details.`;
-                await Promise.allSettled([
+                const [waRes, smsRes] = await Promise.allSettled([
                     notificationService.sendWhatsApp(employeePhone, rejectedMsg),
                     notificationService.sendSMS(employeePhone, rejectedMsg)
                 ]);
+                const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
+                const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
+                notificationSent = !!(waOk || smsOk);
             }
         }
 
         res.status(200).json({
             status: 'success',
-            message: `Resignation ${status.toLowerCase()} successfully`
+            message: `Resignation ${status.toLowerCase()} successfully`,
+            notification_sent: notificationSent
         });
 
     } catch (error: any) {

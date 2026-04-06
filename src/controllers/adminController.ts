@@ -624,6 +624,8 @@ export const inviteEmployee = async (req: any, res: Response) => {
         if (!notified) {
             if (/21608|21211|unverified|not verified|verify.*caller|trial.*number/i.test(errBlob)) {
                 notify_hint = 'twilio_trial_destination_not_verified';
+            } else if (/63038|daily messages limit|exceeded the 50 daily/i.test(errBlob)) {
+                notify_hint = 'twilio_daily_limit';
             } else if (/20003|20001|authenticate|invalid.*sid|invalid.*token|permission denied/i.test(errBlob)) {
                 notify_hint = 'twilio_auth_mismatch';
             }
