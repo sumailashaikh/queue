@@ -76,6 +76,23 @@ function leaveDecisionToOwnerMessage(language: string, employeeName: string, whe
     return `[QueueUp]\nLeave Decision Update\n\n${safeEmployee}'s leave for ${when} has been rejected.${note ? `\nReason: ${note}` : ''}`;
 }
 
+function resignationRequestToOwnerMessage(language: string, employeeName: string, requestedLastDate?: string, reason?: string): string {
+    const lang = baseLang(language);
+    const safeEmployee = employeeName || 'Employee';
+    const safeDate = requestedLastDate || 'N/A';
+    const safeReason = String(reason || '').trim() || 'Not provided';
+    if (lang === 'hi') {
+        return `[QueueUp]\nनया इस्तीफा अनुरोध\n\nकर्मचारी: ${safeEmployee}\nअंतिम कार्य तिथि: ${safeDate}\nकारण: ${safeReason}\n\nकृपया डैशबोर्ड से समीक्षा करें।`;
+    }
+    if (lang === 'ar') {
+        return `[QueueUp]\nطلب استقالة جديد\n\nالموظف: ${safeEmployee}\nآخر يوم عمل: ${safeDate}\nالسبب: ${safeReason}\n\nيرجى المراجعة من لوحة التحكم.`;
+    }
+    if (lang === 'es') {
+        return `[QueueUp]\nNueva solicitud de renuncia\n\nEmpleado: ${safeEmployee}\nUltimo dia laboral: ${safeDate}\nMotivo: ${safeReason}\n\nRevisa la solicitud desde el panel.`;
+    }
+    return `[QueueUp]\nNew Resignation Request\n\nEmployee: ${safeEmployee}\nRequested Last Date: ${safeDate}\nReason: ${safeReason}\n\nPlease review in dashboard.`;
+}
+
 const isMissingColumnError = (error: any, columnName: string) => {
     const raw = error?.message || error?.error || (error as any)?.details || (error as any)?.hint || '';
     const message = String(raw).toLowerCase();
@@ -249,7 +266,8 @@ export const getServiceProviders = async (req: Request, res: Response) => {
         let query = adminSupabase
             .from('service_providers')
             .select('*, services:provider_services(services(id, name))')
-            .eq('business_id', targetBusinessId);
+            .eq('business_id', targetBusinessId)
+            .eq('is_active', true);
 
         const { data: providers, error } = await query.order('name', { ascending: true });
 
@@ -831,15 +849,15 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         // 1. Resolve provider by id OR user_id, then verify ownership/self
         let { data: provider } = await adminSupabase
             .from('service_providers')
-            .select('id, business_id, user_id')
+            .select('id, business_id, user_id, phone')
             .eq('id', id)
             .maybeSingle();
 
         if (!provider) {
             const byUser = await adminSupabase
                 .from('service_providers')
-                .select('id, business_id, user_id')
-                .eq('user_id', id)
+                .select('id, business_id, user_id, phone')
+                .eq('user_id', userId)
                 .order('created_at', { ascending: false })
                 .limit(1)
                 .maybeSingle();
@@ -858,7 +876,33 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             .single();
 
         const isOwner = business?.owner_id === userId;
-        const isSelf = provider.user_id === userId;
+        let isSelf = provider.user_id === userId;
+        if (!isSelf) {
+            // Backward compatibility: some legacy provider rows may not have user_id linked.
+            const mineByUser = await adminSupabase
+                .from('service_providers')
+                .select('id')
+                .eq('business_id', provider.business_id)
+                .eq('user_id', userId)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            isSelf = mineByUser.data?.id === provider.id;
+
+            if (!isSelf) {
+                const { data: myProfile } = await adminSupabase
+                    .from('profiles')
+                    .select('phone')
+                    .eq('id', userId)
+                    .maybeSingle();
+                const myPhone = String(myProfile?.phone || '').replace(/[^\d+]/g, '');
+                const providerPhone = String((provider as any)?.phone || '').replace(/[^\d+]/g, '');
+                if (myPhone && providerPhone) {
+                    const strip = (v: string) => v.replace(/^\+/, '');
+                    isSelf = strip(myPhone) === strip(providerPhone) || strip(myPhone).endsWith(strip(providerPhone)) || strip(providerPhone).endsWith(strip(myPhone));
+                }
+            }
+        }
 
         if (!isOwner && !isSelf) {
             return res.status(403).json({ status: 'error', message: 'Unauthorized: You can only apply for your own leave or for employees you own.' });
@@ -960,7 +1004,15 @@ export const addProviderLeave = async (req: Request, res: Response) => {
 
             const businessName = biz?.name || 'Your Business';
             const employeeFullname = profile?.full_name || 'An Employee';
-            const requestLang = ui_language || profile?.ui_language || 'en';
+            let requestLang = 'en';
+            if (biz?.owner_id) {
+                const { data: ownerLangRow } = await adminSupabase
+                    .from('profiles')
+                    .select('ui_language')
+                    .eq('id', biz.owner_id)
+                    .maybeSingle();
+                requestLang = ownerLangRow?.ui_language || 'en';
+            }
             const msg = leaveRequestToOwnerMessage(
                 requestLang,
                 employeeFullname,
@@ -1221,12 +1273,15 @@ export const deleteProviderLeave = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Unauthorized to delete this leave' });
         }
 
-        const { error } = await supabase
+        const { error, count } = await supabase
             .from('provider_leaves')
-            .delete()
+            .delete({ count: 'exact' })
             .eq('id', leaveId);
 
         if (error) throw error;
+        if (!count || count < 1) {
+            return res.status(404).json({ status: 'error', message: 'Leave not found or already deleted' });
+        }
 
         res.status(200).json({
             status: 'success',
@@ -1432,9 +1487,14 @@ export const submitResignation = async (req: Request, res: Response) => {
         const notificationJobs: Promise<any>[] = [];
 
         if (business?.owner_id) {
-            const { data: owner } = await supabase.from('profiles').select('phone').eq('id', business.owner_id).single();
+            const { data: owner } = await supabase.from('profiles').select('phone, ui_language').eq('id', business.owner_id).single();
             if (owner?.phone) {
-                const msg = `Resignation request received from ${employee.full_name}. Reason: ${reason || 'Not provided'}. Requested Last Date: ${requested_last_date || 'N/A'}.`;
+                const msg = resignationRequestToOwnerMessage(
+                    owner?.ui_language || 'en',
+                    employee.full_name,
+                    requested_last_date,
+                    reason
+                );
                 notificationJobs.push(notificationService.sendWhatsApp(owner.phone, msg));
                 notificationJobs.push(notificationService.sendSMS(owner.phone, msg));
             }

@@ -1647,7 +1647,21 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
 
         if (error) throw error;
         if (!data) {
-            return res.status(404).json({ status: 'error', message: 'Task not found or already updated' });
+            // Some deployments can return null representation on no-op updates.
+            // Re-read row once and treat it as success if it exists.
+            const { data: currentTask, error: refetchErr } = await adminSupabase
+                .from('queue_entry_services')
+                .select('id, assigned_provider_id')
+                .eq('id', id)
+                .maybeSingle();
+            if (refetchErr || !currentTask) {
+                return res.status(404).json({ status: 'error', message: 'Task not found or already updated' });
+            }
+            return res.status(200).json({
+                status: 'success',
+                message: 'Provider assigned to task successfully',
+                data: currentTask
+            });
         }
 
         res.status(200).json({
