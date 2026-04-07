@@ -3,6 +3,7 @@ import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
 import { isBusinessOpen, getLocalDateString } from '../utils/timeUtils';
 import { recomputeProviderDelays } from '../utils/delayLogic';
+import { isBlockingApprovedLeave } from '../utils/leaveStatus';
 
 export const getAllQueues = async (req: Request, res: Response) => {
     try {
@@ -1588,12 +1589,13 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
                 const entryDate = taskStr.queue_entries.entry_date;
                 const { data: leaves } = await adminSupabase
                     .from('provider_leaves')
-                    .select('id')
+                    .select('id, status')
                     .eq('provider_id', provider_id)
                     .lte('start_date', entryDate)
                     .gte('end_date', entryDate);
 
-                if (leaves && leaves.length > 0) {
+                const blocking = (leaves || []).filter(isBlockingApprovedLeave);
+                if (blocking.length > 0) {
                     return res.status(400).json({ status: 'error', message: 'This expert is on leave and cannot be assigned to tasks on this date.' });
                 }
             }
@@ -1774,12 +1776,13 @@ export const startTask = async (req: Request, res: Response) => {
             const entryDate = task.queue_entries.entry_date;
             const { data: leaves } = await adminSupabase
                 .from('provider_leaves')
-                .select('id')
+                .select('id, status')
                 .eq('provider_id', providerId)
                 .lte('start_date', entryDate)
                 .gte('end_date', entryDate);
 
-            if (leaves && leaves.length > 0) {
+            const blocking = (leaves || []).filter(isBlockingApprovedLeave);
+            if (blocking.length > 0) {
                 return res.status(400).json({ status: 'error', message: 'This expert is on leave and cannot start tasks on this date.' });
             }
         }

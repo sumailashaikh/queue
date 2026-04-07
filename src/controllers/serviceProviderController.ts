@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { countBlockingLiveQueueTasks } from '../utils/liveQueueTaskCount';
+import { isBlockingApprovedLeave } from '../utils/leaveStatus';
 
 /** Human-readable dates for SMS (en-US, date-only safe). */
 function formatLeaveDateForMessage(isoOrDate: string): string {
@@ -244,32 +245,16 @@ export const getServiceProviders = async (req: Request, res: Response) => {
         // Determine the target date for availability
         const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: timezone });
 
-        // Fetch all active leaves for these providers on the target date
-        let leavesOnTargetDate: any[] = [];
-        if (providers && providers.length > 0) {
-            const providerIds = providers.map((p: any) => p.id);
-            const { data: leaves } = await supabase
-                .from('provider_leaves')
-                .select('provider_id')
-                .in('provider_id', providerIds)
-                .lte('start_date', targetDateStr)
-                .gte('end_date', targetDateStr);
-
-            if (leaves) leavesOnTargetDate = leaves;
-        }
-
-        const providersOnLeaveIds = new Set(leavesOnTargetDate.map((l: any) => l.provider_id));
-
-        // Enhancement: Fetch all leaves for these providers to compute "upcoming" status
+        // Enhancement: Fetch leaves for these providers to compute "upcoming" / on-leave (approved only)
         let allRecentLeaves: any[] = [];
         if (providers && providers.length > 0) {
             const providerIds = providers.map((p: any) => p.id);
-            const { data: recentLeaves } = await supabase
+            const { data: recentLeaves } = await adminSupabase
                 .from('provider_leaves')
                 .select('*')
                 .in('provider_id', providerIds)
                 .gte('end_date', targetDateStr);
-            if (recentLeaves) allRecentLeaves = recentLeaves;
+            if (recentLeaves) allRecentLeaves = recentLeaves.filter(isBlockingApprovedLeave);
         }
 
         // Enhance with current task count and availability
@@ -917,39 +902,65 @@ export const addProviderLeave = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        // 5. Notify
+        // 5. Notify owner (SMS + WhatsApp when possible; multiple phone fallbacks)
+        let notificationSent = false;
+        let ownerNotifyTarget: string | null = null;
         if (!isAdminOrOwner) {
-            // Notify Owner
-            const { data: biz } = await supabase.from('businesses').select('owner_id, name').eq('id', provider.business_id).single();
-            if (biz?.owner_id) {
-                const { data: owner } = await supabase.from('profiles').select('phone, ui_language').eq('id', biz.owner_id).single();
-                if (owner?.phone) {
-                    const businessName = biz.name || 'Your Business';
-                    const employeeFullname = profile?.full_name || 'An Employee';
-                    const requestLang = profile?.ui_language || ui_language || 'en';
-                    const msg = leaveRequestToOwnerMessage(
-                        requestLang,
-                        employeeFullname,
-                        businessName,
-                        start_date,
-                        end_date,
-                        note
-                    );
+            const { data: biz } = await adminSupabase
+                .from('businesses')
+                .select('owner_id, name, phone, whatsapp_number')
+                .eq('id', provider.business_id)
+                .maybeSingle();
 
-                    const { notificationService } = require('../services/notificationService');
-                    const to = String(owner.phone).replace(/[^\d+]/g, '');
-                    await Promise.allSettled([
+            const businessName = biz?.name || 'Your Business';
+            const employeeFullname = profile?.full_name || 'An Employee';
+            const requestLang = ui_language || profile?.ui_language || 'en';
+            const msg = leaveRequestToOwnerMessage(
+                requestLang,
+                employeeFullname,
+                businessName,
+                start_date,
+                end_date,
+                note
+            );
+
+            const { notificationService, toE164Phone } = require('../services/notificationService');
+            const candidates: string[] = [];
+            if (biz?.owner_id) {
+                const { data: ownerRow } = await adminSupabase
+                    .from('profiles')
+                    .select('phone')
+                    .eq('id', biz.owner_id)
+                    .maybeSingle();
+                if (ownerRow?.phone) candidates.push(String(ownerRow.phone));
+            }
+            if (biz?.whatsapp_number) candidates.push(String(biz.whatsapp_number));
+            if (biz?.phone) candidates.push(String(biz.phone));
+
+            const normalized = [...new Set(candidates.map((c) => toE164Phone(String(c))).filter(Boolean))];
+            ownerNotifyTarget = normalized[0] || null;
+
+            if (normalized.length === 0) {
+                notificationSent = false;
+            } else {
+                const results = await Promise.allSettled(
+                    normalized.flatMap((to) => [
                         notificationService.sendWhatsApp(to, msg),
                         notificationService.sendSMS(to, msg)
-                    ]);
-                }
+                    ])
+                );
+                notificationSent = results.some(
+                    (r) => r.status === 'fulfilled' && r.value === true
+                );
             }
         }
 
         res.status(201).json({
             status: 'success',
             message: isAdminOrOwner ? 'Leave added successfully' : 'Leave request submitted successfully',
-            data
+            data,
+            notification_sent: isAdminOrOwner ? undefined : notificationSent,
+            owner_phone_configured: isAdminOrOwner ? undefined : !!ownerNotifyTarget
         });
 
     } catch (error: any) {
@@ -964,6 +975,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
         const reasonRaw = String(req.body?.reason || '').trim();
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
@@ -1050,13 +1062,17 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
         // 3. Notify Employee
         let recipientPhone = leave.service_providers?.phone;
         if (!recipientPhone && leave.service_providers?.user_id) {
-            const { data: empProfile } = await supabase.from('profiles').select('phone').eq('id', leave.service_providers.user_id).single();
+            const { data: empProfile } = await adminSupabase
+                .from('profiles')
+                .select('phone')
+                .eq('id', leave.service_providers.user_id)
+                .maybeSingle();
             recipientPhone = empProfile?.phone;
         }
 
         let notificationSent = false;
         if (recipientPhone) {
-            const { notificationService } = require('../services/notificationService');
+            const { notificationService, toE164Phone } = require('../services/notificationService');
             const firstName = String(leave.service_providers?.name || 'there').trim().split(/\s+/)[0];
             const when = formatLeaveRangeForMessage(leave.start_date, leave.end_date);
             const { data: approverProfile } = await supabase
@@ -1072,7 +1088,10 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                 reasonRaw
             );
 
-            const to = String(recipientPhone).replace(/[^\d+]/g, '');
+            const to = toE164Phone(String(recipientPhone));
+            if (!to) {
+                notificationSent = false;
+            } else {
             const [waRes, smsRes] = await Promise.allSettled([
                 notificationService.sendWhatsApp(to, msg),
                 notificationService.sendSMS(to, msg)
@@ -1080,6 +1099,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
             const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
             notificationSent = !!(waOk || smsOk);
+            }
         }
 
         res.status(200).json({
@@ -1186,11 +1206,13 @@ export const getBulkLeaveStatus = async (req: Request, res: Response) => {
         const tomorrow = new Date(new Date(targetDateStr).getTime() + 24 * 60 * 60 * 1000);
         const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: timezone });
 
-        const { data: leaves } = await supabase
+        const { data: leavesRaw } = await supabase
             .from('provider_leaves')
             .select('*')
             .eq('business_id', business_id)
             .gte('end_date', targetDateStr);
+
+        const leaves = (leavesRaw || []).filter(isBlockingApprovedLeave);
 
         const results = (providers || []).map((p: any) => {
             const providerLeaves = (leaves || []).filter((l: any) => l.provider_id === p.id);
@@ -1223,6 +1245,54 @@ export const getBulkLeaveStatus = async (req: Request, res: Response) => {
             data: results
         });
 
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+/** Pending leave requests (employee-submitted, awaiting owner action) — for owner dashboard alerts */
+export const getPendingLeaveRequestsCount = async (req: Request, res: Response) => {
+    try {
+        const { business_id } = req.query;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+        if (!business_id) {
+            return res.status(400).json({ status: 'error', message: 'business_id is required' });
+        }
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', business_id)
+            .eq('owner_id', userId)
+            .single();
+
+        if (!business) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { count, error } = await adminSupabase
+            .from('provider_leaves')
+            .select('id', { count: 'exact', head: true })
+            .eq('business_id', business_id)
+            .eq('status', 'PENDING');
+        if (error && isMissingColumnError(error, 'status')) {
+            return res.status(200).json({
+                status: 'success',
+                data: { pending_count: 0 }
+            });
+        }
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            data: { pending_count: count || 0 }
+        });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
     }
