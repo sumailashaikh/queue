@@ -86,8 +86,8 @@ class TwilioNotificationService implements NotificationService {
     async sendSMS(to: string, message: string): Promise<boolean> {
         const e164 = toE164Phone(to);
         if (!this.client) {
-            console.log(`[FALLBACK SMS] To: ${e164}, Message: ${message}`);
-            return true;
+            console.error(`[Twilio SMS Disabled] Missing/invalid client. To: ${e164}`);
+            return false;
         }
 
         try {
@@ -114,8 +114,8 @@ class TwilioNotificationService implements NotificationService {
     async sendWhatsApp(to: string, message: string): Promise<boolean> {
         const e164 = toE164Phone(to);
         if (!this.client) {
-            console.log(`[FALLBACK WhatsApp] To: ${e164}, Message: ${message}`);
-            return true;
+            console.error(`[Twilio WhatsApp Disabled] Missing/invalid client. To: ${e164}`);
+            return false;
         }
 
         try {
@@ -152,11 +152,11 @@ class TwilioNotificationService implements NotificationService {
         let waErr: string | undefined;
 
         if (!this.client) {
-            console.log(`[FALLBACK invite notify] To: ${e164}`);
+            console.error(`[Twilio Invite Disabled] Missing/invalid client. To: ${e164}`);
             return {
-                notified: true,
-                sms: { ok: true, channel: 'sms' as const },
-                whatsapp: { ok: true, channel: 'whatsapp' as const }
+                notified: false,
+                sms: { ok: false, channel: 'sms' as const, error: 'Twilio client not initialized' },
+                whatsapp: { ok: false, channel: 'whatsapp' as const, error: 'Twilio client not initialized' }
             };
         }
 
@@ -209,7 +209,6 @@ class TwilioNotificationService implements NotificationService {
 }
 
 // Export a singleton instance
-// Switch to real service only if valid config exists
-export const notificationService = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_ACCOUNT_SID.startsWith('AC')
-    ? new TwilioNotificationService()
-    : new MockNotificationService();
+// Mock mode should be explicit (local/testing only), otherwise use Twilio service and return real failures.
+const allowMock = String(process.env.ALLOW_MOCK_NOTIFICATIONS || '').toLowerCase() === 'true' || process.env.NODE_ENV === 'test';
+export const notificationService = allowMock ? new MockNotificationService() : new TwilioNotificationService();
