@@ -885,14 +885,14 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         let data: any = null;
         let error: any = null;
         for (let attempt = 0; attempt < 5; attempt++) {
-            const res = await supabase
+            const insertRes = await supabase
                 .from('provider_leaves')
                 .insert([payload])
                 .select()
                 .limit(1)
                 .maybeSingle();
-            data = res.data;
-            error = res.error;
+            data = insertRes.data;
+            error = insertRes.error;
             if (!error) break;
             if (isLeaveOverlapConstraintError(error)) {
                 return res.status(400).json({
