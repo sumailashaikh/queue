@@ -28,21 +28,21 @@ function baseLang(input?: string): 'en' | 'es' | 'hi' | 'ar' {
 }
 
 function leaveRequestToOwnerMessage(language: string, employeeName: string, businessName: string, start: string, end: string, note?: string): string {
-    const when = `${start} - ${end}`;
+    const when = formatLeaveRangeForMessage(start, end);
     const noteText = String(note || '').trim();
     const safeEmployee = employeeName || 'Employee';
     const safeBusiness = businessName || 'Business';
     const lang = baseLang(language);
     if (lang === 'hi') {
-        return `[QueueUp] ${safeEmployee} ने ${safeBusiness} में ${when} के लिए छुट्टी का अनुरोध भेजा है। कृपया डैशबोर्ड में समीक्षा करें.${noteText ? ` नोट: "${noteText}"` : ''}`;
+        return `[QueueUp] छुट्टी अनुरोध: ${safeEmployee} (${safeBusiness})\nतारीख: ${when}\nकृपया प्रोवाइडर्स → Manage Leave में स्वीकृत/अस्वीकृत करें।${noteText ? `\nनोट: ${noteText}` : ''}`;
     }
     if (lang === 'ar') {
-        return `[QueueUp] أرسل ${safeEmployee} طلب إجازة لدى ${safeBusiness} للفترة ${when}. يرجى المراجعة من لوحة التحكم.${noteText ? ` الملاحظة: "${noteText}"` : ''}`;
+        return `[QueueUp] طلب إجازة: ${safeEmployee} (${safeBusiness})\nالتاريخ: ${when}\nيرجى المراجعة من لوحة التحكم (مقدمي الخدمة → إدارة الإجازة).${noteText ? `\nملاحظة: ${noteText}` : ''}`;
     }
     if (lang === 'es') {
-        return `[QueueUp] ${safeEmployee} envió una solicitud de permiso para ${safeBusiness} del ${when}. Revísala en el panel.${noteText ? ` Nota: "${noteText}"` : ''}`;
+        return `[QueueUp] Solicitud de permiso: ${safeEmployee} (${safeBusiness})\nFechas: ${when}\nRevisa y aprueba/rechaza en Proveedores → Gestionar permiso.${noteText ? `\nNota: ${noteText}` : ''}`;
     }
-    return `[QueueUp] ${safeEmployee} submitted a leave request for ${safeBusiness} (${when}). Please review it in your dashboard.${noteText ? ` Note: "${noteText}"` : ''}`;
+    return `[QueueUp] Leave request: ${safeEmployee} (${safeBusiness})\nDates: ${when}\nPlease review in Providers → Manage Leave.${noteText ? `\nNote: ${noteText}` : ''}`;
 }
 
 function leaveDecisionToEmployeeMessage(language: string, firstName: string, when: string, approved: boolean, reason?: string): string {
@@ -50,15 +50,15 @@ function leaveDecisionToEmployeeMessage(language: string, firstName: string, whe
     const note = String(reason || '').trim();
     const lang = baseLang(language);
     if (approved) {
-        if (lang === 'hi') return `[QueueUp] नमस्ते ${name}, ${when} के लिए आपका अवकाश अनुरोध स्वीकृत हो गया है। धन्यवाद।`;
-        if (lang === 'ar') return `[QueueUp] مرحباً ${name}، تمت الموافقة على طلب إجازتك للفترة ${when}. شكراً لك.`;
-        if (lang === 'es') return `[QueueUp] Hola ${name}, tu solicitud de permiso para ${when} fue aprobada. Gracias.`;
-        return `[QueueUp] Hello ${name}, your time-off request for ${when} has been approved. Thank you.`;
+        if (lang === 'hi') return `[QueueUp] नमस्ते ${name},\nआपकी छुट्टी स्वीकृत हो गई है।\nतारीख: ${when}\nधन्यवाद।`;
+        if (lang === 'ar') return `[QueueUp] مرحباً ${name},\nتمت الموافقة على إجازتك.\nالتاريخ: ${when}\nشكراً لك.`;
+        if (lang === 'es') return `[QueueUp] Hola ${name},\nTu permiso fue aprobado.\nFechas: ${when}\nGracias.`;
+        return `[QueueUp] Hello ${name},\nYour time‑off request was approved.\nDates: ${when}\nThank you.`;
     }
-    if (lang === 'hi') return `[QueueUp] नमस्ते ${name}, ${when} के लिए आपका अवकाश अनुरोध स्वीकृत नहीं हो सका।${note ? ` प्रबंधक संदेश: "${note}"` : ''} कृपया नई तारीख़ के साथ फिर प्रयास करें।`;
-    if (lang === 'ar') return `[QueueUp] مرحباً ${name}، تعذر الموافقة على طلب إجازتك للفترة ${when}.${note ? ` رسالة المدير: "${note}"` : ''} يرجى المحاولة بتاريخ آخر.`;
-    if (lang === 'es') return `[QueueUp] Hola ${name}, no pudimos aprobar tu solicitud de permiso para ${when}.${note ? ` Mensaje del responsable: "${note}"` : ''} Inténtalo con otras fechas.`;
-    return `[QueueUp] Hello ${name}, we could not approve your time-off request for ${when}.${note ? ` Manager note: "${note}"` : ''} Please try with alternate dates.`;
+    if (lang === 'hi') return `[QueueUp] नमस्ते ${name},\nआपकी छुट्टी स्वीकृत नहीं हो सकी।\nतारीख: ${when}${note ? `\nप्रबंधक संदेश: ${note}` : ''}\nकृपया दूसरी तारीख चुनकर फिर प्रयास करें।`;
+    if (lang === 'ar') return `[QueueUp] مرحباً ${name},\nتعذر الموافقة على طلب الإجازة.\nالتاريخ: ${when}${note ? `\nرسالة المدير: ${note}` : ''}\nيرجى المحاولة بتاريخ آخر.`;
+    if (lang === 'es') return `[QueueUp] Hola ${name},\nNo pudimos aprobar tu solicitud de permiso.\nFechas: ${when}${note ? `\nMensaje del responsable: ${note}` : ''}\nPor favor, prueba con otras fechas.`;
+    return `[QueueUp] Hello ${name},\nWe could not approve your time‑off request.\nDates: ${when}${note ? `\nManager note: ${note}` : ''}\nPlease try alternate dates.`;
 }
 
 const isMissingColumnError = (error: any, columnName: string) => {
