@@ -1482,38 +1482,62 @@ export const submitResignation = async (req: Request, res: Response) => {
         if (error) throw error;
 
         // 3. Notify Owner + Employee confirmation
-        const { data: business } = await supabase.from('businesses').select('owner_id').eq('id', employee.business_id).single();
-        const { notificationService } = require('../services/notificationService');
-        const notificationJobs: Promise<any>[] = [];
+        const { adminSupabase } = require('../config/supabaseClient');
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('owner_id, phone, whatsapp_number')
+            .eq('id', employee.business_id)
+            .single();
+        const { notificationService, toE164Phone } = require('../services/notificationService');
+        let ownerNotificationSent = false;
+        let employeeNotificationSent = false;
 
         if (business?.owner_id) {
-            const { data: owner } = await supabase.from('profiles').select('phone, ui_language').eq('id', business.owner_id).single();
-            if (owner?.phone) {
+            const { data: owner } = await adminSupabase
+                .from('profiles')
+                .select('phone, ui_language')
+                .eq('id', business.owner_id)
+                .maybeSingle();
+            const ownerCandidates: string[] = [];
+            if (owner?.phone) ownerCandidates.push(String(owner.phone));
+            if (business?.whatsapp_number) ownerCandidates.push(String(business.whatsapp_number));
+            if (business?.phone) ownerCandidates.push(String(business.phone));
+            const ownerTargets = [...new Set(ownerCandidates.map((p) => toE164Phone(String(p))).filter(Boolean))];
+            if (ownerTargets.length > 0) {
                 const msg = resignationRequestToOwnerMessage(
                     owner?.ui_language || 'en',
                     employee.full_name,
                     requested_last_date,
                     reason
                 );
-                notificationJobs.push(notificationService.sendWhatsApp(owner.phone, msg));
-                notificationJobs.push(notificationService.sendSMS(owner.phone, msg));
+                const ownerResults = await Promise.allSettled(
+                    ownerTargets.flatMap((to: string) => [
+                        notificationService.sendWhatsApp(to, msg),
+                        notificationService.sendSMS(to, msg)
+                    ])
+                );
+                ownerNotificationSent = ownerResults.some((r: any) => r.status === 'fulfilled' && r.value === true);
             }
         }
 
         if (employee?.phone) {
             const empMsg = `Your resignation request has been submitted successfully. Requested last date: ${requested_last_date || 'N/A'}. We will notify you once the business owner reviews it.`;
-            notificationJobs.push(notificationService.sendWhatsApp(employee.phone, empMsg));
-            notificationJobs.push(notificationService.sendSMS(employee.phone, empMsg));
-        }
-
-        if (notificationJobs.length > 0) {
-            await Promise.allSettled(notificationJobs);
+            const to = toE164Phone(String(employee.phone));
+            if (to) {
+                const employeeResults = await Promise.allSettled([
+                    notificationService.sendWhatsApp(to, empMsg),
+                    notificationService.sendSMS(to, empMsg)
+                ]);
+                employeeNotificationSent = employeeResults.some((r: any) => r.status === 'fulfilled' && r.value === true);
+            }
         }
 
         res.status(201).json({
             status: 'success',
             message: 'Resignation request submitted successfully',
-            data
+            data,
+            owner_notification_sent: ownerNotificationSent,
+            employee_notification_sent: employeeNotificationSent
         });
 
     } catch (error: any) {
