@@ -233,28 +233,28 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
 
         const businessIds = businesses.map((b: any) => b.id);
 
-        // 1.5 Auto-Process No-Shows & Expirations (30-min grace period)
+        // 1.5 Auto-Process No-Shows & Expirations (60-min grace period)
         const now = new Date();
-        const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
+        const sixtyMinsAgo = new Date(now.getTime() - 60 * 60000).toISOString();
         const primaryTimezone = businesses[0]?.timezone || 'UTC';
         const todayStr = getLocalDateString(primaryTimezone);
 
-        // A. Mark 'scheduled' (Pending) as 'expired' if 30 mins late
+        // A. Mark 'scheduled' (Pending) as 'expired' if 60 mins late
         await supabase
             .from('appointments')
             .update({ status: 'expired' })
             .in('business_id', businessIds)
             .eq('status', 'scheduled')
-            .lt('start_time', thirtyMinsAgo)
+            .lt('start_time', sixtyMinsAgo)
             .gte('start_time', todayStr + 'T00:00:00Z');
 
-        // B. Mark 'confirmed' as 'no_show' if 30 mins late
+        // B. Mark 'confirmed' as 'no_show' if 60 mins late
         const { data: noShowAppointments } = await supabase
             .from('appointments')
             .update({ status: 'no_show' })
             .in('business_id', businessIds)
             .eq('status', 'confirmed')
-            .lt('start_time', thirtyMinsAgo)
+            .lt('start_time', sixtyMinsAgo)
             .gte('start_time', todayStr + 'T00:00:00Z')
             .select('id');
 
