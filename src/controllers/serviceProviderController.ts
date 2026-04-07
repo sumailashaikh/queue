@@ -329,7 +329,7 @@ export const getServiceProviders = async (req: Request, res: Response) => {
 export const updateServiceProvider = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const updates = req.body;
+        const updates = req.body || {};
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -337,12 +337,21 @@ export const updateServiceProvider = async (req: Request, res: Response) => {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        const { name, phone, role, department } = updates;
-        if (!name || !phone || !role || !department) {
+        // PATCH semantics: allow partial updates
+        const hasAnyUpdates =
+            Object.prototype.hasOwnProperty.call(updates, 'name') ||
+            Object.prototype.hasOwnProperty.call(updates, 'phone') ||
+            Object.prototype.hasOwnProperty.call(updates, 'role') ||
+            Object.prototype.hasOwnProperty.call(updates, 'department') ||
+            Object.prototype.hasOwnProperty.call(updates, 'translations') ||
+            Object.prototype.hasOwnProperty.call(updates, 'is_active') ||
+            Object.prototype.hasOwnProperty.call(updates, 'is_available');
+
+        if (!hasAnyUpdates) {
             return res.status(400).json({ status: 'error', message: 'providers.all_fields_required' });
         }
 
-        const trimmedName = name.trim();
+        const trimmedName = typeof updates.name === 'string' ? updates.name.trim() : undefined;
 
         // 1. Ownership check (Implicit via user_id/RLS, but let's confirm the business_id of the record)
         const { data: currentProvider, error: fetchError } = await supabase
@@ -355,25 +364,36 @@ export const updateServiceProvider = async (req: Request, res: Response) => {
             return res.status(404).json({ status: 'error', message: 'providers.err_not_found' });
         }
 
-        // 2. Check for name collision with OTHER providers in the same business
-        const { data: collision, error: collisionError } = await supabase
-            .from('service_providers')
-            .select('id')
-            .eq('business_id', currentProvider.business_id)
-            .ilike('name', trimmedName)
-            .neq('id', id) // Exclude current record
-            .maybeSingle();
+        // 2. Check for name collision with OTHER providers in the same business (only when updating name)
+        if (trimmedName) {
+            const { data: collision, error: collisionError } = await supabase
+                .from('service_providers')
+                .select('id')
+                .eq('business_id', currentProvider.business_id)
+                .ilike('name', trimmedName)
+                .neq('id', id) // Exclude current record
+                .maybeSingle();
 
-        if (collisionError) throw collisionError;
+            if (collisionError) throw collisionError;
 
-        if (collision) {
-            return res.status(400).json({ status: 'error', message: 'providers.already_exists' });
+            if (collision) {
+                return res.status(400).json({ status: 'error', message: 'providers.already_exists' });
+            }
         }
+
+        const safeUpdates: any = {};
+        if (trimmedName !== undefined) safeUpdates.name = trimmedName;
+        if (Object.prototype.hasOwnProperty.call(updates, 'phone')) safeUpdates.phone = updates.phone;
+        if (Object.prototype.hasOwnProperty.call(updates, 'role')) safeUpdates.role = updates.role;
+        if (Object.prototype.hasOwnProperty.call(updates, 'department')) safeUpdates.department = updates.department;
+        if (Object.prototype.hasOwnProperty.call(updates, 'translations')) safeUpdates.translations = updates.translations;
+        if (Object.prototype.hasOwnProperty.call(updates, 'is_active')) safeUpdates.is_active = updates.is_active;
+        if (Object.prototype.hasOwnProperty.call(updates, 'is_available')) safeUpdates.is_available = updates.is_available;
 
         // RLS handles ownership, but we check if we got data back
         const { data, error } = await supabase
             .from('service_providers')
-            .update(updates)
+            .update(safeUpdates)
             .eq('id', id)
             .select()
             .single();
