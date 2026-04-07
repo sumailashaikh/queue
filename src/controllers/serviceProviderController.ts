@@ -31,18 +31,17 @@ function leaveRequestToOwnerMessage(language: string, employeeName: string, busi
     const when = formatLeaveRangeForMessage(start, end);
     const noteText = String(note || '').trim();
     const safeEmployee = employeeName || 'Employee';
-    const safeBusiness = businessName || 'Business';
     const lang = baseLang(language);
     if (lang === 'hi') {
-        return `[QueueUp] छुट्टी अनुरोध: ${safeEmployee} (${safeBusiness})\nतारीख: ${when}\nकृपया प्रोवाइडर्स → Manage Leave में स्वीकृत/अस्वीकृत करें।${noteText ? `\nनोट: ${noteText}` : ''}`;
+        return `[QueueUp]\nछुट्टी अनुरोध\n\nकर्मचारी: ${safeEmployee}\nतारीख: ${when}\nकारण: ${noteText || 'उल्लेख नहीं किया गया'}\n\nकृपया डैशबोर्ड में Approve/Reject करें।`;
     }
     if (lang === 'ar') {
-        return `[QueueUp] طلب إجازة: ${safeEmployee} (${safeBusiness})\nالتاريخ: ${when}\nيرجى المراجعة من لوحة التحكم (مقدمي الخدمة → إدارة الإجازة).${noteText ? `\nملاحظة: ${noteText}` : ''}`;
+        return `[QueueUp]\nطلب إجازة جديد\n\nاسم الموظف: ${safeEmployee}\nالتاريخ: ${when}\nالسبب: ${noteText || 'غير مذكور'}\n\nيرجى الموافقة أو الرفض من لوحة التحكم.`;
     }
     if (lang === 'es') {
-        return `[QueueUp] Solicitud de permiso: ${safeEmployee} (${safeBusiness})\nFechas: ${when}\nRevisa y aprueba/rechaza en Proveedores → Gestionar permiso.${noteText ? `\nNota: ${noteText}` : ''}`;
+        return `[QueueUp]\nNueva solicitud de permiso\n\nEmpleado: ${safeEmployee}\nFecha: ${when}\nMotivo: ${noteText || 'No especificado'}\n\nAprueba o rechaza desde el panel.`;
     }
-    return `[QueueUp] Leave request: ${safeEmployee} (${safeBusiness})\nDates: ${when}\nPlease review in Providers → Manage Leave.${noteText ? `\nNote: ${noteText}` : ''}`;
+    return `[QueueUp]\nNew Leave Request\n\nEmployee Name: ${safeEmployee}\nDate: ${when}\nReason: ${noteText || 'Not provided'}\n\nApprove or Reject from dashboard.`;
 }
 
 function leaveDecisionToEmployeeMessage(language: string, firstName: string, when: string, approved: boolean, reason?: string): string {
@@ -50,15 +49,31 @@ function leaveDecisionToEmployeeMessage(language: string, firstName: string, whe
     const note = String(reason || '').trim();
     const lang = baseLang(language);
     if (approved) {
-        if (lang === 'hi') return `[QueueUp] नमस्ते ${name},\nआपकी छुट्टी स्वीकृत हो गई है।\nतारीख: ${when}\nधन्यवाद।`;
-        if (lang === 'ar') return `[QueueUp] مرحباً ${name},\nتمت الموافقة على إجازتك.\nالتاريخ: ${when}\nشكراً لك.`;
-        if (lang === 'es') return `[QueueUp] Hola ${name},\nTu permiso fue aprobado.\nFechas: ${when}\nGracias.`;
-        return `[QueueUp] Hello ${name},\nYour time‑off request was approved.\nDates: ${when}\nThank you.`;
+        if (lang === 'hi') return `[QueueUp]\nछुट्टी स्वीकृत\n\nनमस्ते ${name},\nआपकी छुट्टी (${when}) स्वीकृत हो गई है।\n\nअपने अवकाश का आनंद लें।`;
+        if (lang === 'ar') return `[QueueUp]\nتمت الموافقة على الإجازة\n\nمرحباً ${name},\nتمت الموافقة على إجازتك بتاريخ ${when}.\n\nنتمنى لك وقتاً سعيداً.`;
+        if (lang === 'es') return `[QueueUp]\nPermiso aprobado\n\nHola ${name},\nTu permiso para ${when} fue aprobado.\n\nDisfruta tu descanso.`;
+        return `[QueueUp]\nLeave Approved\n\nHello ${name},\nYour leave for ${when} has been approved.\n\nEnjoy your time off!`;
     }
-    if (lang === 'hi') return `[QueueUp] नमस्ते ${name},\nआपकी छुट्टी स्वीकृत नहीं हो सकी।\nतारीख: ${when}${note ? `\nप्रबंधक संदेश: ${note}` : ''}\nकृपया दूसरी तारीख चुनकर फिर प्रयास करें।`;
-    if (lang === 'ar') return `[QueueUp] مرحباً ${name},\nتعذر الموافقة على طلب الإجازة.\nالتاريخ: ${when}${note ? `\nرسالة المدير: ${note}` : ''}\nيرجى المحاولة بتاريخ آخر.`;
-    if (lang === 'es') return `[QueueUp] Hola ${name},\nNo pudimos aprobar tu solicitud de permiso.\nFechas: ${when}${note ? `\nMensaje del responsable: ${note}` : ''}\nPor favor, prueba con otras fechas.`;
-    return `[QueueUp] Hello ${name},\nWe could not approve your time‑off request.\nDates: ${when}${note ? `\nManager note: ${note}` : ''}\nPlease try alternate dates.`;
+    if (lang === 'hi') return `[QueueUp]\nछुट्टी अस्वीकृत\n\nनमस्ते ${name},\n${when} की आपकी छुट्टी अनुरोध अस्वीकृत कर दी गई है।${note ? `\nकारण: ${note}` : ''}\n\nकृपया अनुसार योजना बनाएं।`;
+    if (lang === 'ar') return `[QueueUp]\nتم رفض الإجازة\n\nمرحباً ${name},\nتم رفض طلب إجازتك بتاريخ ${when}.${note ? `\nالسبب: ${note}` : ''}\n\nيرجى التخطيط وفقاً لذلك.`;
+    if (lang === 'es') return `[QueueUp]\nPermiso rechazado\n\nHola ${name},\nTu solicitud de permiso para ${when} fue rechazada.${note ? `\nMotivo: ${note}` : ''}\n\nPor favor, planifica en consecuencia.`;
+    return `[QueueUp]\nLeave Rejected\n\nHello ${name},\nYour leave request for ${when} has been rejected.${note ? `\nReason: ${note}` : ''}\n\nPlease plan accordingly.`;
+}
+
+function leaveDecisionToOwnerMessage(language: string, employeeName: string, when: string, approved: boolean, reason?: string): string {
+    const lang = baseLang(language);
+    const safeEmployee = employeeName || 'Employee';
+    const note = String(reason || '').trim();
+    if (approved) {
+        if (lang === 'hi') return `[QueueUp]\nछुट्टी निर्णय अपडेट\n\n${safeEmployee} की छुट्टी ${when} के लिए स्वीकृत कर दी गई है।`;
+        if (lang === 'ar') return `[QueueUp]\nتحديث قرار الإجازة\n\nتمت الموافقة على إجازة ${safeEmployee} بتاريخ ${when}.`;
+        if (lang === 'es') return `[QueueUp]\nActualización de permiso\n\nSe aprobó el permiso de ${safeEmployee} para ${when}.`;
+        return `[QueueUp]\nLeave Decision Update\n\n${safeEmployee}'s leave for ${when} has been approved.`;
+    }
+    if (lang === 'hi') return `[QueueUp]\nछुट्टी निर्णय अपडेट\n\n${safeEmployee} की छुट्टी ${when} के लिए अस्वीकृत कर दी गई है।${note ? `\nकारण: ${note}` : ''}`;
+    if (lang === 'ar') return `[QueueUp]\nتحديث قرار الإجازة\n\nتم رفض إجازة ${safeEmployee} بتاريخ ${when}.${note ? `\nالسبب: ${note}` : ''}`;
+    if (lang === 'es') return `[QueueUp]\nActualización de permiso\n\nSe rechazó el permiso de ${safeEmployee} para ${when}.${note ? `\nMotivo: ${note}` : ''}`;
+    return `[QueueUp]\nLeave Decision Update\n\n${safeEmployee}'s leave for ${when} has been rejected.${note ? `\nReason: ${note}` : ''}`;
 }
 
 const isMissingColumnError = (error: any, columnName: string) => {
@@ -1036,7 +1051,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
         const { data: business } = await supabase
             .from('businesses')
-            .select('id')
+            .select('id, phone, whatsapp_number')
             .eq('id', leave.business_id)
             .eq('owner_id', userId)
             .single();
@@ -1102,15 +1117,17 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
         }
 
         let notificationSent = false;
+        let ownerNotificationSent = false;
+        const { notificationService, toE164Phone } = require('../services/notificationService');
+        const firstName = String(leave.service_providers?.name || 'there').trim().split(/\s+/)[0];
+        const employeeName = String(leave.service_providers?.name || 'Employee').trim();
+        const when = formatLeaveRangeForMessage(leave.start_date, leave.end_date);
+        const { data: approverProfile } = await supabase
+            .from('profiles')
+            .select('ui_language, phone')
+            .eq('id', userId)
+            .maybeSingle();
         if (recipientPhone) {
-            const { notificationService, toE164Phone } = require('../services/notificationService');
-            const firstName = String(leave.service_providers?.name || 'there').trim().split(/\s+/)[0];
-            const when = formatLeaveRangeForMessage(leave.start_date, leave.end_date);
-            const { data: approverProfile } = await supabase
-                .from('profiles')
-                .select('ui_language')
-                .eq('id', userId)
-                .maybeSingle();
             const msg = leaveDecisionToEmployeeMessage(
                 approverProfile?.ui_language || 'en',
                 firstName,
@@ -1123,14 +1140,37 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             if (!to) {
                 notificationSent = false;
             } else {
-            const [waRes, smsRes] = await Promise.allSettled([
-                notificationService.sendWhatsApp(to, msg),
-                notificationService.sendSMS(to, msg)
-            ]);
-            const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
-            const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
-            notificationSent = !!(waOk || smsOk);
+                const [waRes, smsRes] = await Promise.allSettled([
+                    notificationService.sendWhatsApp(to, msg),
+                    notificationService.sendSMS(to, msg)
+                ]);
+                const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
+                const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
+                notificationSent = !!(waOk || smsOk);
             }
+        }
+
+        // 4. Owner confirmation notification (non-blocking)
+        const ownerMsg = leaveDecisionToOwnerMessage(
+            approverProfile?.ui_language || 'en',
+            employeeName,
+            when,
+            status === 'APPROVED',
+            reasonRaw
+        );
+        const ownerCandidates: string[] = [];
+        if (approverProfile?.phone) ownerCandidates.push(String(approverProfile.phone));
+        if (business?.whatsapp_number) ownerCandidates.push(String(business.whatsapp_number));
+        if (business?.phone) ownerCandidates.push(String(business.phone));
+        const ownerTargets = [...new Set(ownerCandidates.map((p) => toE164Phone(String(p))).filter(Boolean))];
+        if (ownerTargets.length > 0) {
+            const ownerResults = await Promise.allSettled(
+                ownerTargets.flatMap((to: string) => [
+                    notificationService.sendWhatsApp(to, ownerMsg),
+                    notificationService.sendSMS(to, ownerMsg)
+                ])
+            );
+            ownerNotificationSent = ownerResults.some((r: any) => r.status === 'fulfilled' && r.value === true);
         }
 
         res.status(200).json({
@@ -1138,7 +1178,8 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             message: 'providers.success_leave_status_updated',
             data,
             leave_status: status,
-            notification_sent: notificationSent
+            notification_sent: notificationSent,
+            owner_notification_sent: ownerNotificationSent
         });
 
     } catch (error: any) {
