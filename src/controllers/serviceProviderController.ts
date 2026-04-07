@@ -82,6 +82,11 @@ const isMissingColumnError = (error: any, columnName: string) => {
     return mentionsCol && schemaIssue;
 };
 
+const isLeaveOverlapConstraintError = (error: any): boolean => {
+    const raw = String(error?.message || error?.error || (error as any)?.details || '').toLowerCase();
+    return raw.includes('exclusion constraint') || raw.includes('provider_leaves_overlap');
+};
+
 const validateTextByLanguage = (text: string, language: string): boolean => {
     if (!text || !text.trim()) return true;
     const baseLang = (language || 'en').split('-')[0].toLowerCase();
@@ -889,6 +894,12 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             data = res.data;
             error = res.error;
             if (!error) break;
+            if (isLeaveOverlapConstraintError(error)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'providers.err_leave_overlap'
+                });
+            }
             if (isMissingColumnError(error, 'approved_by')) {
                 delete payload.approved_by;
                 continue;
