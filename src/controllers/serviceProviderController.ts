@@ -1667,20 +1667,42 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
 
         if (updateReqError) throw updateReqError;
 
+        const { adminSupabase } = require('../config/supabaseClient');
         const { data: emp } = await supabase
             .from('profiles')
             .select('phone, full_name')
             .eq('id', request.employee_id)
             .single();
-        const { data: empProvider } = await supabase
+        const { data: empProvider } = await adminSupabase
             .from('service_providers')
-            .select('phone')
+            .select('phone, user_id')
             .eq('user_id', request.employee_id)
             .order('created_at', { ascending: false })
             .limit(1)
             .maybeSingle();
-        const employeePhone = emp?.phone || empProvider?.phone;
-        const { notificationService } = require('../services/notificationService');
+        // Fallback for legacy rows where provider.user_id was never linked.
+        let fallbackProviderPhone: string | null = null;
+        if (!empProvider?.phone && emp?.phone) {
+            const profilePhone = String(emp.phone).replace(/[^\d+]/g, '');
+            if (profilePhone) {
+                const { data: providerPool } = await adminSupabase
+                    .from('service_providers')
+                    .select('phone')
+                    .eq('business_id', request.business_id)
+                    .order('created_at', { ascending: false })
+                    .limit(50);
+                const strip = (v: string) => v.replace(/[^\d]/g, '');
+                const mine = strip(profilePhone);
+                const matched = (providerPool || []).find((p: any) => {
+                    const cand = strip(String(p?.phone || ''));
+                    return !!cand && (cand === mine || cand.endsWith(mine) || mine.endsWith(cand));
+                });
+                fallbackProviderPhone = matched?.phone || null;
+            }
+        }
+
+        const employeePhone = emp?.phone || empProvider?.phone || fallbackProviderPhone;
+        const { notificationService, toE164Phone } = require('../services/notificationService');
 
         let notificationSent = false;
 
@@ -1710,27 +1732,33 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
             }
 
             if (employeePhone) {
+                const to = toE164Phone(String(employeePhone));
                 const approvedMsg = shouldDeactivateNow
                     ? `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. Your access to the system has been revoked.`
                     : `Hi ${emp.full_name || 'Employee'}, your resignation request has been approved. You can continue working until ${requestedLastDate}. Access will be disabled after your last working date.`;
-                const [waRes, smsRes] = await Promise.allSettled([
-                    notificationService.sendWhatsApp(employeePhone, approvedMsg),
-                    notificationService.sendSMS(employeePhone, approvedMsg)
-                ]);
-                const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
-                const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
-                notificationSent = !!(waOk || smsOk);
+                if (to) {
+                    const [waRes, smsRes] = await Promise.allSettled([
+                        notificationService.sendWhatsApp(to, approvedMsg),
+                        notificationService.sendSMS(to, approvedMsg)
+                    ]);
+                    const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
+                    const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
+                    notificationSent = !!(waOk || smsOk);
+                }
             }
         } else if (status === 'REJECTED') {
             if (employeePhone) {
+                const to = toE164Phone(String(employeePhone));
                 const rejectedMsg = `Hi ${emp.full_name || 'Employee'}, your resignation request has been rejected by the business owner. Please contact the owner for details.`;
-                const [waRes, smsRes] = await Promise.allSettled([
-                    notificationService.sendWhatsApp(employeePhone, rejectedMsg),
-                    notificationService.sendSMS(employeePhone, rejectedMsg)
-                ]);
-                const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
-                const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
-                notificationSent = !!(waOk || smsOk);
+                if (to) {
+                    const [waRes, smsRes] = await Promise.allSettled([
+                        notificationService.sendWhatsApp(to, rejectedMsg),
+                        notificationService.sendSMS(to, rejectedMsg)
+                    ]);
+                    const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
+                    const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
+                    notificationSent = !!(waOk || smsOk);
+                }
             }
         }
 
