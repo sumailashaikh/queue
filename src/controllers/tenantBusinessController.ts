@@ -581,7 +581,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 return {
                     id: a.id,
                     type: 'appointment',
-                    display_token: 'BOOKED',
+                    display_token: `A-${String(a.id).slice(0, 4).toUpperCase()}`,
                     customer_name: customerName,
                     status: a.status === 'confirmed' ? 'waiting' : 'completed',
                     time: a.start_time,
@@ -593,12 +593,13 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
 
         // Sort by time (joined_at for queue, start_time for appointments)
         unified.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+        const tvEntries = unified.filter((x) => x.status === 'waiting' || x.status === 'serving');
 
         res.status(200).json({
             status: 'success',
             data: {
                 business,
-                entries: unified
+                entries: tvEntries
             }
         });
 
@@ -622,6 +623,10 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
 
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: business.timezone || 'UTC' });
 
+        const now = new Date();
+        const nowIso = now.toISOString();
+        const todayIso = todayStr;
+
         const { data: providers, error: pErr } = await supabase
             .from('service_providers')
             .select(`
@@ -639,11 +644,16 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
         const providerIds = (providers || []).map((p: any) => p.id);
         const { data: queueLoadRows } = providerIds.length
             ? await supabase
-                .from('queue_entries')
-                .select('assigned_provider_id, total_duration_minutes, status, served_at, joined_at')
+                .from('queue_entry_services')
+                .select(`
+                    assigned_provider_id,
+                    task_status,
+                    estimated_end_at,
+                    duration_minutes,
+                    queue_entries!queue_entry_id(entry_date, status, joined_at)
+                `)
                 .in('assigned_provider_id', providerIds)
-                .eq('entry_date', todayStr)
-                .in('status', ['waiting', 'serving'])
+                .in('task_status', ['pending', 'in_progress'])
             : { data: [] as any[] };
 
         const { data: apptLoadRows } = providerIds.length
@@ -658,23 +668,35 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
                 .lte('appointments.start_time', `${todayStr}T23:59:59`)
             : { data: [] as any[] };
 
+        const { data: leaveRows } = providerIds.length
+            ? await supabase
+                .from('provider_leaves')
+                .select('provider_id, start_date, end_date, leave_kind, start_time, end_time, status')
+                .in('provider_id', providerIds)
+                .lte('start_date', todayIso)
+                .gte('end_date', todayIso)
+            : { data: [] as any[] };
+
         const queueAhead = new Map<string, number>();
         const queueEta = new Map<string, number>();
+        const queueInProgress = new Map<string, boolean>();
         (queueLoadRows || []).forEach((r: any) => {
             const pid = String(r.assigned_provider_id || '');
             if (!pid) return;
+            const entry = Array.isArray(r.queue_entries) ? r.queue_entries[0] : r.queue_entries;
+            if (!entry || entry.entry_date !== todayStr || !['waiting', 'serving'].includes(String(entry.status || ''))) return;
             queueAhead.set(pid, (queueAhead.get(pid) || 0) + 1);
-            const planned = Number(r.total_duration_minutes || 10);
-            if (String(r.status) === 'serving') {
-                const startedAt = r.served_at || r.joined_at;
-                const elapsed = startedAt ? Math.max(0, Math.round((Date.now() - new Date(startedAt).getTime()) / 60000)) : 0;
-                queueEta.set(pid, (queueEta.get(pid) || 0) + Math.max(0, planned - elapsed));
-            } else {
-                queueEta.set(pid, (queueEta.get(pid) || 0) + planned);
-            }
+            const status = String(r.task_status || '').toLowerCase();
+            if (status === 'in_progress') queueInProgress.set(pid, true);
+            const fromEta = r.estimated_end_at ? Math.max(0, Math.round((new Date(r.estimated_end_at).getTime() - now.getTime()) / 60000)) : 0;
+            const fallback = Number(r.duration_minutes || 10);
+            const add = Math.max(fromEta, fallback);
+            queueEta.set(pid, (queueEta.get(pid) || 0) + add);
         });
 
         const apptActive = new Map<string, number>();
+        const apptBusyNow = new Map<string, boolean>();
+        const apptNextEta = new Map<string, number>();
         (apptLoadRows || []).forEach((r: any) => {
             const pid = String(r.assigned_provider_id || '');
             const a = r.appointments;
@@ -682,18 +704,75 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             const st = String(a.status || '').toLowerCase();
             if (['cancelled', 'completed', 'no_show'].includes(st)) return;
             apptActive.set(pid, (apptActive.get(pid) || 0) + 1);
+            const startMs = new Date(a.start_time).getTime();
+            const endMs = new Date(a.end_time).getTime();
+            const nowMs = now.getTime();
+            if (startMs <= nowMs && nowMs < endMs) {
+                apptBusyNow.set(pid, true);
+                apptNextEta.set(pid, Math.max(0, Math.round((endMs - nowMs) / 60000)));
+            } else if (startMs > nowMs) {
+                const minsUntil = Math.max(0, Math.round((startMs - nowMs) / 60000));
+                const current = apptNextEta.get(pid);
+                if (current === undefined || minsUntil < current) apptNextEta.set(pid, minsUntil);
+            }
+        });
+
+        const leaveBusy = new Map<string, { on_leave: boolean; remaining: number }>();
+        (leaveRows || []).forEach((l: any) => {
+            const pid = String(l.provider_id || '');
+            if (!pid) return;
+            const status = String(l.status || 'PENDING').toUpperCase();
+            if (status === 'REJECTED') return;
+            const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
+            let onLeaveNow = false;
+            let remaining = 0;
+            if (kind === 'FULL_DAY') {
+                onLeaveNow = true;
+                remaining = 24 * 60;
+            } else {
+                const toMins = (t: string) => {
+                    const [hh, mm] = String(t || '00:00').split(':').map(Number);
+                    return (hh || 0) * 60 + (mm || 0);
+                };
+                const nowLocal = now.toLocaleTimeString('en-GB', {
+                    timeZone: business.timezone || 'UTC',
+                    hour12: false,
+                    hour: '2-digit',
+                    minute: '2-digit'
+                });
+                const nowM = toMins(nowLocal);
+                const startM = toMins(l.start_time || '00:00');
+                const endM = toMins(l.end_time || '23:59');
+                onLeaveNow = nowM >= startM && nowM < endM;
+                remaining = Math.max(0, endM - nowM);
+            }
+            if (onLeaveNow) leaveBusy.set(pid, { on_leave: true, remaining });
         });
 
         const data = (providers || []).map((p: any) => ({
+            ...(() => {
+                const leave = leaveBusy.get(p.id);
+                const qEta = queueEta.get(p.id) || 0;
+                const qBusy = !!queueInProgress.get(p.id) || (queueAhead.get(p.id) || 0) > 0;
+                const apBusy = !!apptBusyNow.get(p.id);
+                const blocked = !!leave || qBusy || apBusy;
+                const nextAvailable = Math.max(leave?.remaining || 0, qEta, apptNextEta.get(p.id) || 0);
+                const busySource = leave ? 'on_leave' : qBusy ? 'queue' : apBusy ? 'appointment' : 'free';
+                return {
+                    is_on_leave: !!leave,
+                    busy_source: busySource,
+                    next_available_in_minutes: blocked ? nextAvailable : 0
+                };
+            })(),
             id: p.id,
             name: p.name,
             role: p.role,
             department: p.department,
             service_ids: (p.provider_services || []).map((ps: any) => ps.service_id).filter(Boolean),
             queue_ahead: Math.max(0, (queueAhead.get(p.id) || 0) - 1),
-            estimated_wait_minutes: queueEta.get(p.id) || 0,
+            estimated_wait_minutes: Math.max(queueEta.get(p.id) || 0, apptNextEta.get(p.id) || 0),
             active_appointments: apptActive.get(p.id) || 0,
-            is_available_now: (queueAhead.get(p.id) || 0) === 0
+            is_available_now: !leaveBusy.get(p.id) && (queueAhead.get(p.id) || 0) === 0 && !apptBusyNow.get(p.id)
         }));
 
         res.status(200).json({ status: 'success', data });
@@ -754,6 +833,50 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
                 end: new Date(a.end_time).getTime()
             }));
 
+        const { data: queueBusyRows } = await supabase
+            .from('queue_entry_services')
+            .select(`
+                task_status,
+                estimated_end_at,
+                duration_minutes,
+                queue_entries!queue_entry_id (entry_date, status, joined_at)
+            `)
+            .eq('assigned_provider_id', providerId)
+            .in('task_status', ['pending', 'in_progress']);
+
+        (queueBusyRows || []).forEach((r: any) => {
+            const entry = Array.isArray(r.queue_entries) ? r.queue_entries[0] : r.queue_entries;
+            if (!entry || entry.entry_date !== String(date).slice(0, 10) || !['waiting', 'serving'].includes(String(entry.status || ''))) return;
+            const st = new Date(entry.joined_at || dayStart).getTime();
+            const end = r.estimated_end_at
+                ? new Date(r.estimated_end_at).getTime()
+                : st + Number(r.duration_minutes || 10) * 60000;
+            busy.push({ start: st, end });
+        });
+
+        const { data: dayLeaves } = await supabase
+            .from('provider_leaves')
+            .select('start_date, end_date, leave_kind, start_time, end_time, status')
+            .eq('provider_id', providerId)
+            .lte('start_date', String(date).slice(0, 10))
+            .gte('end_date', String(date).slice(0, 10));
+
+        const leaveBlocks: Array<{ startM: number; endM: number }> = [];
+        (dayLeaves || []).forEach((l: any) => {
+            const status = String(l.status || 'PENDING').toUpperCase();
+            if (status === 'REJECTED') return;
+            const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
+            if (kind === 'FULL_DAY') {
+                leaveBlocks.push({ startM: 0, endM: 24 * 60 });
+                return;
+            }
+            const parse = (t: string) => {
+                const [hh, mm] = String(t || '00:00').split(':').map(Number);
+                return (hh || 0) * 60 + (mm || 0);
+            };
+            leaveBlocks.push({ startM: parse(l.start_time || '00:00'), endM: parse(l.end_time || '23:59') });
+        });
+
         const nowLocal = new Date().toLocaleTimeString('en-GB', {
             timeZone: business.timezone || 'UTC',
             hour12: false,
@@ -772,6 +895,8 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
 
         const slots: string[] = [];
         for (let m = startM; m + duration <= bufferClose; m += 15) {
+            const insideLeave = leaveBlocks.some((b) => m < b.endM && b.startM < (m + duration));
+            if (insideLeave) continue;
             const h = Math.floor(m / 60);
             const mm = m % 60;
             const slot = `${String(targetDate)}T${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00`;
