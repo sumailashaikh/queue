@@ -1297,6 +1297,39 @@ export const validateProviderLeaveImpact = async (req: Request, res: Response) =
         };
         const affected = appts.filter((r: any) => timeOverlaps(r.appointment));
 
+        // Also include live queue tasks assigned to this provider (especially useful for same-day emergency leaves).
+        let queueTasks = (await adminSupabase
+            .from('queue_entries')
+            .select(`
+                id,
+                customer_name,
+                status,
+                joined_at,
+                entry_date,
+                queue_entry_services:queue_entry_services!entry_id (
+                    service_id,
+                    services:service_id (id, name)
+                )
+            `)
+            .eq('assigned_provider_id', provider.id)
+            .gte('entry_date', String(start_date).slice(0, 10))
+            .lte('entry_date', String(end_date).slice(0, 10))
+            .in('status', ['waiting', 'serving'])).data || [];
+
+        if (isEmergency || isHalfDay) {
+            const day = String(start_date).slice(0, 10);
+            const s = String(start_time || '').slice(0, 5);
+            const e = String(end_time || '').slice(0, 5);
+            queueTasks = queueTasks.filter((q: any) => {
+                const qDay = String(q.entry_date || '').slice(0, 10);
+                if (qDay !== day) return false;
+                if (!s || !e) return true;
+                const qAt = String(q.joined_at || '').slice(11, 16);
+                if (!qAt) return true;
+                return qAt >= s && qAt <= e;
+            });
+        }
+
         const customerIds = Array.from(
             new Set<string>(affected.map((r: any) => r.appointment?.user_id).filter(Boolean).map((v: any) => String(v)))
         );
@@ -1332,6 +1365,7 @@ export const validateProviderLeaveImpact = async (req: Request, res: Response) =
             status: 'success',
             data: {
                 total_appointments: affected.length,
+                total_queue_tasks: queueTasks.length,
                 regular_customers: regularCount,
                 vip_customers: vipCount,
                 appointments: affected.map((a: any) => ({
@@ -1342,9 +1376,17 @@ export const validateProviderLeaveImpact = async (req: Request, res: Response) =
                     customer: a.appointment.profiles,
                     service: a.service
                 })),
+                queue_tasks: queueTasks.map((q: any) => ({
+                    id: q.id,
+                    customer_name: q.customer_name,
+                    status: q.status,
+                    joined_at: q.joined_at,
+                    entry_date: q.entry_date,
+                    service: q.queue_entry_services?.[0]?.services || null
+                })),
                 policy: {
                     vip_requires_owner_approval: vipCount > 0,
-                    emergency_requires_handling: (isEmergency || isHalfDay) && affected.length > 0
+                    emergency_requires_handling: (isEmergency || isHalfDay) && (affected.length > 0 || queueTasks.length > 0)
                 }
             }
         });
