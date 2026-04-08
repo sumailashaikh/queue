@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { joinQueue, getQueueStatus } from '../controllers/queueController';
 import { bookPublicAppointment } from '../controllers/appointmentController';
-import { getBusinessDisplayData } from '../controllers/tenantBusinessController';
+import { getBusinessDisplayData, getPublicProvidersBySlug, getPublicProviderSlots } from '../controllers/tenantBusinessController';
 import { getPublicPlatformStats } from '../controllers/publicController';
 import { basicRateLimiter } from '../middleware/rateLimiter';
 
@@ -15,6 +15,8 @@ router.get('/platform-stats', getPublicPlatformStats);
 
 // Business Public Endpoints
 router.get('/business/:slug/display-data', getBusinessDisplayData);
+router.get('/business/:slug/providers', getPublicProvidersBySlug);
+router.get('/business/:slug/providers/:providerId/slots', getPublicProviderSlots);
 
 // Queue Public Endpoints
 router.post('/queue/join', joinQueue);

@@ -624,7 +624,7 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
 
 export const bookPublicAppointment = async (req: Request, res: Response) => {
     try {
-        const { business_id, service_ids, start_time, end_time, customer_name, phone } = req.body;
+        const { business_id, service_ids, start_time, end_time, customer_name, phone, provider_id } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         if (!business_id || !start_time || !customer_name || !phone) {
@@ -720,7 +720,8 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
                     appointment_id: data.id,
                     service_id: s.id,
                     price: s.price || 0,
-                    duration_minutes: s.duration_minutes || 0
+                    duration_minutes: s.duration_minutes || 0,
+                    assigned_provider_id: provider_id || null
                 }));
                 await supabase.from('appointment_services').insert(junctionEntries);
             }

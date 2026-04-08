@@ -263,7 +263,7 @@ import fs from 'fs';
 
 export const joinQueue = async (req: Request, res: Response) => {
     try {
-        const { queue_id, customer_name, phone, service_ids, entry_source, appointment_id } = req.body;
+        const { queue_id, customer_name, phone, service_ids, entry_source, appointment_id, provider_id } = req.body;
         const user_id = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
@@ -436,7 +436,8 @@ export const joinQueue = async (req: Request, res: Response) => {
                     entry_date: todayStr,
                     total_price,
                     total_duration_minutes: serviceDuration,
-                    entry_source: entry_source || 'online'
+                    entry_source: entry_source || 'online',
+                    assigned_provider_id: provider_id || null
                 }
             ])
             .select()
@@ -450,7 +451,8 @@ export const joinQueue = async (req: Request, res: Response) => {
                 queue_entry_id: data.id,
                 service_id: service.id,
                 price: service.price || 0,
-                duration_minutes: service.duration_minutes || 0
+                duration_minutes: service.duration_minutes || 0,
+                assigned_provider_id: provider_id || null
             }));
             await supabase.from('queue_entry_services').insert(junctionEntries);
         } else {

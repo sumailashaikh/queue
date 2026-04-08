@@ -607,6 +607,186 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
         res.status(500).json({ status: 'error', message: error.message });
     }
 };
+
+export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
+    try {
+        const { slug } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id, timezone')
+            .eq('slug', slug)
+            .maybeSingle();
+        if (!business) return res.status(404).json({ status: 'error', message: 'Business not found' });
+
+        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: business.timezone || 'UTC' });
+
+        const { data: providers, error: pErr } = await supabase
+            .from('service_providers')
+            .select(`
+                id,
+                name,
+                role,
+                department,
+                is_active,
+                provider_services(service_id)
+            `)
+            .eq('business_id', business.id)
+            .eq('is_active', true);
+        if (pErr) throw pErr;
+
+        const providerIds = (providers || []).map((p: any) => p.id);
+        const { data: queueLoadRows } = providerIds.length
+            ? await supabase
+                .from('queue_entries')
+                .select('assigned_provider_id, total_duration_minutes, status, served_at, joined_at')
+                .in('assigned_provider_id', providerIds)
+                .eq('entry_date', todayStr)
+                .in('status', ['waiting', 'serving'])
+            : { data: [] as any[] };
+
+        const { data: apptLoadRows } = providerIds.length
+            ? await supabase
+                .from('appointment_services')
+                .select(`
+                    assigned_provider_id,
+                    appointments:appointment_id (start_time, end_time, status)
+                `)
+                .in('assigned_provider_id', providerIds)
+                .gte('appointments.start_time', `${todayStr}T00:00:00`)
+                .lte('appointments.start_time', `${todayStr}T23:59:59`)
+            : { data: [] as any[] };
+
+        const queueAhead = new Map<string, number>();
+        const queueEta = new Map<string, number>();
+        (queueLoadRows || []).forEach((r: any) => {
+            const pid = String(r.assigned_provider_id || '');
+            if (!pid) return;
+            queueAhead.set(pid, (queueAhead.get(pid) || 0) + 1);
+            const planned = Number(r.total_duration_minutes || 10);
+            if (String(r.status) === 'serving') {
+                const startedAt = r.served_at || r.joined_at;
+                const elapsed = startedAt ? Math.max(0, Math.round((Date.now() - new Date(startedAt).getTime()) / 60000)) : 0;
+                queueEta.set(pid, (queueEta.get(pid) || 0) + Math.max(0, planned - elapsed));
+            } else {
+                queueEta.set(pid, (queueEta.get(pid) || 0) + planned);
+            }
+        });
+
+        const apptActive = new Map<string, number>();
+        (apptLoadRows || []).forEach((r: any) => {
+            const pid = String(r.assigned_provider_id || '');
+            const a = r.appointments;
+            if (!pid || !a) return;
+            const st = String(a.status || '').toLowerCase();
+            if (['cancelled', 'completed', 'no_show'].includes(st)) return;
+            apptActive.set(pid, (apptActive.get(pid) || 0) + 1);
+        });
+
+        const data = (providers || []).map((p: any) => ({
+            id: p.id,
+            name: p.name,
+            role: p.role,
+            department: p.department,
+            service_ids: (p.provider_services || []).map((ps: any) => ps.service_id).filter(Boolean),
+            queue_ahead: Math.max(0, (queueAhead.get(p.id) || 0) - 1),
+            estimated_wait_minutes: queueEta.get(p.id) || 0,
+            active_appointments: apptActive.get(p.id) || 0,
+            is_available_now: (queueAhead.get(p.id) || 0) === 0
+        }));
+
+        res.status(200).json({ status: 'success', data });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const getPublicProviderSlots = async (req: Request, res: Response) => {
+    try {
+        const { slug, providerId } = req.params as any;
+        const { date, duration_minutes } = req.query as any;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!date) return res.status(400).json({ status: 'error', message: 'date is required' });
+        const duration = Math.max(5, Number(duration_minutes || 30));
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id, timezone, open_time, close_time')
+            .eq('slug', slug)
+            .maybeSingle();
+        if (!business) return res.status(404).json({ status: 'error', message: 'Business not found' });
+
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id')
+            .eq('id', providerId)
+            .eq('business_id', business.id)
+            .eq('is_active', true)
+            .maybeSingle();
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        const parseMins = (t: string) => {
+            const [hh, mm] = String(t || '00:00').split(':').map(Number);
+            return (hh || 0) * 60 + (mm || 0);
+        };
+        const openM = parseMins(String(business.open_time || '09:00').slice(0, 5));
+        const closeM = parseMins(String(business.close_time || '21:00').slice(0, 5));
+        const bufferClose = closeM - 10;
+
+        const dayStart = `${String(date).slice(0, 10)}T00:00:00`;
+        const dayEnd = `${String(date).slice(0, 10)}T23:59:59`;
+
+        const { data: busyRows } = await supabase
+            .from('appointment_services')
+            .select(`appointments:appointment_id (start_time, end_time, status)`)
+            .eq('assigned_provider_id', providerId)
+            .gte('appointments.start_time', dayStart)
+            .lte('appointments.start_time', dayEnd);
+
+        const busy = (busyRows || [])
+            .map((r: any) => r.appointments)
+            .filter((a: any) => !!a)
+            .filter((a: any) => !['cancelled', 'completed', 'no_show'].includes(String(a.status || '').toLowerCase()))
+            .map((a: any) => ({
+                start: new Date(a.start_time).getTime(),
+                end: new Date(a.end_time).getTime()
+            }));
+
+        const nowLocal = new Date().toLocaleTimeString('en-GB', {
+            timeZone: business.timezone || 'UTC',
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+        const nowM = parseMins(nowLocal);
+        const targetDate = String(date).slice(0, 10);
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: business.timezone || 'UTC' });
+
+        let startM = openM;
+        if (targetDate === today) {
+            startM = Math.max(openM, nowM + 15);
+            startM = Math.ceil(startM / 15) * 15;
+        }
+
+        const slots: string[] = [];
+        for (let m = startM; m + duration <= bufferClose; m += 15) {
+            const h = Math.floor(m / 60);
+            const mm = m % 60;
+            const slot = `${String(targetDate)}T${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}:00`;
+            const end = new Date(new Date(slot).getTime() + duration * 60000).getTime();
+            const st = new Date(slot).getTime();
+            const conflict = busy.some((b: any) => st < b.end && b.start < end);
+            if (!conflict) slots.push(`${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}`);
+        }
+
+        res.status(200).json({ status: 'success', data: { date: targetDate, slots } });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const getBusinessServices = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
