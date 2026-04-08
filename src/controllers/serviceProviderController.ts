@@ -1297,8 +1297,8 @@ export const validateProviderLeaveImpact = async (req: Request, res: Response) =
         };
         const affected = appts.filter((r: any) => timeOverlaps(r.appointment));
 
-        // Also include live queue tasks assigned to this provider (especially useful for same-day emergency leaves).
-        let queueTasks = (await adminSupabase
+        // Also include live queue tasks assigned to this provider (entry-level and per-service assignment).
+        const queueTasksByEntry = (await adminSupabase
             .from('queue_entries')
             .select(`
                 id,
@@ -1315,6 +1315,31 @@ export const validateProviderLeaveImpact = async (req: Request, res: Response) =
             .gte('entry_date', String(start_date).slice(0, 10))
             .lte('entry_date', String(end_date).slice(0, 10))
             .in('status', ['waiting', 'serving'])).data || [];
+
+        const queueTasksByService = (await adminSupabase
+            .from('queue_entries')
+            .select(`
+                id,
+                customer_name,
+                status,
+                joined_at,
+                entry_date,
+                queue_entry_services!inner (
+                    assigned_provider_id,
+                    service_id,
+                    services:service_id (id, name)
+                )
+            `)
+            .eq('queue_entry_services.assigned_provider_id', provider.id)
+            .gte('entry_date', String(start_date).slice(0, 10))
+            .lte('entry_date', String(end_date).slice(0, 10))
+            .in('status', ['waiting', 'serving'])).data || [];
+
+        const queueTaskMap = new Map<string, any>();
+        [...queueTasksByEntry, ...queueTasksByService].forEach((q: any) => {
+            if (q?.id) queueTaskMap.set(String(q.id), q);
+        });
+        let queueTasks = Array.from(queueTaskMap.values());
 
         if (isEmergency || isHalfDay) {
             const day = String(start_date).slice(0, 10);
