@@ -1407,7 +1407,7 @@ export const nextEntry = async (req: Request, res: Response) => {
             .from('queue_entries')
             .select(`
                 *,
-                queue_entry_services (service_id)
+                queue_entry_services (service_id, assigned_provider_id)
             `)
             .eq('queue_id', queue_id)
             .eq('status', 'waiting')
@@ -1420,7 +1420,20 @@ export const nextEntry = async (req: Request, res: Response) => {
             return res.status(200).json({ status: 'success', message: 'No more customers in queue.' });
         }
 
-        // 2. Find an available provider for this customer
+        // 2. Respect explicit assignment first.
+        // If no expert is assigned for this entry, require manual assignment.
+        const taskAssignments = ((next as any).queue_entry_services || [])
+            .map((s: any) => s?.assigned_provider_id)
+            .filter(Boolean);
+        const explicitProviderId = taskAssignments.length > 0 ? String(taskAssignments[0]) : null;
+        if (!explicitProviderId) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Please assign an expert to the next customer before starting service.'
+            });
+        }
+
+        // 3. Check whether assigned provider is already busy serving someone else.
         const { data: busyProviders } = await supabase
             .from('queue_entries')
             .select('assigned_provider_id')
@@ -1429,13 +1442,39 @@ export const nextEntry = async (req: Request, res: Response) => {
             .not('assigned_provider_id', 'is', null);
 
         const busyProviderIds = busyProviders?.map((p: any) => p.assigned_provider_id) || [];
-        const requiredServiceIds = (next as any).queue_entry_services?.map((s: any) => s.service_id) || [];
+        const requiredServiceIds = (next as any).queue_entry_services?.map((s: any) => s.service_id).filter(Boolean) || [];
+        if (busyProviderIds.includes(explicitProviderId)) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Assigned expert is currently serving another customer.'
+            });
+        }
 
+        // 4. Validate assigned provider and capability.
         const { data: providers } = await supabase
             .from('service_providers')
             .select(`id, name, provider_services (service_id)`)
             .eq('business_id', (req as any).business_id || next.business_id || '') // Fallback to next.business_id if not in req
             .eq('is_active', true);
+
+        const assignedProvider = providers?.find((p: any) => String(p.id) === explicitProviderId);
+        if (!assignedProvider) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Assigned expert is unavailable. Please choose another expert.'
+            });
+        }
+
+        const supportsAll = (() => {
+            const pServiceIds = assignedProvider.provider_services?.map((ps: any) => ps.service_id) || [];
+            return requiredServiceIds.every((rid: string) => pServiceIds.includes(rid));
+        })();
+        if (!supportsAll) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Assigned expert cannot perform all selected services. Please reassign.'
+            });
+        }
 
         const availableProvider = providers?.find((p: any) => {
             const pServiceIds = p.provider_services?.map((ps: any) => ps.service_id) || [];
@@ -1443,15 +1482,11 @@ export const nextEntry = async (req: Request, res: Response) => {
             const isNotBusy = !busyProviderIds.includes(p.id);
             return supportsAll && isNotBusy;
         });
+        // We intentionally do not auto-switch providers when one is explicitly assigned.
+        // keep `availableProvider` compatibility for downstream name interpolation only
+        const providerToUse: any = assignedProvider || availableProvider;
 
-        if (!availableProvider) {
-            return res.status(400).json({
-                status: 'error',
-                message: "No available expert found for the next customer. Please serve manually when someone is free."
-            });
-        }
-
-        // 3. Start serving
+        // 5. Start serving with assigned provider
         const now = new Date();
         const duration = Number(next.total_duration_minutes || 0);
         const estEnd = new Date(now.getTime() + duration * 60000);
@@ -1463,13 +1498,13 @@ export const nextEntry = async (req: Request, res: Response) => {
                 served_at: now.toISOString(),
                 service_started_at: now.toISOString(),
                 estimated_end_at: estEnd.toISOString(),
-                assigned_provider_id: availableProvider.id
+                assigned_provider_id: providerToUse.id
             })
             .eq('id', next.id);
 
         res.status(200).json({
             status: 'success',
-            message: `Next customer ${next.ticket_number} is now being served by ${availableProvider.name}.`
+            message: `Next customer ${next.ticket_number} is now being served by ${providerToUse.name}.`
         });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
