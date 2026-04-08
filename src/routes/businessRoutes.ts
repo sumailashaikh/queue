@@ -1,5 +1,14 @@
 import { Router } from 'express';
-import { createBusiness, getMyBusinesses, updateBusiness, deleteBusiness, getBusinessBySlug, getBusinessServices } from '../controllers/tenantBusinessController';
+import {
+  createBusiness,
+  getMyBusinesses,
+  updateBusiness,
+  deleteBusiness,
+  getBusinessBySlug,
+  getBusinessServices,
+  setCustomerVipFlag,
+  listVipCustomers,
+} from '../controllers/tenantBusinessController';
 import { inviteEmployee, deactivateEmployee } from '../controllers/adminController';
 import { requireAuth } from '../middleware/authMiddleware';
 
@@ -13,5 +22,7 @@ router.get('/slug/:slug', getBusinessBySlug);
 router.get('/:id/services', getBusinessServices);
 router.post('/invite-employee', requireAuth, inviteEmployee);
 router.post('/deactivate-employee/:employee_id', requireAuth, deactivateEmployee);
+router.get('/:id/customers/vip', requireAuth, listVipCustomers);
+router.put('/:id/customers/:customerId/vip', requireAuth, setCustomerVipFlag);
 
 export default router;

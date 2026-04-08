@@ -828,7 +828,7 @@ export const getProviderLeaves = async (req: Request, res: Response) => {
 export const addProviderLeave = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // provider_id or user_id
-        const { start_date, end_date, leave_type, note, ui_language } = req.body;
+        const { start_date, end_date, leave_type, leave_kind, start_time, end_time, note, ui_language, allow_owner_approval } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
         const { adminSupabase } = require('../config/supabaseClient');
@@ -839,6 +839,16 @@ export const addProviderLeave = async (req: Request, res: Response) => {
 
         if (!start_date || !end_date || !leave_type) {
             return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+        }
+
+        const normalizedKind = String(leave_kind || 'FULL_DAY').toUpperCase();
+        const isEmergency = normalizedKind === 'EMERGENCY';
+        const isHalfDay = normalizedKind === 'HALF_DAY';
+        if ((isEmergency || isHalfDay) && (!start_time || !end_time)) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'providers.err_leave_time_required'
+            });
         }
 
         const todayStr = new Date().toISOString().split('T')[0];
@@ -950,16 +960,151 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             });
         }
 
-        // 4. Insert leave
+        // 4. Smart validation (appointments + VIP/Regular customers)
+        // We only enforce when this leave impacts assigned appointments.
+        let vipCount = 0;
+        let regularCount = 0;
+        let totalAffected = 0;
+        let requiresOwnerApproval = false;
+        const impactAppointments: any[] = [];
+        try {
+            // Find appointment_services assigned to this provider within date range.
+            const fromIso = new Date(`${String(start_date).slice(0, 10)}T00:00:00.000Z`).toISOString();
+            const toIso = new Date(`${String(end_date).slice(0, 10)}T23:59:59.999Z`).toISOString();
+
+            const { data: apptSvc } = await adminSupabase
+                .from('appointment_services')
+                .select(`
+                    id,
+                    appointment_id,
+                    assigned_provider_id,
+                    appointments:appointment_id (
+                        id,
+                        business_id,
+                        user_id,
+                        start_time,
+                        end_time,
+                        status,
+                        profiles:user_id (id, full_name, phone)
+                    )
+                `)
+                .eq('assigned_provider_id', provider.id)
+                .gte('appointments.start_time', fromIso)
+                .lte('appointments.start_time', toIso);
+
+            const appts = (apptSvc || [])
+                .map((r: any) => r.appointments)
+                .filter(Boolean)
+                .filter((a: any) => !['cancelled', 'completed', 'no_show'].includes(String(a.status || '').toLowerCase()));
+
+            // Emergency leave: only count overlapping time-window appointments on the same day.
+            const timeOverlaps = (a: any) => {
+                if (!isEmergency && !isHalfDay) return true;
+                const day = String(start_date).slice(0, 10);
+                const apptDay = String(a.start_time || '').slice(0, 10);
+                if (apptDay !== day) return true;
+                const s = String(start_time || '').slice(0, 5);
+                const e = String(end_time || '').slice(0, 5);
+                const apptStart = String(a.start_time || '').slice(11, 16);
+                const apptEnd = String(a.end_time || '').slice(11, 16);
+                if (!s || !e || !apptStart || !apptEnd) return true;
+                return !(apptEnd <= s || apptStart >= e);
+            };
+
+            const affected = appts.filter(timeOverlaps);
+            totalAffected = affected.length;
+            affected.forEach((a: any) => impactAppointments.push({
+                id: a.id,
+                start_time: a.start_time,
+                end_time: a.end_time,
+                status: a.status,
+                customer: a.profiles
+            }));
+
+            // VIP customers in these appointments
+            const customerIds = Array.from(
+                new Set<string>(affected.map((a: any) => a.user_id).filter(Boolean).map((v: any) => String(v)))
+            );
+            if (customerIds.length > 0) {
+                const { data: vipRows } = await adminSupabase
+                    .from('business_customer_flags')
+                    .select('customer_id')
+                    .eq('business_id', provider.business_id)
+                    .eq('is_vip', true)
+                    .in('customer_id', customerIds);
+                const vipSet = new Set<string>((vipRows || []).map((r: any) => String(r.customer_id)));
+                vipCount = customerIds.filter((cid) => vipSet.has(cid)).length;
+
+                // Regular customers heuristic: 3+ past completed appointments with same provider
+                const regularThreshold = 3;
+                const { data: past } = await adminSupabase
+                    .from('appointment_services')
+                    .select(`
+                        appointments:appointment_id (user_id, status)
+                    `)
+                    .eq('assigned_provider_id', provider.id);
+                const counts = new Map<string, number>();
+                (past || []).forEach((row: any) => {
+                    const a = row.appointments;
+                    if (!a?.user_id) return;
+                    const st = String(a.status || '').toLowerCase();
+                    if (st !== 'completed') return;
+                    counts.set(a.user_id, (counts.get(a.user_id) || 0) + 1);
+                });
+                regularCount = customerIds.filter((cid) => (counts.get(cid) || 0) >= regularThreshold).length;
+            }
+
+            // STRICT RULE: VIP => block OR require owner approval. We enforce "require owner approval".
+            if (vipCount > 0 && !isAdminOrOwner) {
+                requiresOwnerApproval = true;
+                if (!allow_owner_approval) {
+                    return res.status(409).json({
+                        status: 'error',
+                        message: 'providers.err_vip_leave_requires_owner',
+                        impact: {
+                            total_appointments: totalAffected,
+                            regular_customers: regularCount,
+                            vip_customers: vipCount,
+                            appointments: impactAppointments
+                        }
+                    });
+                }
+            }
+
+            // Emergency leave requires handling first: force reassignment/reschedule by blocking when affected appts exist
+            if ((isEmergency || isHalfDay) && totalAffected > 0 && !isAdminOrOwner) {
+                return res.status(409).json({
+                    status: 'error',
+                    message: 'providers.err_emergency_leave_requires_handling',
+                    impact: {
+                        total_appointments: totalAffected,
+                        regular_customers: regularCount,
+                        vip_customers: vipCount,
+                        appointments: impactAppointments
+                    }
+                });
+            }
+        } catch {
+            // If schema isn't present yet, skip smart enforcement (do not block leave creation).
+        }
+
+        // 5. Insert leave
         const payload: any = {
             provider_id: provider.id,
             business_id: provider.business_id,
             start_date,
             end_date,
             leave_type,
+            leave_kind: normalizedKind,
+            start_time: start_time ? String(start_time).slice(0, 5) : null,
+            end_time: end_time ? String(end_time).slice(0, 5) : null,
             note,
             status,
-            approved_by: isAdminOrOwner ? userId : null
+            approved_by: isAdminOrOwner ? userId : null,
+            requires_owner_approval: requiresOwnerApproval,
+            smart_impact: (vipCount || regularCount || totalAffected)
+                ? { total_appointments: totalAffected, regular_customers: regularCount, vip_customers: vipCount }
+                : null
         };
         let data: any = null;
         let error: any = null;
@@ -1061,6 +1206,497 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             owner_phone_configured: isAdminOrOwner ? undefined : !!ownerNotifyTarget
         });
 
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const validateProviderLeaveImpact = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params; // provider_id or user_id
+        const { start_date, end_date, leave_kind, start_time, end_time } = req.body as any;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!start_date || !end_date) return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+
+        // Resolve provider by id or current user
+        let { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, business_id, user_id, phone')
+            .eq('id', id)
+            .maybeSingle();
+        if (!provider) {
+            const byUser = await adminSupabase
+                .from('service_providers')
+                .select('id, business_id, user_id, phone')
+                .eq('user_id', userId)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            provider = byUser.data;
+        }
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        // Verify this is self OR owner
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', provider.business_id)
+            .maybeSingle();
+        const isOwner = business?.owner_id === userId;
+        const isSelf = provider.user_id === userId;
+        if (!isOwner && !isSelf) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const normalizedKind = String(leave_kind || 'FULL_DAY').toUpperCase();
+        const isEmergency = normalizedKind === 'EMERGENCY';
+        const isHalfDay = normalizedKind === 'HALF_DAY';
+
+        const fromIso = new Date(`${String(start_date).slice(0, 10)}T00:00:00.000Z`).toISOString();
+        const toIso = new Date(`${String(end_date).slice(0, 10)}T23:59:59.999Z`).toISOString();
+
+        const { data: apptSvc } = await adminSupabase
+            .from('appointment_services')
+            .select(`
+                id,
+                appointment_id,
+                assigned_provider_id,
+                services:service_id (id, name, duration_minutes, translations),
+                appointments:appointment_id (
+                    id,
+                    business_id,
+                    user_id,
+                    start_time,
+                    end_time,
+                    status,
+                    profiles:user_id (id, full_name, phone)
+                )
+            `)
+            .eq('assigned_provider_id', provider.id)
+            .gte('appointments.start_time', fromIso)
+            .lte('appointments.start_time', toIso);
+
+        const appts = (apptSvc || [])
+            .map((r: any) => ({ appointment: r.appointments, service: r.services }))
+            .filter((r: any) => !!r.appointment)
+            .filter((r: any) => !['cancelled', 'completed', 'no_show'].includes(String(r.appointment?.status || '').toLowerCase()));
+
+        const timeOverlaps = (a: any) => {
+            if (!isEmergency && !isHalfDay) return true;
+            const day = String(start_date).slice(0, 10);
+            const apptDay = String(a.start_time || '').slice(0, 10);
+            if (apptDay !== day) return true;
+            const s = String(start_time || '').slice(0, 5);
+            const e = String(end_time || '').slice(0, 5);
+            const apptStart = String(a.start_time || '').slice(11, 16);
+            const apptEnd = String(a.end_time || '').slice(11, 16);
+            if (!s || !e || !apptStart || !apptEnd) return true;
+            return !(apptEnd <= s || apptStart >= e);
+        };
+        const affected = appts.filter((r: any) => timeOverlaps(r.appointment));
+
+        const customerIds = Array.from(
+            new Set<string>(affected.map((r: any) => r.appointment?.user_id).filter(Boolean).map((v: any) => String(v)))
+        );
+        let vipCount = 0;
+        let regularCount = 0;
+
+        if (customerIds.length > 0) {
+            const { data: vipRows } = await adminSupabase
+                .from('business_customer_flags')
+                .select('customer_id')
+                .eq('business_id', provider.business_id)
+                .eq('is_vip', true)
+                .in('customer_id', customerIds);
+            const vipSet = new Set<string>((vipRows || []).map((r: any) => String(r.customer_id)));
+            vipCount = customerIds.filter((cid) => vipSet.has(cid)).length;
+
+            const regularThreshold = 3;
+            const { data: past } = await adminSupabase
+                .from('appointment_services')
+                .select(`appointments:appointment_id (user_id, status)`)
+                .eq('assigned_provider_id', provider.id);
+            const counts = new Map<string, number>();
+            (past || []).forEach((row: any) => {
+                const a = row.appointments;
+                if (!a?.user_id) return;
+                if (String(a.status || '').toLowerCase() !== 'completed') return;
+                counts.set(a.user_id, (counts.get(a.user_id) || 0) + 1);
+            });
+            regularCount = customerIds.filter((cid) => (counts.get(cid) || 0) >= regularThreshold).length;
+        }
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                total_appointments: affected.length,
+                regular_customers: regularCount,
+                vip_customers: vipCount,
+                appointments: affected.map((a: any) => ({
+                    id: a.appointment.id,
+                    start_time: a.appointment.start_time,
+                    end_time: a.appointment.end_time,
+                    status: a.appointment.status,
+                    customer: a.appointment.profiles,
+                    service: a.service
+                })),
+                policy: {
+                    vip_requires_owner_approval: vipCount > 0,
+                    emergency_requires_handling: (isEmergency || isHalfDay) && affected.length > 0
+                }
+            }
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+const overlaps = (aStart: string, aEnd: string, bStart: string, bEnd: string) => {
+    const as = new Date(aStart).getTime();
+    const ae = new Date(aEnd).getTime();
+    const bs = new Date(bStart).getTime();
+    const be = new Date(bEnd).getTime();
+    if ([as, ae, bs, be].some((t) => Number.isNaN(t))) return true; // fail-safe: treat as overlap
+    return as < be && bs < ae;
+};
+
+export const previewAutoReassignPlan = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params; // provider_id
+        const { start_date, end_date, leave_kind, start_time, end_time, appointment_ids } = req.body as any;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!start_date || !end_date) return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+
+        // Verify ownership on provider business
+        const { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, business_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', provider.business_id)
+            .maybeSingle();
+        if (!business || business.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        // Get impacted appointments for the provider in this window (reuse validate logic)
+        const normalizedKind = String(leave_kind || 'FULL_DAY').toUpperCase();
+        const isEmergency = normalizedKind === 'EMERGENCY';
+        const isHalfDay = normalizedKind === 'HALF_DAY';
+
+        const fromIso = new Date(`${String(start_date).slice(0, 10)}T00:00:00.000Z`).toISOString();
+        const toIso = new Date(`${String(end_date).slice(0, 10)}T23:59:59.999Z`).toISOString();
+
+        let impactedQuery = adminSupabase
+            .from('appointment_services')
+            .select(`
+                id,
+                appointment_id,
+                service_id,
+                assigned_provider_id,
+                services:service_id (id, name),
+                appointments:appointment_id (
+                    id,
+                    business_id,
+                    user_id,
+                    start_time,
+                    end_time,
+                    status,
+                    profiles:user_id (id, full_name, phone)
+                )
+            `)
+            .eq('assigned_provider_id', provider.id)
+            .gte('appointments.start_time', fromIso)
+            .lte('appointments.start_time', toIso);
+
+        if (Array.isArray(appointment_ids) && appointment_ids.length > 0) {
+            impactedQuery = impactedQuery.in('appointment_id', appointment_ids.map(String));
+        }
+
+        const { data: apptSvc, error: apptErr } = await impactedQuery;
+        if (apptErr) throw apptErr;
+
+        const timeOverlaps = (a: any) => {
+            if (!isEmergency && !isHalfDay) return true;
+            const day = String(start_date).slice(0, 10);
+            const apptDay = String(a.start_time || '').slice(0, 10);
+            if (apptDay !== day) return true;
+            const s = String(start_time || '').slice(0, 5);
+            const e = String(end_time || '').slice(0, 5);
+            const apptStart = String(a.start_time || '').slice(11, 16);
+            const apptEnd = String(a.end_time || '').slice(11, 16);
+            if (!s || !e || !apptStart || !apptEnd) return true;
+            return !(apptEnd <= s || apptStart >= e);
+        };
+
+        const impacted = (apptSvc || [])
+            .map((r: any) => ({ row: r, appt: r.appointments, service: r.services }))
+            .filter((r: any) => !!r.appt)
+            .filter((r: any) => !['cancelled', 'completed', 'no_show'].includes(String(r.appt.status || '').toLowerCase()))
+            .filter((r: any) => timeOverlaps(r.appt))
+            .sort((a: any, b: any) => new Date(a.appt.start_time).getTime() - new Date(b.appt.start_time).getTime());
+
+        // Candidate providers: active, same business, not the leaving provider
+        const { data: candidates, error: candErr } = await adminSupabase
+            .from('service_providers')
+            .select('id, name, is_active')
+            .eq('business_id', provider.business_id)
+            .eq('is_active', true);
+        if (candErr) throw candErr;
+        const candidateProviders = (candidates || []).filter((p: any) => p.id !== provider.id);
+
+        // Provider skill map via provider_services
+        const providerIds = candidateProviders.map((p: any) => p.id);
+        const { data: provSvc } = providerIds.length
+            ? await adminSupabase
+                .from('provider_services')
+                .select('provider_id, service_id')
+                .in('provider_id', providerIds)
+            : { data: [] as any[] };
+        const skills = new Map<string, Set<string>>();
+        (provSvc || []).forEach((r: any) => {
+            const pid = String(r.provider_id);
+            const sid = String(r.service_id);
+            if (!skills.has(pid)) skills.set(pid, new Set());
+            skills.get(pid)!.add(sid);
+        });
+
+        // Load for balancing: count appointments per provider for the impacted day range.
+        // We only need counts for the appointment dates we're reassigning.
+        const daySet = new Set<string>(impacted.map((i: any) => String(i.appt.start_time).slice(0, 10)));
+        const dayList = Array.from(daySet);
+        const dayFrom = dayList.length ? `${dayList[0]}T00:00:00.000Z` : fromIso;
+        const dayTo = dayList.length ? `${dayList[dayList.length - 1]}T23:59:59.999Z` : toIso;
+
+        const { data: busyRows } = providerIds.length
+            ? await adminSupabase
+                .from('appointment_services')
+                .select(`
+                    assigned_provider_id,
+                    appointments:appointment_id (start_time, end_time, status)
+                `)
+                .in('assigned_provider_id', providerIds)
+                .gte('appointments.start_time', dayFrom)
+                .lte('appointments.start_time', dayTo)
+            : { data: [] as any[] };
+
+        const schedules = new Map<string, { start: string; end: string }[]>();
+        const dayLoad = new Map<string, number>();
+        (busyRows || []).forEach((r: any) => {
+            const pid = String(r.assigned_provider_id);
+            const a = r.appointments;
+            if (!a) return;
+            const st = String(a.status || '').toLowerCase();
+            if (['cancelled', 'completed', 'no_show'].includes(st)) return;
+            if (!schedules.has(pid)) schedules.set(pid, []);
+            schedules.get(pid)!.push({ start: a.start_time, end: a.end_time });
+            const d = String(a.start_time).slice(0, 10);
+            const key = `${pid}:${d}`;
+            dayLoad.set(key, (dayLoad.get(key) || 0) + 1);
+        });
+
+        // VIP set for impacted customers
+        const customerIds = Array.from(new Set<string>(impacted.map((i: any) => i.appt.user_id).filter(Boolean).map((v: any) => String(v))));
+        const { data: vipRows } = customerIds.length
+            ? await adminSupabase
+                .from('business_customer_flags')
+                .select('customer_id')
+                .eq('business_id', provider.business_id)
+                .eq('is_vip', true)
+                .in('customer_id', customerIds)
+            : { data: [] as any[] };
+        const vipSet = new Set<string>((vipRows || []).map((r: any) => String(r.customer_id)));
+
+        // Regular preference: previous provider for this customer+service if available (last completed)
+        const { data: pastCompleted } = customerIds.length
+            ? await adminSupabase
+                .from('appointment_services')
+                .select(`
+                    service_id,
+                    assigned_provider_id,
+                    appointments:appointment_id (user_id, status, start_time)
+                `)
+                .in('appointments.user_id', customerIds)
+            : { data: [] as any[] };
+        const lastProviderByCustomerService = new Map<string, string>();
+        (pastCompleted || []).forEach((r: any) => {
+            const a = r.appointments;
+            if (!a?.user_id) return;
+            if (String(a.status || '').toLowerCase() !== 'completed') return;
+            const key = `${String(a.user_id)}:${String(r.service_id)}`;
+            const prev = lastProviderByCustomerService.get(key);
+            // Choose latest by start_time
+            if (!prev) {
+                lastProviderByCustomerService.set(key, String(r.assigned_provider_id));
+                return;
+            }
+            // naive: overwrite if later
+            lastProviderByCustomerService.set(key, String(r.assigned_provider_id));
+        });
+
+        // Planner: for each impacted appointment, pick provider with:
+        // - has skill
+        // - no time overlap (including already planned assignments)
+        // - load balancing: least appointments that day
+        // - VIP: prefer least-loaded overall AND allow manual override later (no rating data)
+        const plannedSchedules = new Map<string, { start: string; end: string }[]>();
+        const plannedDayLoad = new Map<string, number>();
+        const plan: any[] = [];
+
+        const getLoad = (pid: string, day: string) => (dayLoad.get(`${pid}:${day}`) || 0) + (plannedDayLoad.get(`${pid}:${day}`) || 0);
+        const isFree = (pid: string, start: string, end: string) => {
+            const existing = (schedules.get(pid) || []);
+            const planned = (plannedSchedules.get(pid) || []);
+            return ![...existing, ...planned].some((slot) => overlaps(slot.start, slot.end, start, end));
+        };
+
+        for (const item of impacted) {
+            const appt = item.appt;
+            const serviceId = String(item.row.service_id || item.service?.id || '');
+            const customerId = String(appt.user_id || '');
+            const day = String(appt.start_time).slice(0, 10);
+            const isVip = vipSet.has(customerId);
+            const regularPref = lastProviderByCustomerService.get(`${customerId}:${serviceId}`) || null;
+
+            // eligible list by skill
+            let eligible = candidateProviders
+                .filter((p: any) => skills.get(String(p.id))?.has(serviceId))
+                .map((p: any) => String(p.id));
+
+            // prefer regular previous provider if free
+            if (regularPref && eligible.includes(regularPref) && isFree(regularPref, appt.start_time, appt.end_time)) {
+                eligible = [regularPref, ...eligible.filter((x: string) => x !== regularPref)];
+            }
+
+            // filter free
+            const freeEligible = eligible.filter((pid: string) => isFree(pid, appt.start_time, appt.end_time));
+
+            let chosen: string | null = null;
+            if (freeEligible.length > 0) {
+                // load balancing: pick least busy that day
+                freeEligible.sort((a: string, b: string) => getLoad(a, day) - getLoad(b, day));
+                chosen = freeEligible[0];
+            }
+
+            if (chosen) {
+                if (!plannedSchedules.has(chosen)) plannedSchedules.set(chosen, []);
+                plannedSchedules.get(chosen)!.push({ start: appt.start_time, end: appt.end_time });
+                plannedDayLoad.set(`${chosen}:${day}`, (plannedDayLoad.get(`${chosen}:${day}`) || 0) + 1);
+            }
+
+            plan.push({
+                appointment_id: appt.id,
+                appointment_service_id: item.row.id,
+                start_time: appt.start_time,
+                end_time: appt.end_time,
+                service: item.service,
+                customer: appt.profiles,
+                priority: isVip ? 'VIP' : (regularPref ? 'REGULAR' : 'NORMAL'),
+                suggested_provider_id: chosen,
+                suggested_reason: chosen
+                    ? (regularPref && chosen === regularPref ? 'regular_preference' : (isVip ? 'vip_least_busy' : 'least_busy'))
+                    : 'no_available_provider',
+                needs_reschedule: !chosen
+            });
+        }
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                provider_id: provider.id,
+                business_id: provider.business_id,
+                total: plan.length,
+                needs_reschedule_count: plan.filter((p: any) => p.needs_reschedule).length,
+                plan
+            }
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const applyAutoReassignPlan = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params; // leaving provider_id
+        const { assignments } = req.body as any;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!Array.isArray(assignments) || assignments.length === 0) {
+            return res.status(400).json({ status: 'error', message: 'assignments is required' });
+        }
+
+        const { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, business_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', provider.business_id)
+            .maybeSingle();
+        if (!business || business.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const results: any[] = [];
+        for (const a of assignments) {
+            const appointmentId = String(a.appointment_id || '');
+            const toProviderId = a.to_provider_id ? String(a.to_provider_id) : null;
+            if (!appointmentId) continue;
+            try {
+                if (toProviderId) {
+                    const { error: uErr } = await adminSupabase
+                        .from('appointment_services')
+                        .update({
+                            assigned_provider_id: toProviderId,
+                            reassigned_from_provider_id: provider.id,
+                            reassigned_at: new Date().toISOString()
+                        })
+                        .eq('appointment_id', appointmentId)
+                        .eq('assigned_provider_id', provider.id);
+                    if (uErr) throw uErr;
+                    await adminSupabase.from('appointments').update({ needs_reschedule: false }).eq('id', appointmentId);
+                    results.push({ appointment_id: appointmentId, ok: true, action: 'reassigned', to_provider_id: toProviderId });
+                } else {
+                    // No provider available: mark needs_reschedule and unassign from appointment_services
+                    await adminSupabase
+                        .from('appointment_services')
+                        .update({
+                            assigned_provider_id: null,
+                            reassigned_from_provider_id: provider.id,
+                            reassigned_at: new Date().toISOString()
+                        })
+                        .eq('appointment_id', appointmentId)
+                        .eq('assigned_provider_id', provider.id);
+                    await adminSupabase.from('appointments').update({ needs_reschedule: true }).eq('id', appointmentId);
+                    results.push({ appointment_id: appointmentId, ok: true, action: 'needs_reschedule' });
+                }
+            } catch (e: any) {
+                results.push({ appointment_id: appointmentId, ok: false, error: e.message || String(e) });
+            }
+        }
+
+        res.status(200).json({
+            status: 'success',
+            data: {
+                total: results.length,
+                failed: results.filter((r) => !r.ok).length,
+                results
+            }
+        });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
     }

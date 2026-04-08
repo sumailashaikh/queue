@@ -319,6 +319,78 @@ export const deleteBusiness = async (req: Request, res: Response) => {
     }
 };
 
+export const setCustomerVipFlag = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const { id: businessId, customerId } = req.params as any;
+        const { is_vip, vip_note } = req.body as any;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!businessId || !customerId) return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+
+        // Owner-only
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', businessId)
+            .eq('owner_id', userId)
+            .maybeSingle();
+        if (!business) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const payload = {
+            business_id: businessId,
+            customer_id: customerId,
+            is_vip: !!is_vip,
+            vip_note: vip_note ? String(vip_note).slice(0, 240) : null,
+            vip_set_by: userId,
+            updated_at: new Date().toISOString()
+        };
+
+        const { data, error } = await supabase
+            .from('business_customer_flags')
+            .upsert(payload, { onConflict: 'business_id,customer_id' })
+            .select()
+            .maybeSingle();
+
+        if (error) throw error;
+
+        res.status(200).json({ status: 'success', message: 'Customer updated', data });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const listVipCustomers = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const { id: businessId } = req.params as any;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', businessId)
+            .eq('owner_id', userId)
+            .maybeSingle();
+        if (!business) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data, error } = await supabase
+            .from('business_customer_flags')
+            .select('customer_id, is_vip, vip_note, updated_at, profiles:customer_id (id, full_name, phone)')
+            .eq('business_id', businessId)
+            .eq('is_vip', true)
+            .order('updated_at', { ascending: false });
+
+        if (error) throw error;
+        res.status(200).json({ status: 'success', data: data || [] });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const getBusinessBySlug = async (req: Request, res: Response) => {
     try {
         const { slug } = req.params;

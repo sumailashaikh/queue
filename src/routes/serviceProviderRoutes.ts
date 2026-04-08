@@ -22,6 +22,9 @@ router.patch('/assignments/:id', serviceProviderController.assignProviderToEntry
 // Provider Leaves endpoints
 router.get('/:id/leaves', serviceProviderController.getProviderLeaves);
 router.post('/:id/leaves', serviceProviderController.addProviderLeave);
+router.post('/:id/leaves/validate', serviceProviderController.validateProviderLeaveImpact);
+router.post('/:id/leaves/reassign-plan', serviceProviderController.previewAutoReassignPlan);
+router.post('/:id/leaves/reassign-apply', serviceProviderController.applyAutoReassignPlan);
 router.patch('/leaves/:leaveId/status', serviceProviderController.updateLeaveStatus);
 router.delete('/leaves/:leaveId', serviceProviderController.deleteProviderLeave);
 

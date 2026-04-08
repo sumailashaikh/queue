@@ -4,6 +4,39 @@ import { notificationService } from '../services/notificationService';
 import { isBusinessOpen, getLocalMinutes, getLocalDateString } from '../utils/timeUtils';
 import { recomputeProviderDelays } from '../utils/delayLogic';
 
+async function resolveMyProviderForUser(userId: string, adminSupabase: any) {
+    const byUser = await adminSupabase
+        .from('service_providers')
+        .select('id, business_id')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+    return byUser.data || null;
+}
+
+function baseLang(input?: string): 'en' | 'hi' | 'es' | 'ar' {
+    const l = String(input || 'en').toLowerCase().split('-')[0];
+    if (l === 'hi' || l === 'es' || l === 'ar') return l;
+    return 'en';
+}
+
+function appointmentReassignedMessage(lang: string, businessName: string, when: string): string {
+    const l = baseLang(lang);
+    if (l === 'hi') return `आपकी अपॉइंटमेंट ${businessName} में स्टाफ उपलब्धता के कारण री-असाइन कर दी गई है। समय वही रहेगा: ${when}`;
+    if (l === 'ar') return `تمت إعادة تعيين موعدك في ${businessName} بسبب توفر الموظفين. سيبقى الموعد كما هو: ${when}`;
+    if (l === 'es') return `Tu cita en ${businessName} fue reasignada por disponibilidad del personal. El horario se mantiene: ${when}`;
+    return `Your appointment at ${businessName} has been reassigned due to staff availability. Your scheduled time remains ${when}.`;
+}
+
+function appointmentRescheduledMessage(lang: string, businessName: string, when: string): string {
+    const l = baseLang(lang);
+    if (l === 'hi') return `आपकी अपॉइंटमेंट ${businessName} में पुनर्निर्धारित की गई है। नया समय: ${when}`;
+    if (l === 'ar') return `تمت إعادة جدولة موعدك في ${businessName}. الموعد الجديد: ${when}`;
+    if (l === 'es') return `Tu cita en ${businessName} fue reprogramada. Nuevo horario: ${when}`;
+    return `Your appointment at ${businessName} has been rescheduled to ${when}.`;
+}
+
 export const createAppointment = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
@@ -210,6 +243,67 @@ export const getMyAppointments = async (req: Request, res: Response) => {
     }
 };
 
+export const getMyAssignedAppointments = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        const provider = await resolveMyProviderForUser(userId, adminSupabase);
+        if (!provider) return res.status(200).json({ status: 'success', data: [] });
+
+        const { data, error } = await adminSupabase
+            .from('appointment_services')
+            .select(`
+              id,
+              assigned_provider_id,
+              reassigned_from_provider_id,
+              reassigned_at,
+              services:service_id (id, name, duration_minutes, translations),
+              appointments:appointment_id (
+                id,
+                business_id,
+                user_id,
+                start_time,
+                end_time,
+                status,
+                profiles:user_id (id, full_name, phone, ui_language)
+              )
+            `)
+            .eq('assigned_provider_id', provider.id)
+            .order('reassigned_at', { ascending: false, nullsFirst: false });
+
+        if (error) throw error;
+
+        const rows = (data || []).map((row: any) => {
+            const appt = row.appointments || {};
+            const isReassigned = !!row.reassigned_from_provider_id;
+            return {
+                id: appt.id,
+                business_id: appt.business_id,
+                start_time: appt.start_time,
+                end_time: appt.end_time,
+                status: appt.status,
+                appointment_state: isReassigned ? 'REASSIGNED' : (String(appt.status || '').toUpperCase() || 'SCHEDULED'),
+                customer: appt.profiles,
+                service: row.services,
+                assignment: {
+                    appointment_service_id: row.id,
+                    assigned_provider_id: row.assigned_provider_id,
+                    reassigned_from_provider_id: row.reassigned_from_provider_id,
+                    reassigned_at: row.reassigned_at
+                }
+            };
+        });
+
+        res.status(200).json({ status: 'success', data: rows });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const getBusinessAppointments = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
@@ -319,6 +413,75 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
             data: enhancedData
         });
 
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const reassignAppointment = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const { id } = req.params; // appointment_id
+        const { to_provider_id, from_provider_id } = req.body as any;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!to_provider_id) return res.status(400).json({ status: 'error', message: 'to_provider_id is required' });
+
+        // Ensure requester owns the business for this appointment OR is staff within same business (owner override)
+        const { data: appt, error: apptError } = await adminSupabase
+            .from('appointments')
+            .select('id, business_id, user_id, start_time, end_time, businesses(owner_id, timezone, name, language)')
+            .eq('id', id)
+            .maybeSingle();
+        if (apptError) throw apptError;
+        if (!appt) return res.status(404).json({ status: 'error', message: 'Appointment not found' });
+
+        const ownerId = appt.businesses?.owner_id;
+        let isOwner = ownerId === userId;
+        if (!isOwner) {
+            const { data: myProfile } = await supabase.from('profiles').select('business_id').eq('id', userId).maybeSingle();
+            isOwner = !!myProfile?.business_id && myProfile.business_id === appt.business_id;
+        }
+        if (!isOwner) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        // Reassign appointment_services rows (optionally only those from a specific provider)
+        let q = adminSupabase
+            .from('appointment_services')
+            .update({
+                assigned_provider_id: to_provider_id,
+                reassigned_from_provider_id: from_provider_id || null,
+                reassigned_at: new Date().toISOString()
+            })
+            .eq('appointment_id', id);
+        if (from_provider_id) q = q.eq('assigned_provider_id', from_provider_id);
+
+        const { data: updated, error: uErr } = await q.select('*');
+        if (uErr) throw uErr;
+
+        // Notify customer (best-effort)
+        try {
+            const { data: customer } = await adminSupabase
+                .from('profiles')
+                .select('phone, full_name, ui_language')
+                .eq('id', appt.user_id)
+                .maybeSingle();
+            if (customer?.phone) {
+                const timezone = appt.businesses?.timezone || 'UTC';
+                const when = new Date(appt.start_time).toLocaleString('en-IN', { timeZone: timezone });
+                const lang = customer?.ui_language || appt.businesses?.language || 'en';
+                const msg = appointmentReassignedMessage(lang, appt.businesses?.name || 'our business', when);
+                await Promise.allSettled([
+                    notificationService.sendSMS(customer.phone, msg),
+                    notificationService.sendWhatsApp(customer.phone, msg)
+                ]);
+            }
+        } catch {
+            /* non-blocking */
+        }
+
+        res.status(200).json({ status: 'success', message: 'Appointment reassigned', data: updated || [] });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
     }
@@ -658,7 +821,7 @@ export const rescheduleAppointment = async (req: Request, res: Response) => {
             .from('appointments')
             .select(`
                 *,
-                businesses (close_time, owner_id, name, timezone),
+                businesses (close_time, owner_id, name, timezone, language),
                 appointment_services (duration_minutes)
             `)
             .eq('id', id)
@@ -704,9 +867,26 @@ export const rescheduleAppointment = async (req: Request, res: Response) => {
         if (error) throw error;
 
         // Notify client
-        const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
+        const recipient = appointment.guest_phone || null;
         const displayTime = new Date(start_time).toLocaleString('en-IN', { timeZone: timezone });
-        await notificationService.sendSMS(recipient, `Your appointment at ${appointment.businesses.name} has been rescheduled to ${displayTime}.`);
+        let customerLang = appointment.businesses?.language || 'en';
+        if (!recipient && appointment.user_id) {
+            const { data: profile } = await supabase.from('profiles').select('phone, ui_language').eq('id', appointment.user_id).maybeSingle();
+            if (profile?.ui_language) customerLang = profile.ui_language;
+            if (profile?.phone) {
+                const msg = appointmentRescheduledMessage(customerLang, appointment.businesses.name, displayTime);
+                await Promise.allSettled([
+                    notificationService.sendSMS(profile.phone, msg),
+                    notificationService.sendWhatsApp(profile.phone, msg)
+                ]);
+            }
+        } else if (recipient) {
+            const msg = appointmentRescheduledMessage(customerLang, appointment.businesses.name, displayTime);
+            await Promise.allSettled([
+                notificationService.sendSMS(recipient, msg),
+                notificationService.sendWhatsApp(recipient, msg)
+            ]);
+        }
 
         res.status(200).json({
             status: 'success',
