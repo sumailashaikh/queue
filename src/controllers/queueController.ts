@@ -105,7 +105,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
         .from("queue_entries")
         .select(fallbackSelect)
         .eq("assigned_to", userId)
-        .in("status", ["serving", "waiting"])
+        .in("status", ["serving", "waiting", "completed"])
         .order("position", { ascending: true });
       if (fallbackErr) throw fallbackErr;
       return res.status(200).json({ status: "success", data: fallbackRows || [] });
@@ -165,13 +165,13 @@ export const getMyTasks = async (req: Request, res: Response) => {
         .select(baseSelect)
         .eq("assigned_to", userId)
         .eq("entry_date", todayStr)
-        .in("status", ["serving", "waiting"]),
+        .in("status", ["serving", "waiting", "completed"]),
       adminSupabase
         .from("queue_entries")
         .select(baseSelect)
         .in("queue_entry_services.assigned_provider_id", providerIdList)
         .eq("entry_date", todayStr)
-        .in("status", ["serving", "waiting"]),
+        .in("status", ["serving", "waiting", "completed"]),
     ]);
 
     if (primaryAssigned.error) throw primaryAssigned.error;
@@ -206,7 +206,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
                 `,
           )
           .in("assigned_provider_id", providerIdList)
-          .in("task_status", ["pending", "in_progress"]);
+          .in("task_status", ["pending", "in_progress", "done"]);
 
       if (!serviceTaskErr) {
         const eligibleEntryIds = Array.from(
@@ -215,7 +215,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
               .filter(
                 (r: any) =>
                   r?.queue_entries?.entry_date === todayStr &&
-                  ["waiting", "serving"].includes(
+                  ["waiting", "serving", "completed"].includes(
                     String(r?.queue_entries?.status || ""),
                   ),
               )
@@ -231,7 +231,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
               .select(baseSelect)
               .in("id", eligibleEntryIds)
               .eq("entry_date", todayStr)
-              .in("status", ["serving", "waiting"]);
+              .in("status", ["serving", "waiting", "completed"]);
           if (!fallbackErr) {
             (fallbackEntries || []).forEach((row: any) =>
               mergedMap.set(row.id, row),
@@ -248,13 +248,27 @@ export const getMyTasks = async (req: Request, res: Response) => {
         providerIdSet.has(String(s.assigned_provider_id || "")),
       );
       if (mine.length > 0) {
+        if (String(entry?.status || "").toLowerCase() === "completed") {
+          return mine.some(
+            (s: any) => String(s?.task_status || "").toLowerCase() === "done",
+          );
+        }
         return mine.some(
           (s: any) => s.task_status !== "done" && s.task_status !== "cancelled",
         );
       }
       if (entry.assigned_to === userId) {
         if (services.length === 0) {
-          return entry.status === "waiting" || entry.status === "serving";
+          return (
+            entry.status === "waiting" ||
+            entry.status === "serving" ||
+            entry.status === "completed"
+          );
+        }
+        if (String(entry?.status || "").toLowerCase() === "completed") {
+          return services.some(
+            (s: any) => String(s?.task_status || "").toLowerCase() === "done",
+          );
         }
         return services.some(
           (s: any) => s.task_status !== "done" && s.task_status !== "cancelled",
