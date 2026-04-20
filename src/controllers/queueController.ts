@@ -49,6 +49,8 @@ export const getMyTasks = async (req: Request, res: Response) => {
             .limit(1)
             .maybeSingle();
         let provider = providerRes.data;
+        const providerIds = new Set<string>();
+        if (provider?.id) providerIds.add(String(provider.id));
 
         // Fallback by phone for newly invited employees not linked yet.
         if (!provider) {
@@ -74,6 +76,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
                             .eq('id', providerByPhone.id);
                     }
                     provider = { id: providerByPhone.id, business_id: providerByPhone.business_id } as any;
+                    if (providerByPhone.id) providerIds.add(String(providerByPhone.id));
                 }
             }
         }
@@ -81,6 +84,18 @@ export const getMyTasks = async (req: Request, res: Response) => {
         if (!provider) {
             return res.status(200).json({ status: 'success', data: [] });
         }
+
+        // Include all provider rows linked to this employee user to avoid missing tasks
+        // when legacy duplicate provider records exist.
+        const { data: providerRows } = await adminSupabase
+            .from('service_providers')
+            .select('id')
+            .eq('user_id', userId);
+        (providerRows || []).forEach((row: any) => {
+            if (row?.id) providerIds.add(String(row.id));
+        });
+        if (provider?.id) providerIds.add(String(provider.id));
+        const providerIdList = Array.from(providerIds);
 
         if (!(provider as any).business_id && provider.id) {
             const { data: pRow } = await adminSupabase
@@ -128,7 +143,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
             adminSupabase
                 .from('queue_entries')
                 .select(baseSelect)
-                .eq('queue_entry_services.assigned_provider_id', provider.id)
+                .in('queue_entry_services.assigned_provider_id', providerIdList)
                 .eq('entry_date', todayStr)
                 .in('status', ['serving', 'waiting'])
         ]);
@@ -140,10 +155,10 @@ export const getMyTasks = async (req: Request, res: Response) => {
         (primaryAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
         (serviceAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
 
-        const providerId = provider.id;
+        const providerIdSet = new Set(providerIdList);
         const hasOpenWorkForProvider = (entry: any) => {
             const services = entry.queue_entry_services || [];
-            const mine = services.filter((s: any) => s.assigned_provider_id === providerId);
+            const mine = services.filter((s: any) => providerIdSet.has(String(s.assigned_provider_id || '')));
             if (mine.length > 0) {
                 return mine.some(
                     (s: any) => s.task_status !== 'done' && s.task_status !== 'cancelled'
