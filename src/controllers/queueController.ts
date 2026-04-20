@@ -155,6 +155,50 @@ export const getMyTasks = async (req: Request, res: Response) => {
         (primaryAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
         (serviceAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
 
+        // Fallback path for environments where nested ".in(queue_entry_services.assigned_provider_id, ...)"
+        // can under-return rows. Fetch task rows first, then fetch parent queue entries by ids.
+        if ((serviceAssigned.data || []).length === 0 && providerIdList.length > 0) {
+            const { data: serviceTaskRows, error: serviceTaskErr } = await adminSupabase
+                .from('queue_entry_services')
+                .select(`
+                    queue_entry_id,
+                    task_status,
+                    queue_entries!inner (
+                        id,
+                        entry_date,
+                        status
+                    )
+                `)
+                .in('assigned_provider_id', providerIdList)
+                .in('task_status', ['pending', 'in_progress']);
+
+            if (!serviceTaskErr) {
+                const eligibleEntryIds = Array.from(
+                    new Set(
+                        (serviceTaskRows || [])
+                            .filter((r: any) =>
+                                r?.queue_entries?.entry_date === todayStr &&
+                                ['waiting', 'serving'].includes(String(r?.queue_entries?.status || ''))
+                            )
+                            .map((r: any) => String(r.queue_entry_id))
+                            .filter(Boolean)
+                    )
+                );
+
+                if (eligibleEntryIds.length > 0) {
+                    const { data: fallbackEntries, error: fallbackErr } = await adminSupabase
+                        .from('queue_entries')
+                        .select(baseSelect)
+                        .in('id', eligibleEntryIds)
+                        .eq('entry_date', todayStr)
+                        .in('status', ['serving', 'waiting']);
+                    if (!fallbackErr) {
+                        (fallbackEntries || []).forEach((row: any) => mergedMap.set(row.id, row));
+                    }
+                }
+            }
+        }
+
         const providerIdSet = new Set(providerIdList);
         const hasOpenWorkForProvider = (entry: any) => {
             const services = entry.queue_entry_services || [];
@@ -2370,9 +2414,18 @@ export const initializeEntryTasks = async (req: Request, res: Response) => {
             task_status: provider_id ? 'pending' : 'pending' 
         }]);
 
-        // If provider was assigned, also sync it back to the entry level for legacy rows
+        // If provider was assigned, also sync it back to the entry level for legacy rows.
+        // queue_entries.assigned_to stores employee user_id (not provider id).
         if (provider_id) {
-            await supabase.from('queue_entries').update({ assigned_to: provider_id }).eq('id', id);
+            const { data: providerRow } = await supabase
+                .from('service_providers')
+                .select('user_id')
+                .eq('id', provider_id)
+                .maybeSingle();
+            await supabase
+                .from('queue_entries')
+                .update({ assigned_to: providerRow?.user_id || null })
+                .eq('id', id);
         }
 
         res.status(200).json({ status: 'success', message: 'Tasks initialized' });
