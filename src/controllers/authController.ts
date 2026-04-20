@@ -2,6 +2,28 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
 
+/** Supabase / Node fetch often surfaces generic "fetch failed" — avoid leaking that to clients. */
+function userSafeConnectivityMessage(error: unknown): string | null {
+    const msg = String((error as any)?.message ?? '').toLowerCase();
+    const cause = String((error as any)?.cause?.message ?? '').toLowerCase();
+    const blob = `${msg} ${cause}`;
+    if (
+        blob.includes('fetch failed') ||
+        blob.includes('failed to fetch') ||
+        blob.includes('networkerror') ||
+        blob.includes('econnrefused') ||
+        blob.includes('enotfound') ||
+        blob.includes('getaddrinfo') ||
+        blob.includes('socket hang up') ||
+        blob.includes('certificate') ||
+        blob.includes('tls') ||
+        blob.includes('ssl')
+    ) {
+        return 'Sign-in is temporarily unavailable. Please try again in a few minutes.';
+    }
+    return null;
+}
+
 export const sendOtp = async (req: Request, res: Response) => {
     try {
         let { phone } = req.body;
@@ -40,11 +62,14 @@ export const sendOtp = async (req: Request, res: Response) => {
         });
 
     } catch (error: any) {
-        console.error('[AUTH] sendOtp caught error:', error.message);
+        console.error('[AUTH] sendOtp caught error:', error?.message || error);
         const raw = String(error?.message || '').toLowerCase();
-        const safeMessage = (raw.includes('63038') || raw.includes('daily messages limit') || raw.includes('twilio'))
-            ? 'OTP service is temporarily busy. Please try again after some time.'
-            : (error.message || 'Failed to send OTP');
+        const connectivity = userSafeConnectivityMessage(error);
+        const safeMessage = connectivity
+            ? connectivity
+            : (raw.includes('63038') || raw.includes('daily messages limit') || raw.includes('twilio'))
+              ? 'OTP service is temporarily busy. Please try again after some time.'
+              : (error.message || 'Failed to send OTP');
         res.status(400).json({
             status: 'error',
             message: safeMessage
@@ -369,10 +394,13 @@ export const verifyOtp = async (req: Request, res: Response) => {
         
         // Differentiate between Auth errors (bad OTP) and Server errors
         const isAuthError = error.status === 400 || error.message?.toLowerCase().includes('otp') || error.message?.toLowerCase().includes('verification');
-        
+        const connectivity = userSafeConnectivityMessage(error);
+        const message =
+            connectivity || error.message || 'An unexpected error occurred';
+
         res.status(isAuthError ? 401 : 500).json({
             status: 'error',
-            message: error.message || 'An unexpected error occurred'
+            message
         });
     }
 };
