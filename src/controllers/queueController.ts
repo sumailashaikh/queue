@@ -1760,6 +1760,22 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
             });
         }
 
+        // Keep entry-level assignment fields in sync for UI cards and legacy flows.
+        const { data: providerRow } = provider_id
+            ? await adminSupabase
+                .from('service_providers')
+                .select('id, user_id')
+                .eq('id', provider_id)
+                .maybeSingle()
+            : { data: null as any };
+        await adminSupabase
+            .from('queue_entries')
+            .update({
+                assigned_provider_id: providerRow?.id || null,
+                assigned_to: providerRow?.user_id || null
+            })
+            .eq('id', task.queue_entry_id);
+
         res.status(200).json({
             status: 'success',
             message: 'Provider assigned to task successfully',
@@ -2380,7 +2396,28 @@ export const initializeEntryTasks = async (req: Request, res: Response) => {
             .eq('queue_entry_id', id);
 
         if (existing && existing.length > 0) {
-            return res.status(200).json({ status: 'success', message: 'Tasks already initialized' });
+            // If tasks already exist and provider is now selected, treat this as assignment.
+            if (provider_id) {
+                await supabase
+                    .from('queue_entry_services')
+                    .update({ assigned_provider_id: provider_id })
+                    .eq('queue_entry_id', id);
+
+                const { data: providerRow } = await supabase
+                    .from('service_providers')
+                    .select('id, user_id')
+                    .eq('id', provider_id)
+                    .maybeSingle();
+
+                await supabase
+                    .from('queue_entries')
+                    .update({
+                        assigned_provider_id: providerRow?.id || provider_id,
+                        assigned_to: providerRow?.user_id || null
+                    })
+                    .eq('id', id);
+            }
+            return res.status(200).json({ status: 'success', message: provider_id ? 'Provider assigned successfully' : 'Tasks already initialized' });
         }
 
         // 2. Fetch entry and business info simply
@@ -2419,12 +2456,15 @@ export const initializeEntryTasks = async (req: Request, res: Response) => {
         if (provider_id) {
             const { data: providerRow } = await supabase
                 .from('service_providers')
-                .select('user_id')
+                .select('id, user_id')
                 .eq('id', provider_id)
                 .maybeSingle();
             await supabase
                 .from('queue_entries')
-                .update({ assigned_to: providerRow?.user_id || null })
+                .update({
+                    assigned_provider_id: providerRow?.id || provider_id,
+                    assigned_to: providerRow?.user_id || null
+                })
                 .eq('id', id);
         }
 
