@@ -1,126 +1,152 @@
-import { Request, Response } from 'express';
-import { supabase } from '../config/supabaseClient';
-import { notificationService } from '../services/notificationService';
-import { isBusinessOpen, getLocalDateString } from '../utils/timeUtils';
-import { recomputeProviderDelays } from '../utils/delayLogic';
-import { isBlockingApprovedLeave } from '../utils/leaveStatus';
+import { Request, Response } from "express";
+import { supabase } from "../config/supabaseClient";
+import { notificationService } from "../services/notificationService";
+import { isBusinessOpen, getLocalDateString } from "../utils/timeUtils";
+import { recomputeProviderDelays } from "../utils/delayLogic";
+import { isBlockingApprovedLeave } from "../utils/leaveStatus";
 
 export const getAllQueues = async (req: Request, res: Response) => {
-    try {
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
-        const { data, error } = await supabase
-            .from('queues')
-            .select('*')
-            .eq('status', 'open');
+  try {
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
+    const { data, error } = await supabase
+      .from("queues")
+      .select("*")
+      .eq("status", "open");
 
-        if (error) throw error;
+    if (error) throw error;
 
-        res.status(200).json({
-            status: 'success',
-            message: 'Queues retrieved successfully',
-            data
-        });
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
-    }
+    res.status(200).json({
+      status: "success",
+      message: "Queues retrieved successfully",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
 export const getMyTasks = async (req: Request, res: Response) => {
-    try {
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
-        const { adminSupabase } = require('../config/supabaseClient');
+  try {
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
+    const { adminSupabase } = require("../config/supabaseClient");
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
+
+    // 1. Find the provider record for this user (business_id for local “today” + filters)
+    // Avoid single-row coercion here because older data can contain duplicate
+    // provider rows linked to the same user_id.
+    const providerRes = await supabase
+      .from("service_providers")
+      .select("id, business_id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    let provider = providerRes.data;
+    const providerIds = new Set<string>();
+    if (provider?.id) providerIds.add(String(provider.id));
+
+    // Fallback by phone for newly invited employees not linked yet.
+    if (!provider) {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("phone")
+        .eq("id", userId)
+        .maybeSingle();
+      const normalizedPhone = (profile?.phone || "").replace(/[^\d+]/g, "");
+      if (normalizedPhone) {
+        const { data: providerByPhone } = await adminSupabase
+          .from("service_providers")
+          .select("id, user_id, business_id")
+          .eq("phone", normalizedPhone)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (providerByPhone) {
+          if (!providerByPhone.user_id) {
+            await adminSupabase
+              .from("service_providers")
+              .update({ user_id: userId })
+              .eq("id", providerByPhone.id);
+          }
+          provider = {
+            id: providerByPhone.id,
+            business_id: providerByPhone.business_id,
+          } as any;
+          if (providerByPhone.id) providerIds.add(String(providerByPhone.id));
         }
+      }
+    }
 
-        // 1. Find the provider record for this user (business_id for local “today” + filters)
-        // Avoid single-row coercion here because older data can contain duplicate
-        // provider rows linked to the same user_id.
-        const providerRes = await supabase
-            .from('service_providers')
-            .select('id, business_id')
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-        let provider = providerRes.data;
-        const providerIds = new Set<string>();
-        if (provider?.id) providerIds.add(String(provider.id));
+    if (!provider) {
+      // Fallback for accounts where provider linkage is missing:
+      // still show tasks explicitly assigned at entry level.
+      const fallbackSelect = `
+            *,
+            queue_entry_services (
+                *,
+                services (id, name)
+            ),
+            queues (
+                id,
+                name,
+                business_id
+            )
+        `;
+      const { data: fallbackRows, error: fallbackErr } = await adminSupabase
+        .from("queue_entries")
+        .select(fallbackSelect)
+        .eq("assigned_to", userId)
+        .in("status", ["serving", "waiting"])
+        .order("position", { ascending: true });
+      if (fallbackErr) throw fallbackErr;
+      return res.status(200).json({ status: "success", data: fallbackRows || [] });
+    }
 
-        // Fallback by phone for newly invited employees not linked yet.
-        if (!provider) {
-            const { data: profile } = await supabase
-                .from('profiles')
-                .select('phone')
-                .eq('id', userId)
-                .maybeSingle();
-            const normalizedPhone = (profile?.phone || '').replace(/[^\d+]/g, '');
-            if (normalizedPhone) {
-                const { data: providerByPhone } = await adminSupabase
-                    .from('service_providers')
-                    .select('id, user_id, business_id')
-                    .eq('phone', normalizedPhone)
-                    .order('created_at', { ascending: false })
-                    .limit(1)
-                    .maybeSingle();
-                if (providerByPhone) {
-                    if (!providerByPhone.user_id) {
-                        await adminSupabase
-                            .from('service_providers')
-                            .update({ user_id: userId })
-                            .eq('id', providerByPhone.id);
-                    }
-                    provider = { id: providerByPhone.id, business_id: providerByPhone.business_id } as any;
-                    if (providerByPhone.id) providerIds.add(String(providerByPhone.id));
-                }
-            }
-        }
+    // Include all provider rows linked to this employee user to avoid missing tasks
+    // when legacy duplicate provider records exist.
+    const { data: providerRows } = await adminSupabase
+      .from("service_providers")
+      .select("id")
+      .eq("user_id", userId);
+    (providerRows || []).forEach((row: any) => {
+      if (row?.id) providerIds.add(String(row.id));
+    });
+    if (provider?.id) providerIds.add(String(provider.id));
+    const providerIdList = Array.from(providerIds);
 
-        if (!provider) {
-            return res.status(200).json({ status: 'success', data: [] });
-        }
+    if (!(provider as any).business_id && provider.id) {
+      const { data: pRow } = await adminSupabase
+        .from("service_providers")
+        .select("business_id")
+        .eq("id", provider.id)
+        .maybeSingle();
+      if (pRow?.business_id) (provider as any).business_id = pRow.business_id;
+    }
 
-        // Include all provider rows linked to this employee user to avoid missing tasks
-        // when legacy duplicate provider records exist.
-        const { data: providerRows } = await adminSupabase
-            .from('service_providers')
-            .select('id')
-            .eq('user_id', userId);
-        (providerRows || []).forEach((row: any) => {
-            if (row?.id) providerIds.add(String(row.id));
-        });
-        if (provider?.id) providerIds.add(String(provider.id));
-        const providerIdList = Array.from(providerIds);
+    // 2. Today's date in the business timezone (matches queue entry_date)
+    let todayStr = new Date().toISOString().split("T")[0];
+    const bizId = (provider as any).business_id;
+    if (bizId) {
+      const { data: bizTz } = await adminSupabase
+        .from("businesses")
+        .select("timezone")
+        .eq("id", bizId)
+        .maybeSingle();
+      const tz = bizTz?.timezone || "UTC";
+      todayStr = new Date().toLocaleDateString("en-CA", { timeZone: tz });
+    }
 
-        if (!(provider as any).business_id && provider.id) {
-            const { data: pRow } = await adminSupabase
-                .from('service_providers')
-                .select('business_id')
-                .eq('id', provider.id)
-                .maybeSingle();
-            if (pRow?.business_id) (provider as any).business_id = pRow.business_id;
-        }
-
-        // 2. Today's date in the business timezone (matches queue entry_date)
-        let todayStr = new Date().toISOString().split('T')[0];
-        const bizId = (provider as any).business_id;
-        if (bizId) {
-            const { data: bizTz } = await adminSupabase
-                .from('businesses')
-                .select('timezone')
-                .eq('id', bizId)
-                .maybeSingle();
-            const tz = bizTz?.timezone || 'UTC';
-            todayStr = new Date().toLocaleDateString('en-CA', { timeZone: tz });
-        }
-
-        // 2. Fetch tasks via two safe queries (avoid PostgREST .or raw parser issues with UUIDs)
-        const baseSelect = `
+    // 2. Fetch tasks via two safe queries (avoid PostgREST .or raw parser issues with UUIDs)
+    const baseSelect = `
             *,
             queue_entry_services!inner (
                 *,
@@ -133,34 +159,43 @@ export const getMyTasks = async (req: Request, res: Response) => {
             )
         `;
 
-        const [primaryAssigned, serviceAssigned] = await Promise.all([
-            adminSupabase
-                .from('queue_entries')
-                .select(baseSelect)
-                .eq('assigned_to', userId)
-                .eq('entry_date', todayStr)
-                .in('status', ['serving', 'waiting']),
-            adminSupabase
-                .from('queue_entries')
-                .select(baseSelect)
-                .in('queue_entry_services.assigned_provider_id', providerIdList)
-                .eq('entry_date', todayStr)
-                .in('status', ['serving', 'waiting'])
-        ]);
+    const [primaryAssigned, serviceAssigned] = await Promise.all([
+      adminSupabase
+        .from("queue_entries")
+        .select(baseSelect)
+        .eq("assigned_to", userId)
+        .eq("entry_date", todayStr)
+        .in("status", ["serving", "waiting"]),
+      adminSupabase
+        .from("queue_entries")
+        .select(baseSelect)
+        .in("queue_entry_services.assigned_provider_id", providerIdList)
+        .eq("entry_date", todayStr)
+        .in("status", ["serving", "waiting"]),
+    ]);
 
-        if (primaryAssigned.error) throw primaryAssigned.error;
-        if (serviceAssigned.error) throw serviceAssigned.error;
+    if (primaryAssigned.error) throw primaryAssigned.error;
+    if (serviceAssigned.error) throw serviceAssigned.error;
 
-        const mergedMap = new Map<string, any>();
-        (primaryAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
-        (serviceAssigned.data || []).forEach((row: any) => mergedMap.set(row.id, row));
+    const mergedMap = new Map<string, any>();
+    (primaryAssigned.data || []).forEach((row: any) =>
+      mergedMap.set(row.id, row),
+    );
+    (serviceAssigned.data || []).forEach((row: any) =>
+      mergedMap.set(row.id, row),
+    );
 
-        // Fallback path for environments where nested ".in(queue_entry_services.assigned_provider_id, ...)"
-        // can under-return rows. Fetch task rows first, then fetch parent queue entries by ids.
-        if ((serviceAssigned.data || []).length === 0 && providerIdList.length > 0) {
-            const { data: serviceTaskRows, error: serviceTaskErr } = await adminSupabase
-                .from('queue_entry_services')
-                .select(`
+    // Fallback path for environments where nested ".in(queue_entry_services.assigned_provider_id, ...)"
+    // can under-return rows. Fetch task rows first, then fetch parent queue entries by ids.
+    if (
+      (serviceAssigned.data || []).length === 0 &&
+      providerIdList.length > 0
+    ) {
+      const { data: serviceTaskRows, error: serviceTaskErr } =
+        await adminSupabase
+          .from("queue_entry_services")
+          .select(
+            `
                     queue_entry_id,
                     task_status,
                     queue_entries!inner (
@@ -168,589 +203,691 @@ export const getMyTasks = async (req: Request, res: Response) => {
                         entry_date,
                         status
                     )
-                `)
-                .in('assigned_provider_id', providerIdList)
-                .in('task_status', ['pending', 'in_progress']);
+                `,
+          )
+          .in("assigned_provider_id", providerIdList)
+          .in("task_status", ["pending", "in_progress"]);
 
-            if (!serviceTaskErr) {
-                const eligibleEntryIds = Array.from(
-                    new Set(
-                        (serviceTaskRows || [])
-                            .filter((r: any) =>
-                                r?.queue_entries?.entry_date === todayStr &&
-                                ['waiting', 'serving'].includes(String(r?.queue_entries?.status || ''))
-                            )
-                            .map((r: any) => String(r.queue_entry_id))
-                            .filter(Boolean)
-                    )
-                );
+      if (!serviceTaskErr) {
+        const eligibleEntryIds = Array.from(
+          new Set(
+            (serviceTaskRows || [])
+              .filter(
+                (r: any) =>
+                  r?.queue_entries?.entry_date === todayStr &&
+                  ["waiting", "serving"].includes(
+                    String(r?.queue_entries?.status || ""),
+                  ),
+              )
+              .map((r: any) => String(r.queue_entry_id))
+              .filter(Boolean),
+          ),
+        );
 
-                if (eligibleEntryIds.length > 0) {
-                    const { data: fallbackEntries, error: fallbackErr } = await adminSupabase
-                        .from('queue_entries')
-                        .select(baseSelect)
-                        .in('id', eligibleEntryIds)
-                        .eq('entry_date', todayStr)
-                        .in('status', ['serving', 'waiting']);
-                    if (!fallbackErr) {
-                        (fallbackEntries || []).forEach((row: any) => mergedMap.set(row.id, row));
-                    }
-                }
-            }
+        if (eligibleEntryIds.length > 0) {
+          const { data: fallbackEntries, error: fallbackErr } =
+            await adminSupabase
+              .from("queue_entries")
+              .select(baseSelect)
+              .in("id", eligibleEntryIds)
+              .eq("entry_date", todayStr)
+              .in("status", ["serving", "waiting"]);
+          if (!fallbackErr) {
+            (fallbackEntries || []).forEach((row: any) =>
+              mergedMap.set(row.id, row),
+            );
+          }
         }
-
-        const providerIdSet = new Set(providerIdList);
-        const hasOpenWorkForProvider = (entry: any) => {
-            const services = entry.queue_entry_services || [];
-            const mine = services.filter((s: any) => providerIdSet.has(String(s.assigned_provider_id || '')));
-            if (mine.length > 0) {
-                return mine.some(
-                    (s: any) => s.task_status !== 'done' && s.task_status !== 'cancelled'
-                );
-            }
-            if (entry.assigned_to === userId) {
-                if (services.length === 0) {
-                    return entry.status === 'waiting' || entry.status === 'serving';
-                }
-                return services.some(
-                    (s: any) => s.task_status !== 'done' && s.task_status !== 'cancelled'
-                );
-            }
-            return false;
-        };
-
-        const data = Array.from(mergedMap.values())
-            .filter(hasOpenWorkForProvider)
-            .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
-
-        res.status(200).json({
-            status: 'success',
-            data: data || []
-        });
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+      }
     }
+
+    const providerIdSet = new Set(providerIdList);
+    const hasOpenWorkForProvider = (entry: any) => {
+      const services = entry.queue_entry_services || [];
+      const mine = services.filter((s: any) =>
+        providerIdSet.has(String(s.assigned_provider_id || "")),
+      );
+      if (mine.length > 0) {
+        return mine.some(
+          (s: any) => s.task_status !== "done" && s.task_status !== "cancelled",
+        );
+      }
+      if (entry.assigned_to === userId) {
+        if (services.length === 0) {
+          return entry.status === "waiting" || entry.status === "serving";
+        }
+        return services.some(
+          (s: any) => s.task_status !== "done" && s.task_status !== "cancelled",
+        );
+      }
+      return false;
+    };
+
+    const data = Array.from(mergedMap.values())
+      .filter(hasOpenWorkForProvider)
+      .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
+
+    res.status(200).json({
+      status: "success",
+      data: data || [],
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const createQueue = async (req: Request, res: Response) => {
-    try {
-        const { name, description, service_id, business_id } = req.body;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { name, description, service_id, business_id } = req.body;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        // Basic validation
-        if (!name) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Queue name is required'
-            });
-        }
-
-        const userId = req.user?.id;
-
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        // 1. Link to the correct business
-        let targetBusinessId = business_id;
-
-        if (!targetBusinessId) {
-            // Fallback: Find the first business owned by this user
-            console.log(`[createQueue] No business_id provided, looking for business for owner: ${userId}`);
-            const { data: businesses, error: businessError } = await supabase
-                .from('businesses')
-                .select('id')
-                .eq('owner_id', userId);
-
-            if (businessError || !businesses || businesses.length === 0) {
-                return res.status(404).json({
-                    status: 'error',
-                    message: 'No business found for this user. Create a business first.'
-                });
-            }
-            targetBusinessId = businesses[0].id;
-        } else {
-            // Verify ownership of the provided business_id
-            const { data: biz, error: bizError } = await supabase
-                .from('businesses')
-                .select('id')
-                .eq('id', targetBusinessId)
-                .eq('owner_id', userId)
-                .single();
-
-            if (bizError || !biz) {
-                return res.status(403).json({
-                    status: 'error',
-                    message: 'Business not found or access denied'
-                });
-            }
-        }
-
-        console.log(`[createQueue] Using business: ${targetBusinessId}. Proceeding to create queue: ${name}`);
-
-        const { data, error } = await supabase
-            .from('queues')
-            .insert([
-                {
-                    business_id: targetBusinessId,
-                    name,
-                    description,
-                    service_id,
-                    status: 'open',
-                    current_wait_time_minutes: 0
-                }
-            ])
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        res.status(201).json({
-            status: 'success',
-            message: 'Queue created successfully',
-            data
-        });
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+    // Basic validation
+    if (!name) {
+      return res.status(400).json({
+        status: "error",
+        message: "Queue name is required",
+      });
     }
+
+    const userId = req.user?.id;
+
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
+
+    // 1. Link to the correct business
+    let targetBusinessId = business_id;
+
+    if (!targetBusinessId) {
+      // Fallback: Find the first business owned by this user
+      console.log(
+        `[createQueue] No business_id provided, looking for business for owner: ${userId}`,
+      );
+      const { data: businesses, error: businessError } = await supabase
+        .from("businesses")
+        .select("id")
+        .eq("owner_id", userId);
+
+      if (businessError || !businesses || businesses.length === 0) {
+        return res.status(404).json({
+          status: "error",
+          message: "No business found for this user. Create a business first.",
+        });
+      }
+      targetBusinessId = businesses[0].id;
+    } else {
+      // Verify ownership of the provided business_id
+      const { data: biz, error: bizError } = await supabase
+        .from("businesses")
+        .select("id")
+        .eq("id", targetBusinessId)
+        .eq("owner_id", userId)
+        .single();
+
+      if (bizError || !biz) {
+        return res.status(403).json({
+          status: "error",
+          message: "Business not found or access denied",
+        });
+      }
+    }
+
+    console.log(
+      `[createQueue] Using business: ${targetBusinessId}. Proceeding to create queue: ${name}`,
+    );
+
+    const { data, error } = await supabase
+      .from("queues")
+      .insert([
+        {
+          business_id: targetBusinessId,
+          name,
+          description,
+          service_id,
+          status: "open",
+          current_wait_time_minutes: 0,
+        },
+      ])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({
+      status: "success",
+      message: "Queue created successfully",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
-import fs from 'fs';
+import fs from "fs";
 
 export const joinQueue = async (req: Request, res: Response) => {
-    try {
-        const { queue_id, customer_name, phone, service_ids, entry_source, appointment_id, provider_id } = req.body;
-        const user_id = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const {
+      queue_id,
+      customer_name,
+      phone,
+      service_ids,
+      entry_source,
+      appointment_id,
+      provider_id,
+    } = req.body;
+    const user_id = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        const logState = (msg: string) => {
-            fs.appendFileSync('join_debug.log', `[${new Date().toISOString()}] ${msg}\n`);
-        };
+    const logState = (msg: string) => {
+      fs.appendFileSync(
+        "join_debug.log",
+        `[${new Date().toISOString()}] ${msg}\n`,
+      );
+    };
 
-        logState(`Join attempt for Queue: ${queue_id} | Name: ${customer_name}`);
+    logState(`Join attempt for Queue: ${queue_id} | Name: ${customer_name}`);
 
-        if (!queue_id) {
-            return res.status(400).json({ status: 'error', message: 'Queue ID is required' });
-        }
-
-        if (!user_id && !customer_name && !appointment_id) {
-            return res.status(400).json({ status: 'error', message: 'User ID, Customer Name, or Appointment ID is required' });
-        }
-
-        // 0. Get Queue and Business info early
-        const { data: queueInfo, error: queueInfoError } = await supabase
-            .from('queues')
-            .select('*, businesses(name, open_time, close_time, is_closed, timezone)')
-            .eq('id', queue_id)
-            .single();
-
-        if (queueInfoError || !queueInfo) throw queueInfoError || new Error("Queue not found");
-
-        const timezone = queueInfo.businesses?.timezone || 'UTC';
-        const todayStr = getLocalDateString(timezone);
-
-        // --- STRONG APP RULE: Appointment Validation ---
-        if (appointment_id) {
-            const { data: appt, error: apptError } = await supabase
-                .from('appointments')
-                .select('id, start_time, status, business_id')
-                .eq('id', appointment_id)
-                .single();
-
-            if (apptError || !appt) {
-                return res.status(404).json({ status: 'error', message: 'Appointment not found' });
-            }
-
-            const apptDateStr = getLocalDateString(timezone, new Date(appt.start_time));
-            const now = new Date();
-            const gracePeriodMins = 30;
-            const isExpired = now > new Date(new Date(appt.start_time).getTime() + gracePeriodMins * 60000);
-
-            if (apptDateStr !== todayStr) {
-                return res.status(400).json({ status: 'error', message: 'Please book a new appointment. This appointment is not for today.' });
-            }
-
-            if (!['scheduled', 'confirmed'].includes(appt.status)) {
-                return res.status(400).json({ status: 'error', message: `Please book a new appointment. This appointment status is ${appt.status}.` });
-            }
-
-            if (isExpired) {
-                return res.status(400).json({ status: 'error', message: 'Please book a new appointment. Your appointment time has passed the 30-minute grace period.' });
-            }
-        }
-        // ----------------------------------------------
-
-        // Check Business Hours (Basic Open/Closed)
-        if (queueInfo?.businesses) {
-            const status = isBusinessOpen(queueInfo.businesses);
-            if (!status.isOpen) {
-                return res.status(400).json({ status: 'error', message: status.message });
-            }
-        }
-
-        // 1. Calculate current Wait Time for Closing Time Protection
-        const { data: entriesAhead } = await supabase
-            .from('queue_entries')
-            .select('status, total_duration_minutes, served_at, joined_at')
-            .eq('queue_id', queue_id)
-            .eq('entry_date', todayStr)
-            .in('status', ['waiting', 'serving']);
-
-        let currentWaitTimeTotal = 0;
-        const nowMs = Date.now();
-        entriesAhead?.forEach((e: any) => {
-            const plannedDuration = Number(e.total_duration_minutes || 10);
-            if (e.status === 'serving') {
-                // Count only the remaining time for currently serving guests.
-                const startedAt = e.served_at || e.joined_at;
-                const startedAtMs = startedAt ? new Date(startedAt).getTime() : nowMs;
-                const elapsedMins = Math.max(0, Math.round((nowMs - startedAtMs) / 60000));
-                const remainingMins = Math.max(0, plannedDuration - elapsedMins);
-                currentWaitTimeTotal += remainingMins;
-                return;
-            }
-            currentWaitTimeTotal += plannedDuration;
-        });
-
-        // Fetch active providers count to divide wait time (Capacity)
-        const { count: activeProviders } = await supabase
-            .from('service_providers')
-            .select('*', { count: 'exact', head: true })
-            .eq('business_id', queueInfo.business_id)
-            .eq('is_active', true);
-
-        const providerCount = Math.max(1, activeProviders || 1);
-        const currentWaitTime = Math.round(currentWaitTimeTotal / providerCount);
-
-        // Fetch selected services for duration
-        let selectedServices = [];
-        if (service_ids && service_ids.length > 0) {
-            const { data: sData } = await supabase
-                .from('services')
-                .select('id, name, duration_minutes, price')
-                .in('id', service_ids);
-            selectedServices = sData || [];
-        }
-
-        const serviceDuration = selectedServices.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0);
-
-        // 2. Closing Time Protection Logic
-        if (queueInfo?.businesses) {
-            logState(`Checking capacity: Wait=${currentWaitTime}, Service=${serviceDuration}, Providers=${providerCount}`);
-            logState(`Business Data: ${JSON.stringify(queueInfo.businesses)}`);
-
-            const closingProtection = require('../utils/timeUtils').canCompleteBeforeClosing(
-                queueInfo.businesses,
-                currentWaitTime,
-                serviceDuration,
-                10 // 10 min buffer as requested
-            );
-
-            if (!closingProtection.canJoin) {
-                logState(`REJECTED: ${closingProtection.message}`);
-                return res.status(400).json({
-                    status: 'error',
-                    message: closingProtection.message || `We’re fully booked for today. Please book for tomorrow.`
-                });
-            }
-            logState(`Capacity check PASSED.`);
-        }
-
-        // 3. Get next position
-        const { data: maxPosData } = await supabase
-            .from('queue_entries')
-            .select('position')
-            .eq('queue_id', queue_id)
-            .eq('entry_date', todayStr)
-            .order('position', { ascending: false })
-            .limit(1);
-
-        const nextPosition = (maxPosData && maxPosData.length > 0) ? maxPosData[0].position + 1 : 1;
-        const ticket_number = `Q-${nextPosition}`;
-        const status_token = crypto.randomUUID();
-        console.log(`[joinQueue] Next position: ${nextPosition}, Ticket number: ${ticket_number}`);
-
-        const total_price = selectedServices.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0);
-        const serviceNamesDisplay = selectedServices.map((s: any) => s.name).join(', ') || 'General';
-        console.log(`[joinQueue] Total price: ${total_price}, Service names display: ${serviceNamesDisplay}`);
-
-        // Resolve employee user_id for entry-level assignment when provider is preselected.
-        let assignedToUserId: string | null = null;
-        if (provider_id) {
-            const { data: providerRow } = await supabase
-                .from('service_providers')
-                .select('id, user_id')
-                .eq('id', provider_id)
-                .maybeSingle();
-            assignedToUserId = providerRow?.user_id || null;
-        }
-
-        // 4. Insert Entry with entry_source
-        console.log(`[joinQueue] Inserting new queue entry.`);
-        const { data, error } = await supabase
-            .from('queue_entries')
-            .insert([
-                {
-                    queue_id,
-                    user_id: user_id || null,
-                    customer_name: customer_name || 'Guest',
-                    phone: phone || null,
-                    service_name: serviceNamesDisplay,
-                    status: 'waiting',
-                    position: nextPosition,
-                    ticket_number,
-                    status_token,
-                    entry_date: todayStr,
-                    total_price,
-                    total_duration_minutes: serviceDuration,
-                    entry_source: entry_source || 'online',
-                    assigned_provider_id: provider_id || null,
-                    assigned_to: assignedToUserId
-                }
-            ])
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // Junction table insertion
-        if (selectedServices.length > 0) {
-            const junctionEntries = selectedServices.map((service: any) => ({
-                queue_entry_id: data.id,
-                service_id: service.id,
-                price: service.price || 0,
-                duration_minutes: service.duration_minutes || 0,
-                assigned_provider_id: provider_id || null
-            }));
-            await supabase.from('queue_entry_services').insert(junctionEntries);
-        } else {
-            // Provide a bare-minimum service slot for manual additions
-            await supabase.from('queue_entry_services').insert([{
-                queue_entry_id: data.id,
-                service_id: null,
-                assigned_provider_id: provider_id || null,
-                price: queueInfo.businesses?.default_price || 0,
-                duration_minutes: queueInfo.businesses?.default_duration || 5
-            }]);
-        }
-
-        // Send Notifications
-        const isOnline = (entry_source || 'online') === 'online';
-        const businessName = queueInfo?.businesses?.name || 'the salon';
-
-        if (isOnline && phone) {
-            // 1. Join Notification
-            await notificationService.sendWhatsApp(phone, `Thank you for joining the queue at ${businessName}. We’ll notify you as your turn approaches.`);
-
-            // 2. High Demand Notification (if delay >= 15)
-            if (currentWaitTime >= 15) {
-                await notificationService.sendWhatsApp(phone, `We’re currently serving guests and operating at full capacity. Thank you for your patience.`);
-            }
-
-            // Update notified_join
-            await supabase
-                .from('queue_entries')
-                .update({ notified_join: true })
-                .eq('id', data.id);
-        }
-
-        res.status(201).json({
-            status: 'success',
-            message: 'Joined queue successfully',
-            data: {
-                ...data,
-                token: status_token,
-                position: nextPosition,
-                wait_time: currentWaitTime,
-                status_url: `${req.headers.origin || ''}/status?token=${status_token}`
-            }
-        });
-
-    } catch (error: any) {
-        console.error('Join Queue Error:', error);
-        res.status(500).json({ status: 'error', message: error.message });
+    if (!queue_id) {
+      return res
+        .status(400)
+        .json({ status: "error", message: "Queue ID is required" });
     }
+
+    if (!user_id && !customer_name && !appointment_id) {
+      return res
+        .status(400)
+        .json({
+          status: "error",
+          message: "User ID, Customer Name, or Appointment ID is required",
+        });
+    }
+
+    // 0. Get Queue and Business info early
+    const { data: queueInfo, error: queueInfoError } = await supabase
+      .from("queues")
+      .select("*, businesses(name, open_time, close_time, is_closed, timezone)")
+      .eq("id", queue_id)
+      .single();
+
+    if (queueInfoError || !queueInfo)
+      throw queueInfoError || new Error("Queue not found");
+
+    const timezone = queueInfo.businesses?.timezone || "UTC";
+    const todayStr = getLocalDateString(timezone);
+
+    // --- STRONG APP RULE: Appointment Validation ---
+    if (appointment_id) {
+      const { data: appt, error: apptError } = await supabase
+        .from("appointments")
+        .select("id, start_time, status, business_id")
+        .eq("id", appointment_id)
+        .single();
+
+      if (apptError || !appt) {
+        return res
+          .status(404)
+          .json({ status: "error", message: "Appointment not found" });
+      }
+
+      const apptDateStr = getLocalDateString(
+        timezone,
+        new Date(appt.start_time),
+      );
+      const now = new Date();
+      const gracePeriodMins = 30;
+      const isExpired =
+        now >
+        new Date(new Date(appt.start_time).getTime() + gracePeriodMins * 60000);
+
+      if (apptDateStr !== todayStr) {
+        return res
+          .status(400)
+          .json({
+            status: "error",
+            message:
+              "Please book a new appointment. This appointment is not for today.",
+          });
+      }
+
+      if (!["scheduled", "confirmed"].includes(appt.status)) {
+        return res
+          .status(400)
+          .json({
+            status: "error",
+            message: `Please book a new appointment. This appointment status is ${appt.status}.`,
+          });
+      }
+
+      if (isExpired) {
+        return res
+          .status(400)
+          .json({
+            status: "error",
+            message:
+              "Please book a new appointment. Your appointment time has passed the 30-minute grace period.",
+          });
+      }
+    }
+    // ----------------------------------------------
+
+    // Check Business Hours (Basic Open/Closed)
+    if (queueInfo?.businesses) {
+      const status = isBusinessOpen(queueInfo.businesses);
+      if (!status.isOpen) {
+        return res
+          .status(400)
+          .json({ status: "error", message: status.message });
+      }
+    }
+
+    // 1. Calculate current Wait Time for Closing Time Protection
+    const { data: entriesAhead } = await supabase
+      .from("queue_entries")
+      .select("status, total_duration_minutes, served_at, joined_at")
+      .eq("queue_id", queue_id)
+      .eq("entry_date", todayStr)
+      .in("status", ["waiting", "serving"]);
+
+    let currentWaitTimeTotal = 0;
+    const nowMs = Date.now();
+    entriesAhead?.forEach((e: any) => {
+      const plannedDuration = Number(e.total_duration_minutes || 10);
+      if (e.status === "serving") {
+        // Count only the remaining time for currently serving guests.
+        const startedAt = e.served_at || e.joined_at;
+        const startedAtMs = startedAt ? new Date(startedAt).getTime() : nowMs;
+        const elapsedMins = Math.max(
+          0,
+          Math.round((nowMs - startedAtMs) / 60000),
+        );
+        const remainingMins = Math.max(0, plannedDuration - elapsedMins);
+        currentWaitTimeTotal += remainingMins;
+        return;
+      }
+      currentWaitTimeTotal += plannedDuration;
+    });
+
+    // Fetch active providers count to divide wait time (Capacity)
+    const { count: activeProviders } = await supabase
+      .from("service_providers")
+      .select("*", { count: "exact", head: true })
+      .eq("business_id", queueInfo.business_id)
+      .eq("is_active", true);
+
+    const providerCount = Math.max(1, activeProviders || 1);
+    const currentWaitTime = Math.round(currentWaitTimeTotal / providerCount);
+
+    // Fetch selected services for duration
+    let selectedServices = [];
+    if (service_ids && service_ids.length > 0) {
+      const { data: sData } = await supabase
+        .from("services")
+        .select("id, name, duration_minutes, price")
+        .in("id", service_ids);
+      selectedServices = sData || [];
+    }
+
+    const serviceDuration = selectedServices.reduce(
+      (acc: number, s: any) => acc + (s.duration_minutes || 0),
+      0,
+    );
+
+    // 2. Closing Time Protection Logic
+    if (queueInfo?.businesses) {
+      logState(
+        `Checking capacity: Wait=${currentWaitTime}, Service=${serviceDuration}, Providers=${providerCount}`,
+      );
+      logState(`Business Data: ${JSON.stringify(queueInfo.businesses)}`);
+
+      const closingProtection =
+        require("../utils/timeUtils").canCompleteBeforeClosing(
+          queueInfo.businesses,
+          currentWaitTime,
+          serviceDuration,
+          10, // 10 min buffer as requested
+        );
+
+      if (!closingProtection.canJoin) {
+        logState(`REJECTED: ${closingProtection.message}`);
+        return res.status(400).json({
+          status: "error",
+          message:
+            closingProtection.message ||
+            `We’re fully booked for today. Please book for tomorrow.`,
+        });
+      }
+      logState(`Capacity check PASSED.`);
+    }
+
+    // 3. Get next position
+    const { data: maxPosData } = await supabase
+      .from("queue_entries")
+      .select("position")
+      .eq("queue_id", queue_id)
+      .eq("entry_date", todayStr)
+      .order("position", { ascending: false })
+      .limit(1);
+
+    const nextPosition =
+      maxPosData && maxPosData.length > 0 ? maxPosData[0].position + 1 : 1;
+    const ticket_number = `Q-${nextPosition}`;
+    const status_token = crypto.randomUUID();
+    console.log(
+      `[joinQueue] Next position: ${nextPosition}, Ticket number: ${ticket_number}`,
+    );
+
+    const total_price = selectedServices.reduce(
+      (acc: number, s: any) => acc + (Number(s.price) || 0),
+      0,
+    );
+    const serviceNamesDisplay =
+      selectedServices.map((s: any) => s.name).join(", ") || "General";
+    console.log(
+      `[joinQueue] Total price: ${total_price}, Service names display: ${serviceNamesDisplay}`,
+    );
+
+    // Resolve employee user_id for entry-level assignment when provider is preselected.
+    let assignedToUserId: string | null = null;
+    if (provider_id) {
+      const { data: providerRow } = await supabase
+        .from("service_providers")
+        .select("id, user_id")
+        .eq("id", provider_id)
+        .maybeSingle();
+      assignedToUserId = providerRow?.user_id || null;
+    }
+
+    // 4. Insert Entry with entry_source
+    console.log(`[joinQueue] Inserting new queue entry.`);
+    const { data, error } = await supabase
+      .from("queue_entries")
+      .insert([
+        {
+          queue_id,
+          user_id: user_id || null,
+          customer_name: customer_name || "Guest",
+          phone: phone || null,
+          service_name: serviceNamesDisplay,
+          status: "waiting",
+          position: nextPosition,
+          ticket_number,
+          status_token,
+          entry_date: todayStr,
+          total_price,
+          total_duration_minutes: serviceDuration,
+          entry_source: entry_source || "online",
+          assigned_provider_id: provider_id || null,
+          assigned_to: assignedToUserId,
+        },
+      ])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // Junction table insertion
+    if (selectedServices.length > 0) {
+      const junctionEntries = selectedServices.map((service: any) => ({
+        queue_entry_id: data.id,
+        service_id: service.id,
+        price: service.price || 0,
+        duration_minutes: service.duration_minutes || 0,
+        assigned_provider_id: provider_id || null,
+      }));
+      await supabase.from("queue_entry_services").insert(junctionEntries);
+    } else {
+      // Provide a bare-minimum service slot for manual additions
+      await supabase.from("queue_entry_services").insert([
+        {
+          queue_entry_id: data.id,
+          service_id: null,
+          assigned_provider_id: provider_id || null,
+          price: queueInfo.businesses?.default_price || 0,
+          duration_minutes: queueInfo.businesses?.default_duration || 5,
+        },
+      ]);
+    }
+
+    // Send Notifications
+    const isOnline = (entry_source || "online") === "online";
+    const businessName = queueInfo?.businesses?.name || "the salon";
+
+    if (isOnline && phone) {
+      // 1. Join Notification
+      await notificationService.sendWhatsApp(
+        phone,
+        `Thank you for joining the queue at ${businessName}. We’ll notify you as your turn approaches.`,
+      );
+
+      // 2. High Demand Notification (if delay >= 15)
+      if (currentWaitTime >= 15) {
+        await notificationService.sendWhatsApp(
+          phone,
+          `We’re currently serving guests and operating at full capacity. Thank you for your patience.`,
+        );
+      }
+
+      // Update notified_join
+      await supabase
+        .from("queue_entries")
+        .update({ notified_join: true })
+        .eq("id", data.id);
+    }
+
+    res.status(201).json({
+      status: "success",
+      message: "Joined queue successfully",
+      data: {
+        ...data,
+        token: status_token,
+        position: nextPosition,
+        wait_time: currentWaitTime,
+        status_url: `${req.headers.origin || ""}/status?token=${status_token}`,
+      },
+    });
+  } catch (error: any) {
+    console.error("Join Queue Error:", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const updateQueue = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const { name, description, status, current_wait_time_minutes } = req.body;
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const { name, description, status, current_wait_time_minutes } = req.body;
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        // We need to ensure the queue belongs to a business owned by the user.
-        // The RLS policy we will add: "Business owners can update queues for their business"
-        // But let's verification here too.
-
-        // Update directly. If RLS works, it will only update if user is owner.
-        // However, checking existence first gives better error messages (404 vs 403).
-
-        const { data, error } = await supabase
-            .from('queues')
-            .update({ name, description, status, current_wait_time_minutes })
-            .eq('id', id)
-            // Implicit check: join business to check owner? Supabase simple update relies on RLS.
-            // Let's rely on RLS + the fact we will add a policy.
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // If no data returned, either it doesn't exist or RLS blocked it
-        if (!data) {
-            return res.status(404).json({
-                status: 'error',
-                message: 'Queue not found or you do not have permission to update it'
-            });
-        }
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Queue updated successfully',
-            data
-        });
-
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
+
+    // We need to ensure the queue belongs to a business owned by the user.
+    // The RLS policy we will add: "Business owners can update queues for their business"
+    // But let's verification here too.
+
+    // Update directly. If RLS works, it will only update if user is owner.
+    // However, checking existence first gives better error messages (404 vs 403).
+
+    const { data, error } = await supabase
+      .from("queues")
+      .update({ name, description, status, current_wait_time_minutes })
+      .eq("id", id)
+      // Implicit check: join business to check owner? Supabase simple update relies on RLS.
+      // Let's rely on RLS + the fact we will add a policy.
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // If no data returned, either it doesn't exist or RLS blocked it
+    if (!data) {
+      return res.status(404).json({
+        status: "error",
+        message: "Queue not found or you do not have permission to update it",
+      });
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: "Queue updated successfully",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
 export const deleteQueue = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        const { error, count } = await supabase
-            .from('queues')
-            .delete({ count: 'exact' })
-            .eq('id', id);
-
-        if (error) throw error;
-
-        if (count === 0) {
-            return res.status(404).json({
-                status: 'error',
-                message: 'Queue not found or already deleted'
-            });
-        }
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Queue deleted successfully'
-        });
-
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
+
+    const { error, count } = await supabase
+      .from("queues")
+      .delete({ count: "exact" })
+      .eq("id", id);
+
+    if (error) throw error;
+
+    if (count === 0) {
+      return res.status(404).json({
+        status: "error",
+        message: "Queue not found or already deleted",
+      });
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: "Queue deleted successfully",
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
 export const getMyQueues = async (req: Request, res: Response) => {
-    try {
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
 
-        // Get user's first business to determine timezone
-        const { data: userBiz } = await supabase.from('businesses').select('timezone').eq('owner_id', userId).limit(1).single();
-        const timezone = userBiz?.timezone || 'UTC';
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
-        console.log(`Fetching queues for user ${userId}, today is ${todayStr}`);
+    // Get user's first business to determine timezone
+    const { data: userBiz } = await supabase
+      .from("businesses")
+      .select("timezone")
+      .eq("owner_id", userId)
+      .limit(1)
+      .single();
+    const timezone = userBiz?.timezone || "UTC";
+    const todayStr = new Date().toLocaleDateString("en-CA", {
+      timeZone: timezone,
+    });
+    console.log(`Fetching queues for user ${userId}, today is ${todayStr}`);
 
-        // Get queues where the business owner is ME
-        // We fetch the count of entries. Filtering on queue_entries columns in the main query
-        // will filter out the parent 'queues' if no entries match.
-        // To show empty queues, we'll fetch them all first.
-        const { data, error } = await supabase
-            .from('queues')
-            .select(`
+    // Get queues where the business owner is ME
+    // We fetch the count of entries. Filtering on queue_entries columns in the main query
+    // will filter out the parent 'queues' if no entries match.
+    // To show empty queues, we'll fetch them all first.
+    const { data, error } = await supabase
+      .from("queues")
+      .select(
+        `
                 *,
                 businesses!inner (id, owner_id, name),
                 services (*),
                 queue_entries(count)
-            `)
-            .eq('businesses.owner_id', userId)
-            // Removed filters on queue_entries here to prevent hiding empty queues
-            .order('created_at', { ascending: false });
+            `,
+      )
+      .eq("businesses.owner_id", userId)
+      // Removed filters on queue_entries here to prevent hiding empty queues
+      .order("created_at", { ascending: false });
 
-        if (error) throw error;
+    if (error) throw error;
 
-        console.log(`[getMyQueues] User: ${userId} | Found ${data?.length} queues`);
-        if (data && data.length > 0) {
-            console.log(`[getMyQueues] Sample Business Owner: ${data[0].businesses.owner_id}`);
-        }
-
-        res.status(200).json({
-            status: 'success',
-            data
-        });
-
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+    console.log(`[getMyQueues] User: ${userId} | Found ${data?.length} queues`);
+    if (data && data.length > 0) {
+      console.log(
+        `[getMyQueues] Sample Business Owner: ${data[0].businesses.owner_id}`,
+      );
     }
+
+    res.status(200).json({
+      status: "success",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
 export const getTodayQueue = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params; // queue_id
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params; // queue_id
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
 
-        // Get current date in YYYY-MM-DD format
-        // 0. Get queue business_id and timezone
-        const { data: qData } = await supabase
-            .from('queues')
-            .select('business_id, businesses(timezone)')
-            .eq('id', id)
-            .single();
+    // Get current date in YYYY-MM-DD format
+    // 0. Get queue business_id and timezone
+    const { data: qData } = await supabase
+      .from("queues")
+      .select("business_id, businesses(timezone)")
+      .eq("id", id)
+      .single();
 
-        if (!qData) {
-            return res.status(404).json({ status: 'error', message: 'Queue not found' });
-        }
+    if (!qData) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Queue not found" });
+    }
 
-        const timezone = qData.businesses?.timezone || 'UTC';
-        const todayStr = getLocalDateString(timezone);
+    const timezone = qData.businesses?.timezone || "UTC";
+    const todayStr = getLocalDateString(timezone);
 
-        if (qData) {
-            const now = new Date();
-            const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
-            // Start of today in IST
-            const startOfToday = new Date();
-            startOfToday.setHours(0, 0, 0, 0);
+    if (qData) {
+      const now = new Date();
+      const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
+      // Start of today in IST
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
 
-            // 1.5 Auto-Process No-Shows for Appointments (30-min grace)
-            // Find today's appointments that are past due
-            const { data: expiredAppts } = await supabase
-                .from('appointments')
-                .select(`
+      // 1.5 Auto-Process No-Shows for Appointments (30-min grace)
+      // Find today's appointments that are past due
+      const { data: expiredAppts } = await supabase
+        .from("appointments")
+        .select(
+          `
                     id, 
                     user_id, 
                     guest_name, 
@@ -763,74 +900,103 @@ export const getTodayQueue = async (req: Request, res: Response) => {
                         duration_minutes,
                         services!service_id (id, name)
                     )
-                `)
-                .eq('business_id', qData.business_id)
-                .in('status', ['scheduled', 'confirmed'])
-                .is('checked_in_at', null) // CRITICAL: Stop flipping back restored/checked-in guests
-                .lt('start_time', thirtyMinsAgo)
-                .gt('start_time', startOfToday.toISOString()); // Only today's scheduled
+                `,
+        )
+        .eq("business_id", qData.business_id)
+        .in("status", ["scheduled", "confirmed"])
+        .is("checked_in_at", null) // CRITICAL: Stop flipping back restored/checked-in guests
+        .lt("start_time", thirtyMinsAgo)
+        .gt("start_time", startOfToday.toISOString()); // Only today's scheduled
 
+      if (expiredAppts && expiredAppts.length > 0) {
+        for (const appt of expiredAppts) {
+          const { data: existingEntry } = await supabase
+            .from("queue_entries")
+            .select("id, status")
+            .eq("appointment_id", appt.id)
+            .single();
 
-            if (expiredAppts && expiredAppts.length > 0) {
-                for (const appt of expiredAppts) {
-                    const { data: existingEntry } = await supabase
-                        .from('queue_entries')
-                        .select('id, status')
-                        .eq('appointment_id', appt.id)
-                        .single();
+          // CRITICAL FIX: Only auto-no-show if NO entry exists OR if entry is still just 'waiting'
+          // AND NOT manually handled or restored.
+          // If entry is 'serving', 'completed', or has been manually handled, SKIP auto-no-show.
+          if (!existingEntry) {
+            const total_duration =
+              (appt as any).appointment_services?.reduce(
+                (acc: number, s: any) => acc + (s.duration_minutes || 0),
+                0,
+              ) || 0;
+            const total_price =
+              (appt as any).appointment_services?.reduce(
+                (acc: number, s: any) => acc + (Number(s.price) || 0),
+                0,
+              ) || 0;
+            const serviceNames =
+              (appt as any).appointment_services
+                ?.map((s: any) => s.services?.name)
+                .filter(Boolean)
+                .join(", ") || "Appointment Service";
 
-                    // CRITICAL FIX: Only auto-no-show if NO entry exists OR if entry is still just 'waiting' 
-                    // AND NOT manually handled or restored.
-                    // If entry is 'serving', 'completed', or has been manually handled, SKIP auto-no-show.
-                    if (!existingEntry) {
-                        const total_duration = (appt as any).appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
-                        const total_price = (appt as any).appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
-                        const serviceNames = (appt as any).appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Appointment Service';
+            // 1. Mark Appointment as No-Show
+            await supabase
+              .from("appointments")
+              .update({ status: "no_show" })
+              .eq("id", appt.id);
 
-                        // 1. Mark Appointment as No-Show
-                        await supabase.from('appointments').update({ status: 'no_show' }).eq('id', appt.id);
-
-                        // 2. Insert No-Show Queue Entry
-                        await supabase.from('queue_entries').insert([{
-                            queue_id: id,
-                            appointment_id: appt.id,
-                            user_id: appt.user_id,
-                            customer_name: (appt as any).profiles?.full_name || (appt as any).guest_name || 'Guest',
-                            phone: (appt as any).profiles?.phone || (appt as any).guest_phone || null,
-                            service_name: serviceNames,
-                            status: 'no_show',
-                            entry_date: todayStr,
-                            total_price,
-                            total_duration_minutes: total_duration,
-                            position: 0,
-                            ticket_number: 'A-NS'
-                        }]);
-                    } else if (existingEntry.status === 'waiting') {
-                        // If it's still waiting and past due, mark both as no-show
-                        await supabase.from('appointments').update({ status: 'no_show' }).eq('id', appt.id);
-                        await supabase.from('queue_entries').update({ status: 'no_show' }).eq('id', existingEntry.id);
-                    }
-                    // Else: If status is 'serving', 'completed', 'no_show' (already), or 'restored' (waiting but handled), we don't flip it.
-                }
-            }
-
+            // 2. Insert No-Show Queue Entry
+            await supabase.from("queue_entries").insert([
+              {
+                queue_id: id,
+                appointment_id: appt.id,
+                user_id: appt.user_id,
+                customer_name:
+                  (appt as any).profiles?.full_name ||
+                  (appt as any).guest_name ||
+                  "Guest",
+                phone:
+                  (appt as any).profiles?.phone ||
+                  (appt as any).guest_phone ||
+                  null,
+                service_name: serviceNames,
+                status: "no_show",
+                entry_date: todayStr,
+                total_price,
+                total_duration_minutes: total_duration,
+                position: 0,
+                ticket_number: "A-NS",
+              },
+            ]);
+          } else if (existingEntry.status === "waiting") {
+            // If it's still waiting and past due, mark both as no-show
+            await supabase
+              .from("appointments")
+              .update({ status: "no_show" })
+              .eq("id", appt.id);
+            await supabase
+              .from("queue_entries")
+              .update({ status: "no_show" })
+              .eq("id", existingEntry.id);
+          }
+          // Else: If status is 'serving', 'completed', 'no_show' (already), or 'restored' (waiting but handled), we don't flip it.
         }
+      }
+    }
 
-        // 1.6 Auto-Process Skipped Entries (7 minute rule)
-        // If status is 'serving' (called) but served_at + 7m < now, set to 'skipped'
-        // This only applies to entries where NO work has started (service_started_at is null)
-        const sevenMinsAgo = new Date(Date.now() - 7 * 60000).toISOString();
-        await supabase
-            .from('queue_entries')
-            .update({ status: 'skipped' })
-            .eq('queue_id', id)
-            .eq('status', 'serving')
-            .is('service_started_at', null)
-            .lt('served_at', sevenMinsAgo);
+    // 1.6 Auto-Process Skipped Entries (7 minute rule)
+    // If status is 'serving' (called) but served_at + 7m < now, set to 'skipped'
+    // This only applies to entries where NO work has started (service_started_at is null)
+    const sevenMinsAgo = new Date(Date.now() - 7 * 60000).toISOString();
+    await supabase
+      .from("queue_entries")
+      .update({ status: "skipped" })
+      .eq("queue_id", id)
+      .eq("status", "serving")
+      .is("service_started_at", null)
+      .lt("served_at", sevenMinsAgo);
 
-        const { data, error } = await supabase
-            .from('queue_entries')
-            .select(`
+    const { data, error } = await supabase
+      .from("queue_entries")
+      .select(
+        `
                 *,
                 profiles:user_id (ui_language),
                 appointments ( id, start_time, checked_in_at ),
@@ -850,75 +1016,92 @@ export const getTodayQueue = async (req: Request, res: Response) => {
                     services!service_id (id, name),
                     service_providers!assigned_provider_id (id, name)
                 )
-            `)
-            .eq('queue_id', id)
-            .eq('entry_date', todayStr)
-            .or('status.in.(waiting,serving,no_show),and(status.eq.completed,or(payment_method.eq.unpaid,payment_method.is.null))')
-            .order('position', { ascending: true });
+            `,
+      )
+      .eq("queue_id", id)
+      .eq("entry_date", todayStr)
+      .or(
+        "status.in.(waiting,serving,no_show),and(status.eq.completed,or(payment_method.eq.unpaid,payment_method.is.null))",
+      )
+      .order("position", { ascending: true });
 
-        if (error) throw error;
+    if (error) throw error;
 
-        // Post-process to compute entry-level delay and estimated_end_at
-        const enhancedData = (data || []).map((entry: any) => {
-            let totalDelay = 0;
-            let maxEstEnd: Date | null = null;
+    // Post-process to compute entry-level delay and estimated_end_at
+    const enhancedData = (data || []).map((entry: any) => {
+      let totalDelay = 0;
+      let maxEstEnd: Date | null = null;
 
-            entry.queue_entry_services?.forEach((s: any) => {
-                totalDelay += (s.delay_minutes || 0);
+      entry.queue_entry_services?.forEach((s: any) => {
+        totalDelay += s.delay_minutes || 0;
 
-                // Track the latest estimated finish time
-                if (s.estimated_end_at) {
-                    const est = new Date(s.estimated_end_at);
-                    if (!maxEstEnd || est > maxEstEnd) maxEstEnd = est;
-                }
-                // If a task is completed, its completion time is also a reference for the latest activity
-                if (s.completed_at) {
-                    const comp = new Date(s.completed_at);
-                    if (!maxEstEnd || comp > maxEstEnd) maxEstEnd = comp;
-                }
-            });
+        // Track the latest estimated finish time
+        if (s.estimated_end_at) {
+          const est = new Date(s.estimated_end_at);
+          if (!maxEstEnd || est > maxEstEnd) maxEstEnd = est;
+        }
+        // If a task is completed, its completion time is also a reference for the latest activity
+        if (s.completed_at) {
+          const comp = new Date(s.completed_at);
+          if (!maxEstEnd || comp > maxEstEnd) maxEstEnd = comp;
+        }
+      });
 
-            return {
-                ...entry,
-                total_delay: totalDelay,
-                estimated_end_at: maxEstEnd ? (maxEstEnd as Date).toISOString() : null
-            };
-        });
+      return {
+        ...entry,
+        total_delay: totalDelay,
+        estimated_end_at: maxEstEnd ? (maxEstEnd as Date).toISOString() : null,
+      };
+    });
 
-        console.log(`Found ${enhancedData.length} active entries for queue ${id} today (${todayStr})`);
+    console.log(
+      `Found ${enhancedData.length} active entries for queue ${id} today (${todayStr})`,
+    );
 
-        res.status(200).json({
-            status: 'success',
-            data: enhancedData
-        });
-
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
-    }
+    res.status(200).json({
+      status: "success",
+      data: enhancedData,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
 export const updateQueueEntryStatus = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params; // entry_id
-        const { status } = req.body; // 'serving', 'completed', 'cancelled', 'no_show'
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params; // entry_id
+    const { status } = req.body; // 'serving', 'completed', 'cancelled', 'no_show'
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
 
-        if (!['waiting', 'serving', 'completed', 'cancelled', 'no_show', 'skipped'].includes(status)) {
-            return res.status(400).json({ status: 'error', message: 'Invalid status' });
-        }
+    if (
+      ![
+        "waiting",
+        "serving",
+        "completed",
+        "cancelled",
+        "no_show",
+        "skipped",
+      ].includes(status)
+    ) {
+      return res
+        .status(400)
+        .json({ status: "error", message: "Invalid status" });
+    }
 
-        // --- SEQUENTIAL SERVING LOGIC & PROVIDER ASSIGNMENT ---
-        const { data: currentEntry } = await supabase
-            .from('queue_entries')
-            .select(`
+    // --- SEQUENTIAL SERVING LOGIC & PROVIDER ASSIGNMENT ---
+    const { data: currentEntry } = await supabase
+      .from("queue_entries")
+      .select(
+        `
                 *,
                 queues!inner (
                     business_id, 
@@ -926,304 +1109,380 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
                     businesses (timezone)
                 ),
                 queue_entry_services (service_id)
-            `)
-            .eq('id', id)
-            .single();
+            `,
+      )
+      .eq("id", id)
+      .single();
 
-        const timezone = currentEntry?.queues?.businesses?.timezone || 'UTC';
-        const todayStr = getLocalDateString(timezone);
+    const timezone = currentEntry?.queues?.businesses?.timezone || "UTC";
+    const todayStr = getLocalDateString(timezone);
 
-        // Backend-level Walk-in / Direct Serve Block
-        if (status === 'serving') {
-            if (!currentEntry || !currentEntry.ticket_number || currentEntry.entry_date !== todayStr) {
-                return res.status(400).json({
-                    status: 'error',
-                    message: "Customer must join the queue before being served."
-                });
-            }
-        }
+    // Backend-level Walk-in / Direct Serve Block
+    if (status === "serving") {
+      if (
+        !currentEntry ||
+        !currentEntry.ticket_number ||
+        currentEntry.entry_date !== todayStr
+      ) {
+        return res.status(400).json({
+          status: "error",
+          message: "Customer must join the queue before being served.",
+        });
+      }
+    }
 
-        const updates: any = { status };
+    const updates: any = { status };
 
-        if (status === 'serving') {
-            if (currentEntry) {
-                // 1. Get current busy providers for this business today
-                const { data: busyProviders } = await supabase
-                    .from('queue_entries')
-                    .select('assigned_provider_id')
-                    .eq('entry_date', currentEntry.entry_date)
-                    .eq('status', 'serving')
-                    .not('assigned_provider_id', 'is', null);
+    if (status === "serving") {
+      if (currentEntry) {
+        // 1. Get current busy providers for this business today
+        const { data: busyProviders } = await supabase
+          .from("queue_entries")
+          .select("assigned_provider_id")
+          .eq("entry_date", currentEntry.entry_date)
+          .eq("status", "serving")
+          .not("assigned_provider_id", "is", null);
 
-                const busyProviderIds = busyProviders?.map((p: any) => p.assigned_provider_id) || [];
+        const busyProviderIds =
+          busyProviders?.map((p: any) => p.assigned_provider_id) || [];
 
-                let eligibleProviderId = currentEntry.assigned_provider_id;
+        let eligibleProviderId = currentEntry.assigned_provider_id;
 
-                // 2. Provider Assignment Logic
-                if (!eligibleProviderId) {
-                    const requiredServiceIds = (currentEntry as any).queue_entry_services?.map((s: any) => s.service_id) || [];
+        // 2. Provider Assignment Logic
+        if (!eligibleProviderId) {
+          const requiredServiceIds =
+            (currentEntry as any).queue_entry_services?.map(
+              (s: any) => s.service_id,
+            ) || [];
 
-                    // Find providers who are active and have ALL required services
-                    const { data: providers, error: provError } = await supabase
-                        .from('service_providers')
-                        .select(`
+          // Find providers who are active and have ALL required services
+          const { data: providers, error: provError } = await supabase
+            .from("service_providers")
+            .select(
+              `
                             id,
                             name,
                             provider_services (service_id)
-                        `)
-                        .eq('business_id', (currentEntry as any).queues.business_id)
-                        .eq('is_active', true);
+                        `,
+            )
+            .eq("business_id", (currentEntry as any).queues.business_id)
+            .eq("is_active", true);
 
-                    if (provError) {
-                        console.error('[queueController] Provider lookup error:', provError);
-                        throw provError;
-                    }
+          if (provError) {
+            console.error(
+              "[queueController] Provider lookup error:",
+              provError,
+            );
+            throw provError;
+          }
 
-                    // Filtering: Supports ALL selected services AND is NOT busy
-                    const availableProvider = providers?.find((p: any) => {
-                        const providerServiceIds = p.provider_services?.map((ps: any) => ps.service_id) || [];
-                        const supportsAll = requiredServiceIds.every((rid: string) => providerServiceIds.includes(rid));
-                        const isNotBusy = !busyProviderIds.includes(p.id);
-                        return supportsAll && isNotBusy;
-                    });
+          // Filtering: Supports ALL selected services AND is NOT busy
+          const availableProvider = providers?.find((p: any) => {
+            const providerServiceIds =
+              p.provider_services?.map((ps: any) => ps.service_id) || [];
+            const supportsAll = requiredServiceIds.every((rid: string) =>
+              providerServiceIds.includes(rid),
+            );
+            const isNotBusy = !busyProviderIds.includes(p.id);
+            return supportsAll && isNotBusy;
+          });
 
-                    if (!availableProvider) {
-                        return res.status(400).json({
-                            status: 'error',
-                            message: "No available expert found who supports all selected services. Please wait or assign manually."
-                        });
-                    }
-                    eligibleProviderId = availableProvider.id;
-                } else {
-                    // Check if the pre-assigned provider is busy
-                    if (busyProviderIds.includes(eligibleProviderId)) {
-                        return res.status(400).json({
-                            status: 'error',
-                            message: "The selected expert is currently attending to another guest. Please choose an available expert."
-                        });
-                    }
-                }
-
-                updates.assigned_provider_id = eligibleProviderId;
-                
-                // Also link to the user profile if the provider has one
-                const { data: provProfile } = await supabase
-                    .from('service_providers')
-                    .select('user_id')
-                    .eq('id', eligibleProviderId)
-                    .single();
-                
-                if (provProfile?.user_id) {
-                    updates.assigned_to = provProfile.user_id;
-                }
-
-                // Update per-service assignment in queue_entry_services
-                await supabase
-                    .from('queue_entry_services')
-                    .update({ assigned_provider_id: eligibleProviderId })
-                    .eq('queue_entry_id', id);
-            }
-        }
-
-        if (status === 'serving') {
-            const now = new Date();
-            const duration = Number(currentEntry?.total_duration_minutes || 0);
-            const estEnd = new Date(now.getTime() + duration * 60000);
-            updates.estimated_end_at = estEnd.toISOString();
-            updates.served_at = now.toISOString();
-
-            // Send "serving started" SMS with ETA
-            const recipient = currentEntry?.phone || (currentEntry?.user_id ? `User-${currentEntry.user_id}` : `Guest-${currentEntry?.customer_name}`);
-            const etaStr = estEnd.toLocaleTimeString('en-IN', { 
-                hour: '2-digit', 
-                minute: '2-digit', 
-                timeZone: timezone 
+          if (!availableProvider) {
+            return res.status(400).json({
+              status: "error",
+              message:
+                "No available expert found who supports all selected services. Please wait or assign manually.",
             });
-            await notificationService.sendSMS(recipient, `Hello ${currentEntry?.customer_name}, your service has started! Estimated completion is ${etaStr}. Thank you!`);
+          }
+          eligibleProviderId = availableProvider.id;
+        } else {
+          // Check if the pre-assigned provider is busy
+          if (busyProviderIds.includes(eligibleProviderId)) {
+            return res.status(400).json({
+              status: "error",
+              message:
+                "The selected expert is currently attending to another guest. Please choose an available expert.",
+            });
+          }
         }
 
-        if (status === 'completed') {
-            const now = new Date();
-            updates.completed_at = now.toISOString();
-            updates.completed_by_id = userId;
-            
-            // Determine role
-            const { data: profile } = await supabase.from('profiles').select('role').eq('id', userId).single();
-            updates.completed_by_role = (profile?.role === 'owner' || profile?.role === 'admin') ? 'OWNER' : 'EMPLOYEE';
+        updates.assigned_provider_id = eligibleProviderId;
 
-            // Fetch start and estimated end timestamps to calculate actual duration and delay
-            const { data: timingData } = await supabase
-                .from('queue_entries')
-                .select('service_started_at, estimated_end_at, total_duration_minutes')
-                .eq('id', id)
-                .single();
+        // Also link to the user profile if the provider has one
+        const { data: provProfile } = await supabase
+          .from("service_providers")
+          .select("user_id")
+          .eq("id", eligibleProviderId)
+          .single();
 
-            if (timingData?.service_started_at) {
-                const start = new Date(timingData.service_started_at);
-                const actualDuration = Math.round((now.getTime() - start.getTime()) / 60000);
-                updates.actual_duration_minutes = actualDuration;
-
-                if (timingData.estimated_end_at) {
-                    const estEnd = new Date(timingData.estimated_end_at);
-                    const delay = Math.max(0, Math.round((now.getTime() - estEnd.getTime()) / 60000));
-                    updates.delay_minutes = delay;
-                }
-            }
+        if (provProfile?.user_id) {
+          updates.assigned_to = provProfile.user_id;
         }
 
-        console.log(`Updating queue entry ${id} with status ${status} by user ${userId}`);
+        // Update per-service assignment in queue_entry_services
+        await supabase
+          .from("queue_entry_services")
+          .update({ assigned_provider_id: eligibleProviderId })
+          .eq("queue_entry_id", id);
+      }
+    }
 
-        // Update the entry
-        // RLS "Business owners can update entries" will enforce permission
-        const { data, error } = await supabase
-            .from('queue_entries')
-            .update(updates)
-            .eq('id', id)
-            .select(`
+    if (status === "serving") {
+      const now = new Date();
+      const duration = Number(currentEntry?.total_duration_minutes || 0);
+      const estEnd = new Date(now.getTime() + duration * 60000);
+      updates.estimated_end_at = estEnd.toISOString();
+      updates.served_at = now.toISOString();
+
+      // Send "serving started" SMS with ETA
+      const recipient =
+        currentEntry?.phone ||
+        (currentEntry?.user_id
+          ? `User-${currentEntry.user_id}`
+          : `Guest-${currentEntry?.customer_name}`);
+      const etaStr = estEnd.toLocaleTimeString("en-IN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: timezone,
+      });
+      await notificationService.sendSMS(
+        recipient,
+        `Hello ${currentEntry?.customer_name}, your service has started! Estimated completion is ${etaStr}. Thank you!`,
+      );
+    }
+
+    if (status === "completed") {
+      const now = new Date();
+      updates.completed_at = now.toISOString();
+      updates.completed_by_id = userId;
+
+      // Determine role
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("role")
+        .eq("id", userId)
+        .single();
+      updates.completed_by_role =
+        profile?.role === "owner" || profile?.role === "admin"
+          ? "OWNER"
+          : "EMPLOYEE";
+
+      // Fetch start and estimated end timestamps to calculate actual duration and delay
+      const { data: timingData } = await supabase
+        .from("queue_entries")
+        .select("service_started_at, estimated_end_at, total_duration_minutes")
+        .eq("id", id)
+        .single();
+
+      if (timingData?.service_started_at) {
+        const start = new Date(timingData.service_started_at);
+        const actualDuration = Math.round(
+          (now.getTime() - start.getTime()) / 60000,
+        );
+        updates.actual_duration_minutes = actualDuration;
+
+        if (timingData.estimated_end_at) {
+          const estEnd = new Date(timingData.estimated_end_at);
+          const delay = Math.max(
+            0,
+            Math.round((now.getTime() - estEnd.getTime()) / 60000),
+          );
+          updates.delay_minutes = delay;
+        }
+      }
+    }
+
+    console.log(
+      `Updating queue entry ${id} with status ${status} by user ${userId}`,
+    );
+
+    // Update the entry
+    // RLS "Business owners can update entries" will enforce permission
+    const { data, error } = await supabase
+      .from("queue_entries")
+      .update(updates)
+      .eq("id", id).select(`
                 *,
                 queues (name, business_id),
                 service_providers (name)
             `);
 
-        if (error) throw error;
+    if (error) throw error;
 
-        if (!data || data.length === 0) {
-            console.error(`Update failed for entry ${id}. No data returned. Possible RLS bypass or missing entry.`);
-            return res.status(404).json({
-                status: 'error',
-                message: 'Entry not found or permission denied. Ensure you are the business owner.'
-            });
-        }
-
-        const entry = data[0];
-
-        // Send Notification
-        // In real app, we'd fetch user's phone from profiles/auth or queue_entry
-        // For now, mocking with "User-{id}"
-        const recipient = entry.user_id ? `User-${entry.user_id}` : `Guest-${entry.customer_name}`;
-
-        // Consolidate all queue notifications through the process helper
-        if (currentEntry) {
-            await processQueueNotifications(currentEntry.queue_id, currentEntry.entry_date, supabase);
-        }
-
-        // --- SYNC STATUS TO APPOINTMENT ---
-        if (entry.appointment_id) {
-            let apptStatus = status;
-            if (status === 'waiting') apptStatus = 'checked_in';
-            if (status === 'serving') apptStatus = 'in_service';
-
-            if (['no_show', 'cancelled', 'completed', 'checked_in', 'in_service'].includes(apptStatus)) {
-                await supabase
-                    .from('appointments')
-                    .update({
-                        status: apptStatus,
-                        completed_at: status === 'completed' ? new Date().toISOString() : null
-                    })
-                    .eq('id', entry.appointment_id);
-            }
-        }
-        // -----------------------------------
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Status updated successfully',
-            data: entry
-        });
-
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+    if (!data || data.length === 0) {
+      console.error(
+        `Update failed for entry ${id}. No data returned. Possible RLS bypass or missing entry.`,
+      );
+      return res.status(404).json({
+        status: "error",
+        message:
+          "Entry not found or permission denied. Ensure you are the business owner.",
+      });
     }
+
+    const entry = data[0];
+
+    // Send Notification
+    // In real app, we'd fetch user's phone from profiles/auth or queue_entry
+    // For now, mocking with "User-{id}"
+    const recipient = entry.user_id
+      ? `User-${entry.user_id}`
+      : `Guest-${entry.customer_name}`;
+
+    // Consolidate all queue notifications through the process helper
+    if (currentEntry) {
+      await processQueueNotifications(
+        currentEntry.queue_id,
+        currentEntry.entry_date,
+        supabase,
+      );
+    }
+
+    // --- SYNC STATUS TO APPOINTMENT ---
+    if (entry.appointment_id) {
+      let apptStatus = status;
+      if (status === "waiting") apptStatus = "checked_in";
+      if (status === "serving") apptStatus = "in_service";
+
+      if (
+        [
+          "no_show",
+          "cancelled",
+          "completed",
+          "checked_in",
+          "in_service",
+        ].includes(apptStatus)
+      ) {
+        await supabase
+          .from("appointments")
+          .update({
+            status: apptStatus,
+            completed_at:
+              status === "completed" ? new Date().toISOString() : null,
+          })
+          .eq("id", entry.appointment_id);
+      }
+    }
+    // -----------------------------------
+
+    res.status(200).json({
+      status: "success",
+      message: "Status updated successfully",
+      data: entry,
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
 export const noShowQueueEntry = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        // 1. Get current entry to check for notifications and provider lock
-        const { data: currentEntry } = await supabase
-            .from('queue_entries')
-            .select('*')
-            .eq('id', id)
-            .single();
-
-        if (!currentEntry) {
-            return res.status(404).json({ status: 'error', message: 'Entry not found' });
-        }
-
-        // Enhanced Validation: Prevent no-show if checked in or in an invalid state
-        if (currentEntry.checked_in_at) {
-            return res.status(400).json({ status: 'error', message: 'Cannot mark no-show: Customer has already checked in.' });
-        }
-        
-        // Allow marking 'serving' as no-show (e.g. if customer walks out after being called)
-        if (['completed', 'done', 'cancelled'].includes(currentEntry.status)) {
-            return res.status(400).json({ status: 'error', message: `Cannot mark no-show: Entry is already ${currentEntry.status}.` });
-        }
-
-        // 2. Update status and release provider lock
-        const updates: any = {
-            status: 'no_show',
-            assigned_provider_id: null
-        };
-
-        const { data, error } = await supabase
-            .from('queue_entries')
-            .update(updates)
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // --- SYNC STATUS TO APPOINTMENT ---
-        if (currentEntry.appointment_id) {
-            await supabase
-                .from('appointments')
-                .update({ status: 'no_show' })
-                .eq('id', currentEntry.appointment_id);
-        }
-        // -----------------------------------
-
-        // Release lock AND reset task status in junction table
-        await supabase
-            .from('queue_entry_services')
-            .update({ 
-                assigned_provider_id: null,
-                task_status: 'pending' // Reset tasks so "DONE" buttons disappear
-            })
-            .eq('queue_entry_id', id);
-
-        // 3. Send Notification
-        const recipient = currentEntry.phone;
-        const isOnline = (currentEntry.entry_source || 'online') === 'online';
-        if (isOnline && recipient) {
-            const message = "We tried reaching you for your turn. If you still need service, please rejoin the queue.";
-            await notificationService.sendWhatsApp(recipient, message);
-            await supabase.from('queue_entries').update({ notified_noshow: true }).eq('id', id);
-        }
-
-        // 4. Trigger position updates for the rest of the queue
-        await processQueueNotifications(currentEntry.queue_id, currentEntry.entry_date, supabase);
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Customer marked as no-show and expert released.',
-            data
-        });
-
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
+
+    // 1. Get current entry to check for notifications and provider lock
+    const { data: currentEntry } = await supabase
+      .from("queue_entries")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (!currentEntry) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Entry not found" });
+    }
+
+    // Enhanced Validation: Prevent no-show if checked in or in an invalid state
+    if (currentEntry.checked_in_at) {
+      return res
+        .status(400)
+        .json({
+          status: "error",
+          message: "Cannot mark no-show: Customer has already checked in.",
+        });
+    }
+
+    // Allow marking 'serving' as no-show (e.g. if customer walks out after being called)
+    if (["completed", "done", "cancelled"].includes(currentEntry.status)) {
+      return res
+        .status(400)
+        .json({
+          status: "error",
+          message: `Cannot mark no-show: Entry is already ${currentEntry.status}.`,
+        });
+    }
+
+    // 2. Update status and release provider lock
+    const updates: any = {
+      status: "no_show",
+      assigned_provider_id: null,
+    };
+
+    const { data, error } = await supabase
+      .from("queue_entries")
+      .update(updates)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // --- SYNC STATUS TO APPOINTMENT ---
+    if (currentEntry.appointment_id) {
+      await supabase
+        .from("appointments")
+        .update({ status: "no_show" })
+        .eq("id", currentEntry.appointment_id);
+    }
+    // -----------------------------------
+
+    // Release lock AND reset task status in junction table
+    await supabase
+      .from("queue_entry_services")
+      .update({
+        assigned_provider_id: null,
+        task_status: "pending", // Reset tasks so "DONE" buttons disappear
+      })
+      .eq("queue_entry_id", id);
+
+    // 3. Send Notification
+    const recipient = currentEntry.phone;
+    const isOnline = (currentEntry.entry_source || "online") === "online";
+    if (isOnline && recipient) {
+      const message =
+        "We tried reaching you for your turn. If you still need service, please rejoin the queue.";
+      await notificationService.sendWhatsApp(recipient, message);
+      await supabase
+        .from("queue_entries")
+        .update({ notified_noshow: true })
+        .eq("id", id);
+    }
+
+    // 4. Trigger position updates for the rest of the queue
+    await processQueueNotifications(
+      currentEntry.queue_id,
+      currentEntry.entry_date,
+      supabase,
+    );
+
+    res.status(200).json({
+      status: "success",
+      message: "Customer marked as no-show and expert released.",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 /**
@@ -1233,632 +1492,775 @@ export const noShowQueueEntry = async (req: Request, res: Response) => {
  * State 3: Position = 1 (Becoming Next) - Handled here
  * State 5: High Demand (Delay >= 15) - Handled in joinQueue
  */
-export const processQueueNotifications = async (queueId: string, entryDate: string, supabase: any) => {
-    try {
-        // 1. Fetch current waiting entries for this queue
-        // We join queues to get business name safely
-        const { data: entries, error } = await supabase
-            .from('queue_entries')
-            .select(`
+export const processQueueNotifications = async (
+  queueId: string,
+  entryDate: string,
+  supabase: any,
+) => {
+  try {
+    // 1. Fetch current waiting entries for this queue
+    // We join queues to get business name safely
+    const { data: entries, error } = await supabase
+      .from("queue_entries")
+      .select(
+        `
                 id, ticket_number, phone, position, customer_name, entry_source, 
                 notified_top3, notified_next,
                 queues (
                     business_id,
                     businesses ( name )
                 )
-            `)
-            .eq('queue_id', queueId)
-            .eq('entry_date', entryDate)
-            .eq('status', 'waiting')
-            .order('position', { ascending: true });
+            `,
+      )
+      .eq("queue_id", queueId)
+      .eq("entry_date", entryDate)
+      .eq("status", "waiting")
+      .order("position", { ascending: true });
 
-        if (error || !entries) {
-            console.error('[Notification Process] Fetch Error:', error);
-            return;
-        }
-
-        for (let i = 0; i < entries.length; i++) {
-            const entry = entries[i];
-            const rank = i + 1; // Real-time rank in the waiting list
-            const isOnline = (entry.entry_source || 'online') === 'online';
-
-            // Extract business name from join
-            const businessName = (entry.queues as any)?.businesses?.name || 'the salon';
-
-            if (!isOnline || !entry.phone) continue;
-
-            // State 3: Position = 1 (Becoming Next)
-            if (rank === 1 && !entry.notified_next) {
-                await notificationService.sendWhatsApp(entry.phone, `Your turn is now at ${businessName}. Please proceed to the counter.`);
-                await supabase.from('queue_entries').update({ notified_next: true }).eq('id', entry.id);
-            }
-            // State 2: Position <= 3 (Top 3)
-            else if (rank <= 3 && rank > 1 && !entry.notified_top3) {
-                await notificationService.sendWhatsApp(entry.phone, `Your turn at ${businessName} is coming up soon. Please stay nearby.`);
-                await supabase.from('queue_entries').update({ notified_top3: true }).eq('id', entry.id);
-            }
-        }
-    } catch (err) {
-        console.error('[Notification Process Error]:', err);
+    if (error || !entries) {
+      console.error("[Notification Process] Fetch Error:", error);
+      return;
     }
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const rank = i + 1; // Real-time rank in the waiting list
+      const isOnline = (entry.entry_source || "online") === "online";
+
+      // Extract business name from join
+      const businessName =
+        (entry.queues as any)?.businesses?.name || "the salon";
+
+      if (!isOnline || !entry.phone) continue;
+
+      // State 3: Position = 1 (Becoming Next)
+      if (rank === 1 && !entry.notified_next) {
+        await notificationService.sendWhatsApp(
+          entry.phone,
+          `Your turn is now at ${businessName}. Please proceed to the counter.`,
+        );
+        await supabase
+          .from("queue_entries")
+          .update({ notified_next: true })
+          .eq("id", entry.id);
+      }
+      // State 2: Position <= 3 (Top 3)
+      else if (rank <= 3 && rank > 1 && !entry.notified_top3) {
+        await notificationService.sendWhatsApp(
+          entry.phone,
+          `Your turn at ${businessName} is coming up soon. Please stay nearby.`,
+        );
+        await supabase
+          .from("queue_entries")
+          .update({ notified_top3: true })
+          .eq("id", entry.id);
+      }
+    }
+  } catch (err) {
+    console.error("[Notification Process Error]:", err);
+  }
 };
 
 export const resetQueueEntries = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params; // queue_id
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params; // queue_id
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        // Get business timezone
-        const { data: qData } = await supabase.from('queues').select('businesses(timezone)').eq('id', id).single();
-        const timezone = qData?.businesses?.timezone || 'UTC';
-
-        // Get current date string (Business Local Time)
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
-
-        console.log(`Resetting queue entries for queue ${id} on date ${todayStr} by user ${userId}`);
-
-        // Delete all entries for this queue today
-        const { error } = await supabase
-            .from('queue_entries')
-            .delete()
-            .eq('queue_id', id)
-            .eq('entry_date', todayStr);
-
-        if (error) throw error;
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Queue reset successfully for today'
-        });
-
-    } catch (error: any) {
-        res.status(500).json({
-            status: 'error',
-            message: error.message
-        });
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
+
+    // Get business timezone
+    const { data: qData } = await supabase
+      .from("queues")
+      .select("businesses(timezone)")
+      .eq("id", id)
+      .single();
+    const timezone = qData?.businesses?.timezone || "UTC";
+
+    // Get current date string (Business Local Time)
+    const todayStr = new Date().toLocaleDateString("en-CA", {
+      timeZone: timezone,
+    });
+
+    console.log(
+      `Resetting queue entries for queue ${id} on date ${todayStr} by user ${userId}`,
+    );
+
+    // Delete all entries for this queue today
+    const { error } = await supabase
+      .from("queue_entries")
+      .delete()
+      .eq("queue_id", id)
+      .eq("entry_date", todayStr);
+
+    if (error) throw error;
+
+    res.status(200).json({
+      status: "success",
+      message: "Queue reset successfully for today",
+    });
+  } catch (error: any) {
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
+  }
 };
 
 export const getQueueStatus = async (req: Request, res: Response) => {
-    try {
-        const { token } = req.query; // status_token (UUID)
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { token } = req.query; // status_token (UUID)
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!token) {
-            return res.status(400).json({ status: 'error', message: 'Token is required' });
-        }
+    if (!token) {
+      return res
+        .status(400)
+        .json({ status: "error", message: "Token is required" });
+    }
 
-        const { data: entry, error: entryError } = await supabase
-            .from('queue_entries')
-            .select('*, queues(*, businesses(name, slug, phone, language, owner_id))')
-            .eq('status_token', token)
-            .single();
+    const { data: entry, error: entryError } = await supabase
+      .from("queue_entries")
+      .select("*, queues(*, businesses(name, slug, phone, language, owner_id))")
+      .eq("status_token", token)
+      .single();
 
-        if (entryError || !entry) {
-            return res.status(404).json({ status: 'error', message: 'Entry not found' });
-        }
+    if (entryError || !entry) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Entry not found" });
+    }
 
-        let businessLang = entry.ui_language || entry.queues?.businesses?.language || 'en';
-        if (!entry.ui_language && entry.queues?.businesses?.owner_id) {
-            const { data: profile } = await supabase.from('profiles').select('ui_language').eq('id', entry.queues.businesses.owner_id).maybeSingle();
-            if (profile?.ui_language) {
-                businessLang = profile.ui_language;
-            }
-        }
+    let businessLang =
+      entry.ui_language || entry.queues?.businesses?.language || "en";
+    if (!entry.ui_language && entry.queues?.businesses?.owner_id) {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("ui_language")
+        .eq("id", entry.queues.businesses.owner_id)
+        .maybeSingle();
+      if (profile?.ui_language) {
+        businessLang = profile.ui_language;
+      }
+    }
 
-        // 2. Get currently serving person for this queue
-        const { data: currentServingEntries } = await supabase
-            .from('queue_entries')
-            .select('ticket_number, estimated_end_at, service_providers(name)')
-            .eq('queue_id', entry.queue_id)
-            .eq('status', 'serving')
-            .eq('entry_date', entry.entry_date)
-            .order('served_at', { ascending: false })
-            .limit(1);
+    // 2. Get currently serving person for this queue
+    const { data: currentServingEntries } = await supabase
+      .from("queue_entries")
+      .select("ticket_number, estimated_end_at, service_providers(name)")
+      .eq("queue_id", entry.queue_id)
+      .eq("status", "serving")
+      .eq("entry_date", entry.entry_date)
+      .order("served_at", { ascending: false })
+      .limit(1);
 
-        const currentServing = currentServingEntries && currentServingEntries.length > 0 ? currentServingEntries[0] : null;
+    const currentServing =
+      currentServingEntries && currentServingEntries.length > 0
+        ? currentServingEntries[0]
+        : null;
 
-        // 3. Get Top 3 Context for "Queue Status" list
-        const { data: topEntries } = await supabase
-            .from('queue_entries')
-            .select(`
+    // 3. Get Top 3 Context for "Queue Status" list
+    const { data: topEntries } = await supabase
+      .from("queue_entries")
+      .select(
+        `
                 id, ticket_number, customer_name, status, position,
                 service_providers(name),
                 queue_entry_services(services(name))
-            `)
-            .eq('queue_id', entry.queue_id)
-            .eq('entry_date', entry.entry_date)
-            .in('status', ['serving', 'waiting'])
-            .order('position', { ascending: true })
-            .limit(3);
+            `,
+      )
+      .eq("queue_id", entry.queue_id)
+      .eq("entry_date", entry.entry_date)
+      .in("status", ["serving", "waiting"])
+      .order("position", { ascending: true })
+      .limit(3);
 
-        const queueContext = (topEntries || []).map((e: any) => ({
-            ticket: e.ticket_number,
-            name: e.customer_name,
-            status: e.status,
-            specialist: e.service_providers?.name || 'Waiting',
-            service: e.queue_entry_services?.[0]?.services?.name || 'General',
-            is_user: e.id === entry.id
-        }));
+    const queueContext = (topEntries || []).map((e: any) => ({
+      ticket: e.ticket_number,
+      name: e.customer_name,
+      status: e.status,
+      specialist: e.service_providers?.name || "Waiting",
+      service: e.queue_entry_services?.[0]?.services?.name || "General",
+      is_user: e.id === entry.id,
+    }));
 
-        // 4. Calculate position ahead
-        const { count } = await supabase
-            .from('queue_entries')
-            .select('*', { count: 'exact', head: true })
-            .eq('queue_id', entry.queue_id)
-            .eq('status', 'waiting')
-            .eq('entry_date', entry.entry_date)
-            .lt('position', entry.position);
+    // 4. Calculate position ahead
+    const { count } = await supabase
+      .from("queue_entries")
+      .select("*", { count: "exact", head: true })
+      .eq("queue_id", entry.queue_id)
+      .eq("status", "waiting")
+      .eq("entry_date", entry.entry_date)
+      .lt("position", entry.position);
 
-        const positionAhead = count || 0;
+    const positionAhead = count || 0;
 
-        // 5. Calculate total wait time based on entries ahead (waiting)
-        const { data: entriesAhead } = await supabase
-            .from('queue_entries')
-            .select('id, total_duration_minutes')
-            .eq('queue_id', entry.queue_id)
-            .eq('entry_date', entry.entry_date)
-            .eq('status', 'waiting')
-            .lt('position', entry.position);
+    // 5. Calculate total wait time based on entries ahead (waiting)
+    const { data: entriesAhead } = await supabase
+      .from("queue_entries")
+      .select("id, total_duration_minutes")
+      .eq("queue_id", entry.queue_id)
+      .eq("entry_date", entry.entry_date)
+      .eq("status", "waiting")
+      .lt("position", entry.position);
 
-        let waitTime = 0;
-        entriesAhead?.forEach((e: any) => {
-            waitTime += (e.total_duration_minutes || 10);
-        });
+    let waitTime = 0;
+    entriesAhead?.forEach((e: any) => {
+      waitTime += e.total_duration_minutes || 10;
+    });
 
-        // 6. Add remaining time of the current serving entry
-        if (currentServing?.estimated_end_at) {
-            const now = new Date();
-            const estEnd = new Date(currentServing.estimated_end_at);
-            const remainingMinutes = Math.max(0, Math.round((estEnd.getTime() - now.getTime()) / 60000));
-            waitTime += remainingMinutes;
-        }
-
-        // 7. Fetch current user's services/specialist info for the main card
-        const { data: myUserExtended } = await supabase
-            .from('queue_entries')
-            .select('*, service_providers(name, department, role)')
-            .eq('id', entry.id)
-            .single();
-
-        const { data: myServices } = await supabase
-            .from('queue_entry_services')
-            .select('services(name, duration_minutes)')
-            .eq('queue_entry_id', entry.id);
-
-        const serviceNames = myServices?.map((s: any) => s.services?.name).filter(Boolean) || [];
-
-        res.status(200).json({
-            status: 'success',
-            data: {
-                business_name: entry.queues?.businesses?.name,
-                business_slug: entry.queues?.businesses?.slug,
-                business_phone: entry.queues?.businesses?.phone,
-                business_language: businessLang,
-                display_token: entry.ticket_number,
-                current_serving: currentServing?.ticket_number || 'None',
-                current_specialist: currentServing?.service_providers?.name || 'Expert',
-                position: positionAhead + 1,
-                estimated_wait_time: waitTime,
-                status: entry.status,
-                guest_name: entry.customer_name,
-                service_names: serviceNames,
-                specialist: {
-                    name: myUserExtended?.service_providers?.name || 'TBD',
-                    role: myUserExtended?.service_providers?.role || myUserExtended?.service_providers?.department || 'Specialist'
-                },
-                queue_context: queueContext
-            }
-        });
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    // 6. Add remaining time of the current serving entry
+    if (currentServing?.estimated_end_at) {
+      const now = new Date();
+      const estEnd = new Date(currentServing.estimated_end_at);
+      const remainingMinutes = Math.max(
+        0,
+        Math.round((estEnd.getTime() - now.getTime()) / 60000),
+      );
+      waitTime += remainingMinutes;
     }
+
+    // 7. Fetch current user's services/specialist info for the main card
+    const { data: myUserExtended } = await supabase
+      .from("queue_entries")
+      .select("*, service_providers(name, department, role)")
+      .eq("id", entry.id)
+      .single();
+
+    const { data: myServices } = await supabase
+      .from("queue_entry_services")
+      .select("services(name, duration_minutes)")
+      .eq("queue_entry_id", entry.id);
+
+    const serviceNames =
+      myServices?.map((s: any) => s.services?.name).filter(Boolean) || [];
+
+    res.status(200).json({
+      status: "success",
+      data: {
+        business_name: entry.queues?.businesses?.name,
+        business_slug: entry.queues?.businesses?.slug,
+        business_phone: entry.queues?.businesses?.phone,
+        business_language: businessLang,
+        display_token: entry.ticket_number,
+        current_serving: currentServing?.ticket_number || "None",
+        current_specialist: currentServing?.service_providers?.name || "Expert",
+        position: positionAhead + 1,
+        estimated_wait_time: waitTime,
+        status: entry.status,
+        guest_name: entry.customer_name,
+        service_names: serviceNames,
+        specialist: {
+          name: myUserExtended?.service_providers?.name || "TBD",
+          role:
+            myUserExtended?.service_providers?.role ||
+            myUserExtended?.service_providers?.department ||
+            "Specialist",
+        },
+        queue_context: queueContext,
+      },
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const nextEntry = async (req: Request, res: Response) => {
-    try {
-        const { queue_id } = req.body;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { queue_id } = req.body;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        // Get business timezone
-        const { data: qData } = await supabase.from('queues').select('businesses(timezone)').eq('id', queue_id).single();
-        const timezone = qData?.businesses?.timezone || 'UTC';
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+    // Get business timezone
+    const { data: qData } = await supabase
+      .from("queues")
+      .select("businesses(timezone)")
+      .eq("id", queue_id)
+      .single();
+    const timezone = qData?.businesses?.timezone || "UTC";
+    const todayStr = new Date().toLocaleDateString("en-CA", {
+      timeZone: timezone,
+    });
 
-        if (!queue_id) {
-            return res.status(400).json({ status: 'error', message: 'Queue ID is required' });
-        }
+    if (!queue_id) {
+      return res
+        .status(400)
+        .json({ status: "error", message: "Queue ID is required" });
+    }
 
-        // 1. Find next person in line
-        const { data: next, error: nextError } = await supabase
-            .from('queue_entries')
-            .select(`
+    // 1. Find next person in line
+    const { data: next, error: nextError } = await supabase
+      .from("queue_entries")
+      .select(
+        `
                 *,
                 queue_entry_services (service_id, assigned_provider_id)
-            `)
-            .eq('queue_id', queue_id)
-            .eq('status', 'waiting')
-            .eq('entry_date', todayStr)
-            .order('position', { ascending: true })
-            .limit(1)
-            .single();
+            `,
+      )
+      .eq("queue_id", queue_id)
+      .eq("status", "waiting")
+      .eq("entry_date", todayStr)
+      .order("position", { ascending: true })
+      .limit(1)
+      .single();
 
-        if (nextError || !next) {
-            return res.status(200).json({ status: 'success', message: 'No more customers in queue.' });
-        }
-
-        // 2. Respect explicit assignment first.
-        // If no expert is assigned for this entry, require manual assignment.
-        const taskAssignments = ((next as any).queue_entry_services || [])
-            .map((s: any) => s?.assigned_provider_id)
-            .filter(Boolean);
-        const explicitProviderId = taskAssignments.length > 0 ? String(taskAssignments[0]) : null;
-        if (!explicitProviderId) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Please assign an expert to the next customer before starting service.'
-            });
-        }
-
-        // 3. Check whether assigned provider is already busy serving someone else.
-        const { data: busyProviders } = await supabase
-            .from('queue_entries')
-            .select('assigned_provider_id')
-            .eq('entry_date', todayStr)
-            .eq('status', 'serving')
-            .not('assigned_provider_id', 'is', null);
-
-        const busyProviderIds = busyProviders?.map((p: any) => p.assigned_provider_id) || [];
-        const requiredServiceIds = (next as any).queue_entry_services?.map((s: any) => s.service_id).filter(Boolean) || [];
-        if (busyProviderIds.includes(explicitProviderId)) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Assigned expert is currently serving another customer.'
-            });
-        }
-
-        // 4. Validate assigned provider and capability.
-        const { data: providers } = await supabase
-            .from('service_providers')
-            .select(`id, name, provider_services (service_id)`)
-            .eq('business_id', (req as any).business_id || next.business_id || '') // Fallback to next.business_id if not in req
-            .eq('is_active', true);
-
-        const assignedProvider = providers?.find((p: any) => String(p.id) === explicitProviderId);
-        if (!assignedProvider) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Assigned expert is unavailable. Please choose another expert.'
-            });
-        }
-
-        const supportsAll = (() => {
-            const pServiceIds = assignedProvider.provider_services?.map((ps: any) => ps.service_id) || [];
-            return requiredServiceIds.every((rid: string) => pServiceIds.includes(rid));
-        })();
-        if (!supportsAll) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Assigned expert cannot perform all selected services. Please reassign.'
-            });
-        }
-
-        const availableProvider = providers?.find((p: any) => {
-            const pServiceIds = p.provider_services?.map((ps: any) => ps.service_id) || [];
-            const supportsAll = requiredServiceIds.every((rid: string) => pServiceIds.includes(rid));
-            const isNotBusy = !busyProviderIds.includes(p.id);
-            return supportsAll && isNotBusy;
-        });
-        // We intentionally do not auto-switch providers when one is explicitly assigned.
-        // keep `availableProvider` compatibility for downstream name interpolation only
-        const providerToUse: any = assignedProvider || availableProvider;
-
-        // 5. Start serving with assigned provider
-        const now = new Date();
-        const duration = Number(next.total_duration_minutes || 0);
-        const estEnd = new Date(now.getTime() + duration * 60000);
-
-        await supabase
-            .from('queue_entries')
-            .update({
-                status: 'serving',
-                served_at: now.toISOString(),
-                service_started_at: now.toISOString(),
-                estimated_end_at: estEnd.toISOString(),
-                assigned_provider_id: providerToUse.id
-            })
-            .eq('id', next.id);
-
-        res.status(200).json({
-            status: 'success',
-            message: `Next customer ${next.ticket_number} is now being served by ${providerToUse.name}.`
-        });
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (nextError || !next) {
+      return res
+        .status(200)
+        .json({ status: "success", message: "No more customers in queue." });
     }
+
+    // 2. Respect explicit assignment first.
+    // If no expert is assigned for this entry, require manual assignment.
+    const taskAssignments = ((next as any).queue_entry_services || [])
+      .map((s: any) => s?.assigned_provider_id)
+      .filter(Boolean);
+    const explicitProviderId =
+      taskAssignments.length > 0 ? String(taskAssignments[0]) : null;
+    if (!explicitProviderId) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "Please assign an expert to the next customer before starting service.",
+      });
+    }
+
+    // 3. Check whether assigned provider is already busy serving someone else.
+    const { data: busyProviders } = await supabase
+      .from("queue_entries")
+      .select("assigned_provider_id")
+      .eq("entry_date", todayStr)
+      .eq("status", "serving")
+      .not("assigned_provider_id", "is", null);
+
+    const busyProviderIds =
+      busyProviders?.map((p: any) => p.assigned_provider_id) || [];
+    const requiredServiceIds =
+      (next as any).queue_entry_services
+        ?.map((s: any) => s.service_id)
+        .filter(Boolean) || [];
+    if (busyProviderIds.includes(explicitProviderId)) {
+      return res.status(400).json({
+        status: "error",
+        message: "Assigned expert is currently serving another customer.",
+      });
+    }
+
+    // 4. Validate assigned provider and capability.
+    const { data: providers } = await supabase
+      .from("service_providers")
+      .select(`id, name, provider_services (service_id)`)
+      .eq("business_id", (req as any).business_id || next.business_id || "") // Fallback to next.business_id if not in req
+      .eq("is_active", true);
+
+    const assignedProvider = providers?.find(
+      (p: any) => String(p.id) === explicitProviderId,
+    );
+    if (!assignedProvider) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "Assigned expert is unavailable. Please choose another expert.",
+      });
+    }
+
+    const supportsAll = (() => {
+      const pServiceIds =
+        assignedProvider.provider_services?.map((ps: any) => ps.service_id) ||
+        [];
+      return requiredServiceIds.every((rid: string) =>
+        pServiceIds.includes(rid),
+      );
+    })();
+    if (!supportsAll) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "Assigned expert cannot perform all selected services. Please reassign.",
+      });
+    }
+
+    const availableProvider = providers?.find((p: any) => {
+      const pServiceIds =
+        p.provider_services?.map((ps: any) => ps.service_id) || [];
+      const supportsAll = requiredServiceIds.every((rid: string) =>
+        pServiceIds.includes(rid),
+      );
+      const isNotBusy = !busyProviderIds.includes(p.id);
+      return supportsAll && isNotBusy;
+    });
+    // We intentionally do not auto-switch providers when one is explicitly assigned.
+    // keep `availableProvider` compatibility for downstream name interpolation only
+    const providerToUse: any = assignedProvider || availableProvider;
+
+    // 5. Start serving with assigned provider
+    const now = new Date();
+    const duration = Number(next.total_duration_minutes || 0);
+    const estEnd = new Date(now.getTime() + duration * 60000);
+
+    await supabase
+      .from("queue_entries")
+      .update({
+        status: "serving",
+        served_at: now.toISOString(),
+        service_started_at: now.toISOString(),
+        estimated_end_at: estEnd.toISOString(),
+        assigned_provider_id: providerToUse.id,
+      })
+      .eq("id", next.id);
+
+    res.status(200).json({
+      status: "success",
+      message: `Next customer ${next.ticket_number} is now being served by ${providerToUse.name}.`,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const extendTime = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const { additional_minutes } = req.body;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const { additional_minutes } = req.body;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        // Get business timezone
-        const { data: eData } = await supabase.from('queue_entries').select('queues(businesses(timezone))').eq('id', id).single();
-        const timezone = eData?.queues?.businesses?.timezone || 'UTC';
-        const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+    // Get business timezone
+    const { data: eData } = await supabase
+      .from("queue_entries")
+      .select("queues(businesses(timezone))")
+      .eq("id", id)
+      .single();
+    const timezone = eData?.queues?.businesses?.timezone || "UTC";
+    const todayStr = new Date().toLocaleDateString("en-CA", {
+      timeZone: timezone,
+    });
 
-        if (!additional_minutes || isNaN(additional_minutes)) {
-            return res.status(400).json({ status: 'error', message: 'Valid additional_minutes is required' });
-        }
-
-        // 1. Get current entry
-        const { data: entry, error: fetchError } = await supabase
-            .from('queue_entries')
-            .select('*')
-            .eq('id', id)
-            .single();
-
-        if (fetchError || !entry) {
-            return res.status(404).json({ status: 'error', message: 'Entry not found' });
-        }
-
-        if (entry.status !== 'serving') {
-            return res.status(400).json({ status: 'error', message: 'Can only extend time for customers currently being served' });
-        }
-
-        const currentEstEnd = new Date(entry.estimated_end_at || new Date());
-        const newEstEnd = new Date(currentEstEnd.getTime() + additional_minutes * 60000);
-
-        // Calculate new delay
-        const startTime = new Date(entry.service_started_at);
-        const totalProjectedDuration = Math.round((newEstEnd.getTime() - startTime.getTime()) / 60000);
-        const newDelay = Math.max(0, totalProjectedDuration - (entry.total_duration_minutes || 0));
-
-        const updates: any = {
-            estimated_end_at: newEstEnd.toISOString(),
-            delay_minutes: newDelay
-        };
-
-        // Delay Alert Mapping
-        const lastAlerted = entry.last_alerted_delay_minutes || 0;
-        let alertSent = false;
-
-        if (newDelay - lastAlerted >= 10) {
-            // Find next waiting entry
-            const { data: nextPeople } = await supabase
-                .from('queue_entries')
-                .select('*')
-                .eq('queue_id', entry.queue_id)
-                .eq('entry_date', todayStr)
-                .eq('status', 'waiting')
-                .order('position', { ascending: true })
-                .limit(1);
-
-            if (nextPeople && nextPeople.length > 0) {
-                const next = nextPeople[0];
-                const etaStr = newEstEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: timezone });
-                const recipient = next.phone || (next.user_id ? `User-${next.user_id}` : `Guest-${next.customer_name}`);
-
-                await notificationService.sendSMS(recipient, `Hello ${next.customer_name}, there is a small delay in the queue. Your estimated turn is now around ${etaStr}. We appreciate your patience!`);
-
-                updates.last_alerted_delay_minutes = newDelay;
-                alertSent = true;
-            }
-        }
-
-        const { data: updated, error: updateError } = await supabase
-            .from('queue_entries')
-            .update(updates)
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (updateError) throw updateError;
-
-        res.status(200).json({
-            status: 'success',
-            message: alertSent ? 'Time extended and next customer notified' : 'Time extended',
-            data: updated
+    if (!additional_minutes || isNaN(additional_minutes)) {
+      return res
+        .status(400)
+        .json({
+          status: "error",
+          message: "Valid additional_minutes is required",
         });
-
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
     }
+
+    // 1. Get current entry
+    const { data: entry, error: fetchError } = await supabase
+      .from("queue_entries")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (fetchError || !entry) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Entry not found" });
+    }
+
+    if (entry.status !== "serving") {
+      return res
+        .status(400)
+        .json({
+          status: "error",
+          message: "Can only extend time for customers currently being served",
+        });
+    }
+
+    const currentEstEnd = new Date(entry.estimated_end_at || new Date());
+    const newEstEnd = new Date(
+      currentEstEnd.getTime() + additional_minutes * 60000,
+    );
+
+    // Calculate new delay
+    const startTime = new Date(entry.service_started_at);
+    const totalProjectedDuration = Math.round(
+      (newEstEnd.getTime() - startTime.getTime()) / 60000,
+    );
+    const newDelay = Math.max(
+      0,
+      totalProjectedDuration - (entry.total_duration_minutes || 0),
+    );
+
+    const updates: any = {
+      estimated_end_at: newEstEnd.toISOString(),
+      delay_minutes: newDelay,
+    };
+
+    // Delay Alert Mapping
+    const lastAlerted = entry.last_alerted_delay_minutes || 0;
+    let alertSent = false;
+
+    if (newDelay - lastAlerted >= 10) {
+      // Find next waiting entry
+      const { data: nextPeople } = await supabase
+        .from("queue_entries")
+        .select("*")
+        .eq("queue_id", entry.queue_id)
+        .eq("entry_date", todayStr)
+        .eq("status", "waiting")
+        .order("position", { ascending: true })
+        .limit(1);
+
+      if (nextPeople && nextPeople.length > 0) {
+        const next = nextPeople[0];
+        const etaStr = newEstEnd.toLocaleTimeString("en-IN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          timeZone: timezone,
+        });
+        const recipient =
+          next.phone ||
+          (next.user_id
+            ? `User-${next.user_id}`
+            : `Guest-${next.customer_name}`);
+
+        await notificationService.sendSMS(
+          recipient,
+          `Hello ${next.customer_name}, there is a small delay in the queue. Your estimated turn is now around ${etaStr}. We appreciate your patience!`,
+        );
+
+        updates.last_alerted_delay_minutes = newDelay;
+        alertSent = true;
+      }
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("queue_entries")
+      .update(updates)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    res.status(200).json({
+      status: "success",
+      message: alertSent
+        ? "Time extended and next customer notified"
+        : "Time extended",
+      data: updated,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const assignTaskProvider = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params; // queue_entry_service_id
-        const { provider_id } = req.body;
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params; // queue_entry_service_id
+    const { provider_id } = req.body;
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
 
-        const { adminSupabase } = require('../config/supabaseClient');
+    const { adminSupabase } = require("../config/supabaseClient");
 
-        // 0. Validate if provider is on leave for this task's date
-        if (provider_id) {
-            const { data: taskStr } = await adminSupabase
-                .from('queue_entry_services')
-                .select('queue_entries!inner(entry_date)')
-                .eq('id', id)
-                .maybeSingle();
+    // 0. Validate if provider is on leave for this task's date
+    if (provider_id) {
+      const { data: taskStr } = await adminSupabase
+        .from("queue_entry_services")
+        .select("queue_entries!inner(entry_date)")
+        .eq("id", id)
+        .maybeSingle();
 
-            if (taskStr && taskStr.queue_entries?.entry_date) {
-                const entryDate = taskStr.queue_entries.entry_date;
-                const { data: leaves } = await adminSupabase
-                    .from('provider_leaves')
-                    .select('id, status')
-                    .eq('provider_id', provider_id)
-                    .lte('start_date', entryDate)
-                    .gte('end_date', entryDate);
+      if (taskStr && taskStr.queue_entries?.entry_date) {
+        const entryDate = taskStr.queue_entries.entry_date;
+        const { data: leaves } = await adminSupabase
+          .from("provider_leaves")
+          .select("id, status")
+          .eq("provider_id", provider_id)
+          .lte("start_date", entryDate)
+          .gte("end_date", entryDate);
 
-                const blocking = (leaves || []).filter(isBlockingApprovedLeave);
-                if (blocking.length > 0) {
-                    return res.status(400).json({ status: 'error', message: 'This expert is on leave and cannot be assigned to tasks on this date.' });
-                }
-            }
-        }
-
-        // 1. Fetch task with admin client (avoid RLS no-row .single errors)
-        const { data: task, error: fetchError } = await adminSupabase
-            .from('queue_entry_services')
-            .select('id, queue_entry_id, queue_entries!inner(queue_id, queues!inner(business_id))')
-            .eq('id', id)
-            .maybeSingle();
-
-        if (fetchError || !task) {
-            return res.status(404).json({ status: 'error', message: 'Task not found or access denied' });
-        }
-
-        // 1b. Owner/Admin guard
-        const businessId = task.queue_entries?.queues?.business_id;
-        if (!businessId) {
-            return res.status(400).json({ status: 'error', message: 'Invalid task/business context' });
-        }
-
-        const { data: roleProfile } = await adminSupabase
-            .from('profiles')
-            .select('role')
-            .eq('id', userId)
-            .maybeSingle();
-        const isAdmin = roleProfile?.role === 'admin';
-
-        if (!isAdmin) {
-            const { data: business, error: businessErr } = await adminSupabase
-                .from('businesses')
-                .select('owner_id')
-                .eq('id', businessId)
-                .maybeSingle();
-
-            if (businessErr || !business || business.owner_id !== userId) {
-                return res.status(403).json({ status: 'error', message: 'Unauthorized to assign provider' });
-            }
-        }
-
-        // 2. Perform the update with admin client to bypass RLS/Constraint issues
-        const { data, error } = await adminSupabase
-            .from('queue_entry_services')
-            .update({ assigned_provider_id: provider_id || null })
-            .eq('id', id)
-            .select('id, assigned_provider_id')
-            .maybeSingle();
-
-        if (error) throw error;
-        if (!data) {
-            // Some deployments can return null representation on no-op updates.
-            // Re-read row once and treat it as success if it exists.
-            const { data: currentTask, error: refetchErr } = await adminSupabase
-                .from('queue_entry_services')
-                .select('id, assigned_provider_id')
-                .eq('id', id)
-                .maybeSingle();
-            if (refetchErr || !currentTask) {
-                return res.status(404).json({ status: 'error', message: 'Task not found or already updated' });
-            }
-            return res.status(200).json({
-                status: 'success',
-                message: 'Provider assigned to task successfully',
-                data: currentTask
+        const blocking = (leaves || []).filter(isBlockingApprovedLeave);
+        if (blocking.length > 0) {
+          return res
+            .status(400)
+            .json({
+              status: "error",
+              message:
+                "This expert is on leave and cannot be assigned to tasks on this date.",
             });
         }
-
-        // Keep entry-level assignment fields in sync for UI cards and legacy flows.
-        const { data: providerRow } = provider_id
-            ? await adminSupabase
-                .from('service_providers')
-                .select('id, user_id')
-                .eq('id', provider_id)
-                .maybeSingle()
-            : { data: null as any };
-        await adminSupabase
-            .from('queue_entries')
-            .update({
-                assigned_provider_id: providerRow?.id || null,
-                assigned_to: providerRow?.user_id || null
-            })
-            .eq('id', task.queue_entry_id);
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Provider assigned to task successfully',
-            data
-        });
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+      }
     }
+
+    // 1. Fetch task with admin client (avoid RLS no-row .single errors)
+    const { data: task, error: fetchError } = await adminSupabase
+      .from("queue_entry_services")
+      .select(
+        "id, queue_entry_id, queue_entries!inner(queue_id, queues!inner(business_id))",
+      )
+      .eq("id", id)
+      .maybeSingle();
+
+    if (fetchError || !task) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Task not found or access denied" });
+    }
+
+    // 1b. Owner/Admin guard
+    const businessId = task.queue_entries?.queues?.business_id;
+    if (!businessId) {
+      return res
+        .status(400)
+        .json({ status: "error", message: "Invalid task/business context" });
+    }
+
+    const { data: roleProfile } = await adminSupabase
+      .from("profiles")
+      .select("role")
+      .eq("id", userId)
+      .maybeSingle();
+    const isAdmin = roleProfile?.role === "admin";
+
+    if (!isAdmin) {
+      const { data: business, error: businessErr } = await adminSupabase
+        .from("businesses")
+        .select("owner_id")
+        .eq("id", businessId)
+        .maybeSingle();
+
+      if (businessErr || !business || business.owner_id !== userId) {
+        return res
+          .status(403)
+          .json({
+            status: "error",
+            message: "Unauthorized to assign provider",
+          });
+      }
+    }
+
+    // 2. Perform the update with admin client to bypass RLS/Constraint issues
+    const { data, error } = await adminSupabase
+      .from("queue_entry_services")
+      .update({ assigned_provider_id: provider_id || null })
+      .eq("id", id)
+      .select("id, assigned_provider_id")
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!data) {
+      // Some deployments can return null representation on no-op updates.
+      // Re-read row once and treat it as success if it exists.
+      const { data: currentTask, error: refetchErr } = await adminSupabase
+        .from("queue_entry_services")
+        .select("id, assigned_provider_id")
+        .eq("id", id)
+        .maybeSingle();
+      if (refetchErr || !currentTask) {
+        return res
+          .status(404)
+          .json({
+            status: "error",
+            message: "Task not found or already updated",
+          });
+      }
+      return res.status(200).json({
+        status: "success",
+        message: "Provider assigned to task successfully",
+        data: currentTask,
+      });
+    }
+
+    // Keep entry-level assignment fields in sync for UI cards and legacy flows.
+    const { data: providerRow } = provider_id
+      ? await adminSupabase
+          .from("service_providers")
+          .select("id, user_id")
+          .eq("id", provider_id)
+          .maybeSingle()
+      : { data: null as any };
+    await adminSupabase
+      .from("queue_entries")
+      .update({
+        assigned_provider_id: providerRow?.id || null,
+        assigned_to: providerRow?.user_id || null,
+      })
+      .eq("id", task.queue_entry_id);
+
+    res.status(200).json({
+      status: "success",
+      message: "Provider assigned to task successfully",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 // Assuming this is the markNoShow function based on the provided edit context
 export const markNoShow = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params; // queue_entry_id
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params; // queue_entry_id
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        // 1. Fetch the current entry to get appointment_id
-        const { data: currentEntry, error: fetchError } = await supabase
-            .from('queue_entries')
-            .select('id, appointment_id')
-            .eq('id', id)
-            .single();
+    // 1. Fetch the current entry to get appointment_id
+    const { data: currentEntry, error: fetchError } = await supabase
+      .from("queue_entries")
+      .select("id, appointment_id")
+      .eq("id", id)
+      .single();
 
-        if (fetchError || !currentEntry) {
-            return res.status(404).json({ status: 'error', message: 'Entry not found' });
-        }
-
-        // 2. Mark the queue entry as 'no_show'
-        const { data, error } = await supabase
-            .from('queue_entries')
-            .update({ status: 'no_show' })
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // 3. Sync with Appointment (if linked)
-        if (currentEntry.appointment_id) {
-            await supabase
-                .from('appointments')
-                .update({ status: 'no_show' })
-                .eq('id', currentEntry.appointment_id);
-        }
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Customer marked as No-Show',
-            data
-        });
-
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (fetchError || !currentEntry) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Entry not found" });
     }
+
+    // 2. Mark the queue entry as 'no_show'
+    const { data, error } = await supabase
+      .from("queue_entries")
+      .update({ status: "no_show" })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // 3. Sync with Appointment (if linked)
+    if (currentEntry.appointment_id) {
+      await supabase
+        .from("appointments")
+        .update({ status: "no_show" })
+        .eq("id", currentEntry.appointment_id);
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: "Customer marked as No-Show",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const startTask = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params; // queue_entry_service_id
-        const userId = req.user?.id;
-        const { adminSupabase } = require('../config/supabaseClient');
+  try {
+    const { id } = req.params; // queue_entry_service_id
+    const userId = req.user?.id;
+    const { adminSupabase } = require("../config/supabaseClient");
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
 
-        // 1. Fetch task (admin client: employees often lack RLS read on queue_entry_services)
-        const { data: task, error: taskError } = await adminSupabase
-            .from('queue_entry_services')
-            .select(`
+    // 1. Fetch task (admin client: employees often lack RLS read on queue_entry_services)
+    const { data: task, error: taskError } = await adminSupabase
+      .from("queue_entry_services")
+      .select(
+        `
                 *,
                 queue_entries!inner (
                     id, 
@@ -1870,163 +2272,202 @@ export const startTask = async (req: Request, res: Response) => {
                     appointment_id,
                     queues!inner (business_id)
                 )
-            `)
-            .eq('id', id)
-            .maybeSingle();
+            `,
+      )
+      .eq("id", id)
+      .maybeSingle();
 
-        if (taskError || !task) {
-            return res.status(404).json({ status: 'error', message: 'Task not found' });
-        }
+    if (taskError || !task) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Task not found" });
+    }
 
-        const businessId = task.queue_entries?.queues?.business_id;
-        const { data: business } = await adminSupabase
-            .from('businesses')
-            .select('owner_id')
-            .eq('id', businessId)
-            .maybeSingle();
-        const isOwner = business?.owner_id === userId;
-        const myProviderRes = await adminSupabase
-            .from('service_providers')
-            .select('id')
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-        const myProvider = myProviderRes.data;
-        const isAssignedEmployee =
-            !!task.assigned_provider_id &&
-            !!myProvider?.id &&
-            task.assigned_provider_id === myProvider.id;
+    const businessId = task.queue_entries?.queues?.business_id;
+    const { data: business } = await adminSupabase
+      .from("businesses")
+      .select("owner_id")
+      .eq("id", businessId)
+      .maybeSingle();
+    const isOwner = business?.owner_id === userId;
+    const myProviderRes = await adminSupabase
+      .from("service_providers")
+      .select("id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const myProvider = myProviderRes.data;
+    const isAssignedEmployee =
+      !!task.assigned_provider_id &&
+      !!myProvider?.id &&
+      task.assigned_provider_id === myProvider.id;
 
-        if (!isOwner && !isAssignedEmployee) {
-            return res.status(403).json({
-                status: 'error',
-                message: 'You do not have permission to modify this task.'
-            });
-        }
+    if (!isOwner && !isAssignedEmployee) {
+      return res.status(403).json({
+        status: "error",
+        message: "You do not have permission to modify this task.",
+      });
+    }
 
-        const providerId = task.assigned_provider_id;
-        if (!providerId) {
-            return res.status(400).json({ status: 'error', message: 'Please assign an expert to this task first.' });
-        }
+    const providerId = task.assigned_provider_id;
+    if (!providerId) {
+      return res
+        .status(400)
+        .json({
+          status: "error",
+          message: "Please assign an expert to this task first.",
+        });
+    }
 
-        // 1.5 Validate if provider is on leave for this task's date
-        if (task.queue_entries?.entry_date) {
-            const entryDate = task.queue_entries.entry_date;
-            const { data: leaves } = await adminSupabase
-                .from('provider_leaves')
-                .select('id, status')
-                .eq('provider_id', providerId)
-                .lte('start_date', entryDate)
-                .gte('end_date', entryDate);
+    // 1.5 Validate if provider is on leave for this task's date
+    if (task.queue_entries?.entry_date) {
+      const entryDate = task.queue_entries.entry_date;
+      const { data: leaves } = await adminSupabase
+        .from("provider_leaves")
+        .select("id, status")
+        .eq("provider_id", providerId)
+        .lte("start_date", entryDate)
+        .gte("end_date", entryDate);
 
-            const blocking = (leaves || []).filter(isBlockingApprovedLeave);
-            if (blocking.length > 0) {
-                return res.status(400).json({ status: 'error', message: 'This expert is on leave and cannot start tasks on this date.' });
-            }
-        }
+      const blocking = (leaves || []).filter(isBlockingApprovedLeave);
+      if (blocking.length > 0) {
+        return res
+          .status(400)
+          .json({
+            status: "error",
+            message:
+              "This expert is on leave and cannot start tasks on this date.",
+          });
+      }
+    }
 
-        // 2. STRICTOR PROVIDER LOCK
-        // Check if provider has ANY task 'in_progress' for this business today
-        const { data: rawBusyTasks } = await adminSupabase
-            .from('queue_entry_services')
-            .select(`
+    // 2. STRICTOR PROVIDER LOCK
+    // Check if provider has ANY task 'in_progress' for this business today
+    const { data: rawBusyTasks } = await adminSupabase
+      .from("queue_entry_services")
+      .select(
+        `
                 id,
                 queue_entries!inner (
                     entry_date,
                     status,
                     queues!inner (business_id)
                 )
-            `)
-            .eq('assigned_provider_id', providerId)
-            .eq('task_status', 'in_progress');
+            `,
+      )
+      .eq("assigned_provider_id", providerId)
+      .eq("task_status", "in_progress");
 
-        const busyTasks = rawBusyTasks?.filter((b: any) =>
-            b.queue_entries?.entry_date === task.queue_entries.entry_date &&
-            b.queue_entries?.queues?.business_id === task.queue_entries.queues.business_id &&
-            b.queue_entries?.status === 'serving'
-        );
+    const busyTasks = rawBusyTasks?.filter(
+      (b: any) =>
+        b.queue_entries?.entry_date === task.queue_entries.entry_date &&
+        b.queue_entries?.queues?.business_id ===
+          task.queue_entries.queues.business_id &&
+        b.queue_entries?.status === "serving",
+    );
 
-        if (busyTasks && busyTasks.length > 0) {
-            return res.status(400).json({
-                status: 'error',
-                message: "The selected expert is currently attending to another guest. Please choose an available expert."
-            });
-        }
-
-        // 3. Start Task
-        const now = new Date();
-        const duration = Number(task.duration_minutes || 0);
-        const estEnd = new Date(now.getTime() + duration * 60000);
-
-        const { data: updatedTask, error: updateError } = await adminSupabase
-            .from('queue_entry_services')
-            .update({
-                task_status: 'in_progress',
-                started_at: now.toISOString(),
-                estimated_end_at: estEnd.toISOString()
-            })
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (updateError) throw updateError;
-
-        // 3.5 Recompute delays for this provider's upcoming appointments
-        await recomputeProviderDelays(providerId, businessId as string, estEnd).catch((err: Error) => {
-            console.error('[queueController] Failed to recompute delays in startTask:', err);
-        });
-
-        // 4. Update parent entry status to 'serving' if it's currently 'waiting'
-        if (task.queue_entries.status === 'waiting') {
-            await adminSupabase
-                .from('queue_entries')
-                .update({
-                    status: 'serving',
-                    served_at: now.toISOString(),
-                    service_started_at: now.toISOString() // First task start marks entry start
-                })
-                .eq('id', task.queue_entries.id);
-
-            // Sync with parent appointment
-            if (task.queue_entries.appointment_id) {
-                await adminSupabase
-                    .from('appointments')
-                    .update({ status: 'in_service' })
-                    .eq('id', task.queue_entries.appointment_id);
-            }
-
-            // Send Notification for first service start
-            const recipient = task.queue_entries.phone || (task.queue_entries.user_id ? `User-${task.queue_entries.user_id}` : `Guest-${task.queue_entries.customer_name}`);
-            const etaStr = estEnd.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
-            await notificationService.sendSMS(recipient, `Hello ${task.queue_entries.customer_name}, your service has started! Estimated time for this task: ${etaStr}. Thank you!`);
-        }
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Task started successfully',
-            data: updatedTask
-        });
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (busyTasks && busyTasks.length > 0) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "The selected expert is currently attending to another guest. Please choose an available expert.",
+      });
     }
+
+    // 3. Start Task
+    const now = new Date();
+    const duration = Number(task.duration_minutes || 0);
+    const estEnd = new Date(now.getTime() + duration * 60000);
+
+    const { data: updatedTask, error: updateError } = await adminSupabase
+      .from("queue_entry_services")
+      .update({
+        task_status: "in_progress",
+        started_at: now.toISOString(),
+        estimated_end_at: estEnd.toISOString(),
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    // 3.5 Recompute delays for this provider's upcoming appointments
+    await recomputeProviderDelays(
+      providerId,
+      businessId as string,
+      estEnd,
+    ).catch((err: Error) => {
+      console.error(
+        "[queueController] Failed to recompute delays in startTask:",
+        err,
+      );
+    });
+
+    // 4. Update parent entry status to 'serving' if it's currently 'waiting'
+    if (task.queue_entries.status === "waiting") {
+      await adminSupabase
+        .from("queue_entries")
+        .update({
+          status: "serving",
+          served_at: now.toISOString(),
+          service_started_at: now.toISOString(), // First task start marks entry start
+        })
+        .eq("id", task.queue_entries.id);
+
+      // Sync with parent appointment
+      if (task.queue_entries.appointment_id) {
+        await adminSupabase
+          .from("appointments")
+          .update({ status: "in_service" })
+          .eq("id", task.queue_entries.appointment_id);
+      }
+
+      // Send Notification for first service start
+      const recipient =
+        task.queue_entries.phone ||
+        (task.queue_entries.user_id
+          ? `User-${task.queue_entries.user_id}`
+          : `Guest-${task.queue_entries.customer_name}`);
+      const etaStr = estEnd.toLocaleTimeString("en-IN", {
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Asia/Kolkata",
+      });
+      await notificationService.sendSMS(
+        recipient,
+        `Hello ${task.queue_entries.customer_name}, your service has started! Estimated time for this task: ${etaStr}. Thank you!`,
+      );
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: "Task started successfully",
+      data: updatedTask,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const completeTask = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params; // queue_entry_service_id
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
-        const { adminSupabase } = require('../config/supabaseClient');
+  try {
+    const { id } = req.params; // queue_entry_service_id
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
+    const { adminSupabase } = require("../config/supabaseClient");
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
 
-        // 1. Fetch task details and business owner info (admin client: employee RLS + correct service id required)
-        const { data: task, error: taskError } = await adminSupabase
-            .from('queue_entry_services')
-            .select(`
+    // 1. Fetch task details and business owner info (admin client: employee RLS + correct service id required)
+    const { data: task, error: taskError } = await adminSupabase
+      .from("queue_entry_services")
+      .select(
+        `
                 *,
                 queue_entries!inner (
                     id, 
@@ -2036,454 +2477,541 @@ export const completeTask = async (req: Request, res: Response) => {
                         businesses!inner(owner_id)
                     )
                 )
-            `)
-            .eq('id', id)
-            .maybeSingle();
+            `,
+      )
+      .eq("id", id)
+      .maybeSingle();
 
-        if (taskError || !task) {
-            return res.status(404).json({ status: 'error', message: 'Task not found' });
-        }
-
-        // PERMISSION CHECK: Must be the assigned provider (service_providers.id) OR the business owner
-        const ownerId = task.queue_entries?.queues?.businesses?.owner_id;
-        const isOwner = ownerId === userId;
-        const { data: myProvider } = await adminSupabase
-            .from('service_providers')
-            .select('id')
-            .eq('user_id', userId)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle();
-        const isAssignedEmployee =
-            !!task.assigned_provider_id &&
-            !!myProvider?.id &&
-            task.assigned_provider_id === myProvider.id;
-
-        if (!isOwner && !isAssignedEmployee) {
-            return res.status(403).json({ 
-                status: 'error', 
-                message: 'You do not have permission to complete this task. Only the assigned employee or owner can do this.' 
-            });
-        }
-
-        if (!task.started_at) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'This task hasn\'t been started yet. Please start the task before completion.'
-            });
-        }
-
-        // 2. Calculate metrics
-        const now = new Date();
-        const startedAt = new Date(task.started_at);
-        const actualMinutes = Math.round((now.getTime() - startedAt.getTime()) / 60000);
-        const delayMinutes = Math.max(0, actualMinutes - (task.duration_minutes || 0));
-
-        // 3. Mark task as done
-        const { data: profile } = await supabase.from('profiles').select('role').eq('id', userId).single();
-        const userRole = (profile?.role === 'owner' || profile?.role === 'admin' || isOwner) ? 'OWNER' : 'EMPLOYEE';
-
-        const { data: updatedTask, error: updateError } = await adminSupabase
-            .from('queue_entry_services')
-            .update({
-                task_status: 'done',
-                completed_at: now.toISOString(),
-                actual_minutes: actualMinutes,
-                delay_minutes: delayMinutes,
-                completed_by_id: userId,
-                completed_by_role: userRole
-            })
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (updateError) throw updateError;
-
-        // Recompute delays based on actual completion time
-        if (task.assigned_provider_id && task.queue_entries?.queues?.business_id) {
-            await recomputeProviderDelays(task.assigned_provider_id, task.queue_entries.queues.business_id, now).catch(err => {
-                console.error('[queueController] Failed to recompute delays in completeTask:', err);
-            });
-        }
-
-        // 4. Check if ALL tasks for this entry are done
-        const { data: allTasks } = await adminSupabase
-            .from('queue_entry_services')
-            .select('task_status')
-            .eq('queue_entry_id', task.queue_entry_id);
-
-        const terminalTaskStatuses = new Set(['done', 'completed', 'cancelled', 'skipped']);
-        const allDone = (allTasks || []).length > 0 && (allTasks || []).every((t: any) => {
-            const status = String(t?.task_status || '').toLowerCase();
-            return terminalTaskStatuses.has(status);
-        });
-
-        if (allDone) {
-            // Auto-complete the whole entry
-            await adminSupabase
-                .from('queue_entries')
-                .update({
-                    status: 'completed',
-                    completed_at: now.toISOString(),
-                    completed_by_id: userId,
-                    completed_by_role: userRole
-                })
-                .eq('id', task.queue_entry_id);
-
-            // Sync with parent appointment
-            if (task.queue_entries.appointment_id) {
-                await adminSupabase
-                    .from('appointments')
-                    .update({
-                        status: 'completed',
-                        completed_at: now.toISOString()
-                    })
-                    .eq('id', task.queue_entries.appointment_id);
-            }
-        }
-
-        res.status(200).json({
-            status: 'success',
-            message: allDone ? 'All services completed. Guest session finished.' : 'Task completed successfully',
-            data: updatedTask
-        });
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (taskError || !task) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Task not found" });
     }
+
+    // PERMISSION CHECK: Must be the assigned provider (service_providers.id) OR the business owner
+    const ownerId = task.queue_entries?.queues?.businesses?.owner_id;
+    const isOwner = ownerId === userId;
+    const { data: myProvider } = await adminSupabase
+      .from("service_providers")
+      .select("id")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const isAssignedEmployee =
+      !!task.assigned_provider_id &&
+      !!myProvider?.id &&
+      task.assigned_provider_id === myProvider.id;
+
+    if (!isOwner && !isAssignedEmployee) {
+      return res.status(403).json({
+        status: "error",
+        message:
+          "You do not have permission to complete this task. Only the assigned employee or owner can do this.",
+      });
+    }
+
+    if (!task.started_at) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "This task hasn't been started yet. Please start the task before completion.",
+      });
+    }
+
+    // 2. Calculate metrics
+    const now = new Date();
+    const startedAt = new Date(task.started_at);
+    const actualMinutes = Math.round(
+      (now.getTime() - startedAt.getTime()) / 60000,
+    );
+    const delayMinutes = Math.max(
+      0,
+      actualMinutes - (task.duration_minutes || 0),
+    );
+
+    // 3. Mark task as done
+    const { data: profile } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", userId)
+      .maybeSingle();
+    const userRole =
+      profile?.role === "owner" || profile?.role === "admin" || isOwner
+        ? "OWNER"
+        : "EMPLOYEE";
+
+    const { data: updatedTasks, error: updateError } = await adminSupabase
+      .from("queue_entry_services")
+      .update({
+        task_status: "done",
+        completed_at: now.toISOString(),
+        actual_minutes: actualMinutes,
+        delay_minutes: delayMinutes,
+        completed_by_id: userId,
+        completed_by_role: userRole,
+      })
+      .eq("id", id)
+      .select();
+
+    if (updateError) throw updateError;
+    const updatedTask = Array.isArray(updatedTasks)
+      ? updatedTasks[0]
+      : updatedTasks;
+    if (!updatedTask) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Task not found after update" });
+    }
+
+    // Recompute delays based on actual completion time
+    if (task.assigned_provider_id && task.queue_entries?.queues?.business_id) {
+      await recomputeProviderDelays(
+        task.assigned_provider_id,
+        task.queue_entries.queues.business_id,
+        now,
+      ).catch((err) => {
+        console.error(
+          "[queueController] Failed to recompute delays in completeTask:",
+          err,
+        );
+      });
+    }
+
+    // 4. Check if ALL tasks for this entry are done
+    const { data: allTasks } = await adminSupabase
+      .from("queue_entry_services")
+      .select("task_status")
+      .eq("queue_entry_id", task.queue_entry_id);
+
+    const terminalTaskStatuses = new Set([
+      "done",
+      "completed",
+      "cancelled",
+      "skipped",
+    ]);
+    const allDone =
+      (allTasks || []).length > 0 &&
+      (allTasks || []).every((t: any) => {
+        const status = String(t?.task_status || "").toLowerCase();
+        return terminalTaskStatuses.has(status);
+      });
+
+    if (allDone) {
+      // Auto-complete the whole entry
+      await adminSupabase
+        .from("queue_entries")
+        .update({
+          status: "completed",
+          completed_at: now.toISOString(),
+          completed_by_id: userId,
+          completed_by_role: userRole,
+        })
+        .eq("id", task.queue_entry_id);
+
+      // Sync with parent appointment
+      if (task.queue_entries.appointment_id) {
+        await adminSupabase
+          .from("appointments")
+          .update({
+            status: "completed",
+            completed_at: now.toISOString(),
+          })
+          .eq("id", task.queue_entries.appointment_id);
+      }
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: allDone
+        ? "All services completed. Guest session finished."
+        : "Task completed successfully",
+      data: updatedTask,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
-
 export const skipQueueEntry = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        // 1. Get current entry
-        const { data: currentEntry } = await supabase
-            .from('queue_entries')
-            .select('*')
-            .eq('id', id)
-            .single();
-
-        if (!currentEntry) {
-            return res.status(404).json({ status: 'error', message: 'Entry not found' });
-        }
-
-        if (currentEntry.status !== 'waiting') {
-            return res.status(400).json({ status: 'error', message: 'Can only skip customers who are in the waiting list.' });
-        }
-
-        // 2. Find the entry immediately after this one (next position)
-        const { data: nextEntry } = await supabase
-            .from('queue_entries')
-            .select('id, position')
-            .eq('queue_id', currentEntry.queue_id)
-            .eq('entry_date', currentEntry.entry_date)
-            .eq('status', 'waiting')
-            .gt('position', currentEntry.position)
-            .order('position', { ascending: true })
-            .limit(1)
-            .maybeSingle();
-
-        if (!nextEntry) {
-            return res.status(400).json({ status: 'error', message: 'queue.err_end_reached' });
-        }
-
-        // 3. Swap positions
-        const tempPos = 999999 + Math.floor(Math.random() * 1000);
-
-        await supabase.from('queue_entries').update({ position: tempPos }).eq('id', currentEntry.id);
-        await supabase.from('queue_entries').update({ position: currentEntry.position }).eq('id', nextEntry.id);
-        await supabase.from('queue_entries').update({ position: nextEntry.position }).eq('id', currentEntry.id);
-
-        // Trigger notifications as positions have swapped
-        await processQueueNotifications(currentEntry.queue_id, currentEntry.entry_date, supabase);
-
-        res.status(200).json({
-            status: 'success',
-            message: `Customer ${currentEntry.ticket_number} skipped. Moved down 1 position.`,
-            data: { id: currentEntry.id, new_position: nextEntry.position }
-        });
-
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
+
+    // 1. Get current entry
+    const { data: currentEntry } = await supabase
+      .from("queue_entries")
+      .select("*")
+      .eq("id", id)
+      .single();
+
+    if (!currentEntry) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Entry not found" });
+    }
+
+    if (currentEntry.status !== "waiting") {
+      return res
+        .status(400)
+        .json({
+          status: "error",
+          message: "Can only skip customers who are in the waiting list.",
+        });
+    }
+
+    // 2. Find the entry immediately after this one (next position)
+    const { data: nextEntry } = await supabase
+      .from("queue_entries")
+      .select("id, position")
+      .eq("queue_id", currentEntry.queue_id)
+      .eq("entry_date", currentEntry.entry_date)
+      .eq("status", "waiting")
+      .gt("position", currentEntry.position)
+      .order("position", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    if (!nextEntry) {
+      return res
+        .status(400)
+        .json({ status: "error", message: "queue.err_end_reached" });
+    }
+
+    // 3. Swap positions
+    const tempPos = 999999 + Math.floor(Math.random() * 1000);
+
+    await supabase
+      .from("queue_entries")
+      .update({ position: tempPos })
+      .eq("id", currentEntry.id);
+    await supabase
+      .from("queue_entries")
+      .update({ position: currentEntry.position })
+      .eq("id", nextEntry.id);
+    await supabase
+      .from("queue_entries")
+      .update({ position: nextEntry.position })
+      .eq("id", currentEntry.id);
+
+    // Trigger notifications as positions have swapped
+    await processQueueNotifications(
+      currentEntry.queue_id,
+      currentEntry.entry_date,
+      supabase,
+    );
+
+    res.status(200).json({
+      status: "success",
+      message: `Customer ${currentEntry.ticket_number} skipped. Moved down 1 position.`,
+      data: { id: currentEntry.id, new_position: nextEntry.position },
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const updateQueueEntryPayment = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const { payment_method } = req.body;
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const { payment_method } = req.body;
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        // Verify ownership and get appointment_id
-        const { data: entry, error: fetchError } = await supabase
-            .from('queue_entries')
-            .select('appointment_id, total_price, queues!inner(business_id)')
-            .eq('id', id)
-            .single();
-
-        if (fetchError || !entry) {
-            return res.status(404).json({ status: 'error', message: 'Queue entry not found' });
-        }
-
-        const { data: businessInfo } = await supabase
-            .from('businesses')
-            .select('owner_id')
-            .eq('id', entry.queues.business_id)
-            .single();
-
-        if (!businessInfo || businessInfo.owner_id !== userId) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
-        }
-
-        const now = new Date().toISOString();
-
-        // 1. Update Queue Entry
-        const { data, error } = await supabase
-            .from('queue_entries')
-            .update({
-                payment_method,
-                payment_status: 'paid',
-                paid_at: now,
-                amount_paid: entry.total_price || 0
-            })
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // 2. Sync with Appointment (if linked)
-        if (entry.appointment_id) {
-            await supabase
-                .from('appointments')
-                .update({
-                    status: 'completed',
-                    payment_status: 'paid',
-                    payment_method,
-                    paid_at: now,
-                    completed_at: now,
-                    amount_paid: data.total_price || 0 // Sync total price if available
-                })
-                .eq('id', entry.appointment_id);
-        }
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Payment updated successfully',
-            data
-        });
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
+
+    // Verify ownership and get appointment_id
+    const { data: entry, error: fetchError } = await supabase
+      .from("queue_entries")
+      .select("appointment_id, total_price, queues!inner(business_id)")
+      .eq("id", id)
+      .single();
+
+    if (fetchError || !entry) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Queue entry not found" });
+    }
+
+    const { data: businessInfo } = await supabase
+      .from("businesses")
+      .select("owner_id")
+      .eq("id", entry.queues.business_id)
+      .single();
+
+    if (!businessInfo || businessInfo.owner_id !== userId) {
+      return res.status(403).json({ status: "error", message: "Unauthorized" });
+    }
+
+    const now = new Date().toISOString();
+
+    // 1. Update Queue Entry
+    const { data, error } = await supabase
+      .from("queue_entries")
+      .update({
+        payment_method,
+        payment_status: "paid",
+        paid_at: now,
+        amount_paid: entry.total_price || 0,
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // 2. Sync with Appointment (if linked)
+    if (entry.appointment_id) {
+      await supabase
+        .from("appointments")
+        .update({
+          status: "completed",
+          payment_status: "paid",
+          payment_method,
+          paid_at: now,
+          completed_at: now,
+          amount_paid: data.total_price || 0, // Sync total price if available
+        })
+        .eq("id", entry.appointment_id);
+    }
+
+    res.status(200).json({
+      status: "success",
+      message: "Payment updated successfully",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
 export const restoreQueueEntry = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        if (!userId) {
-            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
-        }
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
 
-        // 1. Get current entry
-        const { data: entry } = await supabase
-            .from('queue_entries')
-            .select(`
+    // 1. Get current entry
+    const { data: entry } = await supabase
+      .from("queue_entries")
+      .select(
+        `
                 *,
                 queues!inner (business_id)
-            `)
-            .eq('id', id)
-            .single();
+            `,
+      )
+      .eq("id", id)
+      .single();
 
-        if (!entry) {
-            return res.status(404).json({ status: 'error', message: 'Entry not found' });
-        }
-
-        // Verify ownership
-        const { data: biz } = await supabase.from('businesses').select('owner_id, timezone').eq('id', entry.queues.business_id).single();
-        if (biz?.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Forbidden' });
-
-        // Verify it's from today (Only allow restoration for same-day no-shows)
-        const timezone = biz?.timezone || 'UTC';
-        const todayStr = getLocalDateString(timezone);
-
-        if (entry.entry_date !== todayStr) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Cannot restore no-shows from previous days. Please ask the customer to join the queue again.'
-            });
-        }
-
-        // 2. Find MAX position for today to "add to live queue" (at the end)
-        const { data: maxPosData } = await supabase
-            .from('queue_entries')
-            .select('position')
-            .eq('queue_id', entry.queue_id)
-            .eq('entry_date', todayStr)
-            .order('position', { ascending: false })
-            .limit(1);
-
-        const nextPosition = (maxPosData && maxPosData.length > 0) ? maxPosData[0].position + 1 : 1;
-
-        // 3. Update entry status and position
-        const { data, error } = await supabase
-            .from('queue_entries')
-            .update({ 
-                status: 'waiting',
-                position: nextPosition,
-                assigned_provider_id: null, // Reset provider just in case
-                service_started_at: null,    // Reset serving timestamps
-                served_at: null
-            })
-            .eq('id', id)
-            .select()
-            .single();
-
-        if (error) throw error;
-
-        // 4. Reset task status in junction table so they can be started/done again
-        await supabase
-            .from('queue_entry_services')
-            .update({ 
-                task_status: 'pending',
-                assigned_provider_id: null,
-                started_at: null,
-                completed_at: null,
-                actual_minutes: null,
-                delay_minutes: null
-            })
-            .eq('queue_entry_id', id);
-
-        // 5. Sync with Appointment (if linked)
-        if (entry.appointment_id) {
-            await supabase
-                .from('appointments')
-                .update({ 
-                    status: 'checked_in',    // Use 'checked_in' to break the loop (getTodayQueue only looks for 'confirmed')
-                    checked_in_at: new Date().toISOString() // Backup marker
-                }) 
-                .eq('id', entry.appointment_id);
-        }
-
-
-
-        // 6. Trigger position updates and notifications
-        await processQueueNotifications(entry.queue_id, todayStr, supabase);
-
-        res.status(200).json({
-            status: 'success',
-            message: 'Customer restored and added to the end of the live queue',
-            data
-        });
-
-    } catch (error: any) {
-        res.status(500).json({ status: 'error', message: error.message });
+    if (!entry) {
+      return res
+        .status(404)
+        .json({ status: "error", message: "Entry not found" });
     }
+
+    // Verify ownership
+    const { data: biz } = await supabase
+      .from("businesses")
+      .select("owner_id, timezone")
+      .eq("id", entry.queues.business_id)
+      .single();
+    if (biz?.owner_id !== userId)
+      return res.status(403).json({ status: "error", message: "Forbidden" });
+
+    // Verify it's from today (Only allow restoration for same-day no-shows)
+    const timezone = biz?.timezone || "UTC";
+    const todayStr = getLocalDateString(timezone);
+
+    if (entry.entry_date !== todayStr) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "Cannot restore no-shows from previous days. Please ask the customer to join the queue again.",
+      });
+    }
+
+    // 2. Find MAX position for today to "add to live queue" (at the end)
+    const { data: maxPosData } = await supabase
+      .from("queue_entries")
+      .select("position")
+      .eq("queue_id", entry.queue_id)
+      .eq("entry_date", todayStr)
+      .order("position", { ascending: false })
+      .limit(1);
+
+    const nextPosition =
+      maxPosData && maxPosData.length > 0 ? maxPosData[0].position + 1 : 1;
+
+    // 3. Update entry status and position
+    const { data, error } = await supabase
+      .from("queue_entries")
+      .update({
+        status: "waiting",
+        position: nextPosition,
+        assigned_provider_id: null, // Reset provider just in case
+        service_started_at: null, // Reset serving timestamps
+        served_at: null,
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    // 4. Reset task status in junction table so they can be started/done again
+    await supabase
+      .from("queue_entry_services")
+      .update({
+        task_status: "pending",
+        assigned_provider_id: null,
+        started_at: null,
+        completed_at: null,
+        actual_minutes: null,
+        delay_minutes: null,
+      })
+      .eq("queue_entry_id", id);
+
+    // 5. Sync with Appointment (if linked)
+    if (entry.appointment_id) {
+      await supabase
+        .from("appointments")
+        .update({
+          status: "checked_in", // Use 'checked_in' to break the loop (getTodayQueue only looks for 'confirmed')
+          checked_in_at: new Date().toISOString(), // Backup marker
+        })
+        .eq("id", entry.appointment_id);
+    }
+
+    // 6. Trigger position updates and notifications
+    await processQueueNotifications(entry.queue_id, todayStr, supabase);
+
+    res.status(200).json({
+      status: "success",
+      message: "Customer restored and added to the end of the live queue",
+      data,
+    });
+  } catch (error: any) {
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
 
-
 export const initializeEntryTasks = async (req: Request, res: Response) => {
-    try {
-        const { id } = req.params;
-        const { provider_id } = req.body;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+  try {
+    const { id } = req.params;
+    const { provider_id } = req.body;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
 
-        // 1. Check if tasks already exist
-        const { data: existing } = await supabase
-            .from('queue_entry_services')
-            .select('id')
-            .eq('queue_entry_id', id);
+    // 1. Check if tasks already exist
+    const { data: existing } = await supabase
+      .from("queue_entry_services")
+      .select("id")
+      .eq("queue_entry_id", id);
 
-        if (existing && existing.length > 0) {
-            // If tasks already exist and provider is now selected, treat this as assignment.
-            if (provider_id) {
-                await supabase
-                    .from('queue_entry_services')
-                    .update({ assigned_provider_id: provider_id })
-                    .eq('queue_entry_id', id);
+    if (existing && existing.length > 0) {
+      // If tasks already exist and provider is now selected, treat this as assignment.
+      if (provider_id) {
+        await supabase
+          .from("queue_entry_services")
+          .update({ assigned_provider_id: provider_id })
+          .eq("queue_entry_id", id);
 
-                const { data: providerRow } = await supabase
-                    .from('service_providers')
-                    .select('id, user_id')
-                    .eq('id', provider_id)
-                    .maybeSingle();
+        const { data: providerRow } = await supabase
+          .from("service_providers")
+          .select("id, user_id")
+          .eq("id", provider_id)
+          .maybeSingle();
 
-                await supabase
-                    .from('queue_entries')
-                    .update({
-                        assigned_provider_id: providerRow?.id || provider_id,
-                        assigned_to: providerRow?.user_id || null
-                    })
-                    .eq('id', id);
-            }
-            return res.status(200).json({ status: 'success', message: provider_id ? 'Provider assigned successfully' : 'Tasks already initialized' });
-        }
+        await supabase
+          .from("queue_entries")
+          .update({
+            assigned_provider_id: providerRow?.id || provider_id,
+            assigned_to: providerRow?.user_id || null,
+          })
+          .eq("id", id);
+      }
+      return res
+        .status(200)
+        .json({
+          status: "success",
+          message: provider_id
+            ? "Provider assigned successfully"
+            : "Tasks already initialized",
+        });
+    }
 
-        // 2. Fetch entry and business info simply
-        const { data: entry, error: entryErr } = await supabase
-            .from('queue_entries')
-            .select(`
+    // 2. Fetch entry and business info simply
+    const { data: entry, error: entryErr } = await supabase
+      .from("queue_entries")
+      .select(
+        `
                 id,
                 queue_id
-            `)
-            .eq('id', id)
-            .single();
+            `,
+      )
+      .eq("id", id)
+      .single();
 
-        if (entryErr || !entry) {
-            console.error('[initializeEntryTasks] Entry not found:', id, entryErr);
-            return res.status(404).json({ status: 'error', message: 'Entry not found' });
-        }
-
-        const { data: queueData } = await supabase
-            .from('queues')
-            .select('business_id, businesses(default_price, default_duration)')
-            .eq('id', entry.queue_id)
-            .single();
-
-        // 3. Insert default manual service slot (Assign provider immediately if provided)
-        await supabase.from('queue_entry_services').insert([{
-            queue_entry_id: id,
-            service_id: null,
-            assigned_provider_id: provider_id || null,
-            price: (queueData as any)?.businesses?.default_price || 0,
-            duration_minutes: (queueData as any)?.businesses?.default_duration || 10,
-            task_status: provider_id ? 'pending' : 'pending' 
-        }]);
-
-        // If provider was assigned, also sync it back to the entry level for legacy rows.
-        // queue_entries.assigned_to stores employee user_id (not provider id).
-        if (provider_id) {
-            const { data: providerRow } = await supabase
-                .from('service_providers')
-                .select('id, user_id')
-                .eq('id', provider_id)
-                .maybeSingle();
-            await supabase
-                .from('queue_entries')
-                .update({
-                    assigned_provider_id: providerRow?.id || provider_id,
-                    assigned_to: providerRow?.user_id || null
-                })
-                .eq('id', id);
-        }
-
-        res.status(200).json({ status: 'success', message: 'Tasks initialized' });
-    } catch (error: any) {
-        console.error('[initializeEntryTasks] Global error:', error);
-        res.status(500).json({ status: 'error', message: error.message });
+    if (entryErr || !entry) {
+      console.error("[initializeEntryTasks] Entry not found:", id, entryErr);
+      return res
+        .status(404)
+        .json({ status: "error", message: "Entry not found" });
     }
+
+    const { data: queueData } = await supabase
+      .from("queues")
+      .select("business_id, businesses(default_price, default_duration)")
+      .eq("id", entry.queue_id)
+      .single();
+
+    // 3. Insert default manual service slot (Assign provider immediately if provided)
+    await supabase.from("queue_entry_services").insert([
+      {
+        queue_entry_id: id,
+        service_id: null,
+        assigned_provider_id: provider_id || null,
+        price: (queueData as any)?.businesses?.default_price || 0,
+        duration_minutes:
+          (queueData as any)?.businesses?.default_duration || 10,
+        task_status: provider_id ? "pending" : "pending",
+      },
+    ]);
+
+    // If provider was assigned, also sync it back to the entry level for legacy rows.
+    // queue_entries.assigned_to stores employee user_id (not provider id).
+    if (provider_id) {
+      const { data: providerRow } = await supabase
+        .from("service_providers")
+        .select("id, user_id")
+        .eq("id", provider_id)
+        .maybeSingle();
+      await supabase
+        .from("queue_entries")
+        .update({
+          assigned_provider_id: providerRow?.id || provider_id,
+          assigned_to: providerRow?.user_id || null,
+        })
+        .eq("id", id);
+    }
+
+    res.status(200).json({ status: "success", message: "Tasks initialized" });
+  } catch (error: any) {
+    console.error("[initializeEntryTasks] Global error:", error);
+    res.status(500).json({ status: "error", message: error.message });
+  }
 };
