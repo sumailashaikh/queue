@@ -24,6 +24,14 @@ function userSafeConnectivityMessage(error: unknown): string | null {
     return null;
 }
 
+function userSafeOtpTemplateMessage(error: unknown): string | null {
+    const msg = String((error as any)?.message ?? '').toLowerCase();
+    if (msg.includes('error generating sms template') || msg.includes('sms template')) {
+        return 'OTP setup is temporarily unavailable. Please try again shortly.';
+    }
+    return null;
+}
+
 export const sendOtp = async (req: Request, res: Response) => {
     try {
         let { phone } = req.body;
@@ -65,7 +73,10 @@ export const sendOtp = async (req: Request, res: Response) => {
         console.error('[AUTH] sendOtp caught error:', error?.message || error);
         const raw = String(error?.message || '').toLowerCase();
         const connectivity = userSafeConnectivityMessage(error);
-        const safeMessage = connectivity
+        const templateError = userSafeOtpTemplateMessage(error);
+        const safeMessage = templateError
+            ? templateError
+            : connectivity
             ? connectivity
             : (raw.includes('63038') || raw.includes('daily messages limit') || raw.includes('twilio'))
               ? 'OTP service is temporarily busy. Please try again after some time.'
