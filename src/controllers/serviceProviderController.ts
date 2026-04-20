@@ -1139,6 +1139,7 @@ export const addProviderLeave = async (req: Request, res: Response) => {
 
         // 5. Notify owner (SMS + WhatsApp when possible; multiple phone fallbacks)
         let notificationSent = false;
+        let notifyDebug: any = null;
         let ownerNotifyTarget: string | null = null;
         if (!isAdminOrOwner) {
             const { data: biz } = await adminSupabase
@@ -1185,6 +1186,14 @@ export const addProviderLeave = async (req: Request, res: Response) => {
 
             if (normalized.length === 0) {
                 notificationSent = false;
+                notifyDebug = {
+                    attempted_targets: 0,
+                    sms_ok: 0,
+                    whatsapp_ok: 0,
+                    sms_failed: 0,
+                    whatsapp_failed: 0,
+                    error: 'No owner phone/whatsapp configured'
+                };
             } else {
                 const results = await Promise.allSettled(
                     normalized.flatMap((to) => [
@@ -1192,9 +1201,43 @@ export const addProviderLeave = async (req: Request, res: Response) => {
                         notificationService.sendSMS(to, msg)
                     ])
                 );
-                notificationSent = results.some(
-                    (r) => r.status === 'fulfilled' && r.value === true
-                );
+                let smsOk = 0;
+                let smsFailed = 0;
+                let waOk = 0;
+                let waFailed = 0;
+                const errors: string[] = [];
+
+                results.forEach((r, idx) => {
+                    const isWhatsAppAttempt = idx % 2 === 0;
+                    if (r.status === 'fulfilled' && r.value === true) {
+                        if (isWhatsAppAttempt) waOk += 1;
+                        else smsOk += 1;
+                    } else {
+                        if (isWhatsAppAttempt) waFailed += 1;
+                        else smsFailed += 1;
+                        const reason = r.status === 'rejected' ? String(r.reason || 'unknown') : 'provider returned false';
+                        errors.push(`${isWhatsAppAttempt ? 'whatsapp' : 'sms'}: ${reason}`);
+                    }
+                });
+
+                notificationSent = waOk > 0 || smsOk > 0;
+                notifyDebug = {
+                    attempted_targets: normalized.length,
+                    sms_ok: smsOk,
+                    whatsapp_ok: waOk,
+                    sms_failed: smsFailed,
+                    whatsapp_failed: waFailed,
+                    errors
+                };
+                console.log('[LEAVE_NOTIFY_OWNER]', {
+                    business_id: provider.business_id,
+                    provider_id: provider.id,
+                    attempted_targets: normalized.length,
+                    sms_ok: smsOk,
+                    whatsapp_ok: waOk,
+                    sms_failed: smsFailed,
+                    whatsapp_failed: waFailed
+                });
             }
         }
 
@@ -1203,7 +1246,8 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             message: isAdminOrOwner ? 'Leave added successfully' : 'Leave request submitted successfully',
             data,
             notification_sent: isAdminOrOwner ? undefined : notificationSent,
-            owner_phone_configured: isAdminOrOwner ? undefined : !!ownerNotifyTarget
+            owner_phone_configured: isAdminOrOwner ? undefined : !!ownerNotifyTarget,
+            notification_debug: isAdminOrOwner ? undefined : notifyDebug
         });
 
     } catch (error: any) {
