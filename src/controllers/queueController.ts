@@ -477,6 +477,17 @@ export const joinQueue = async (req: Request, res: Response) => {
         const serviceNamesDisplay = selectedServices.map((s: any) => s.name).join(', ') || 'General';
         console.log(`[joinQueue] Total price: ${total_price}, Service names display: ${serviceNamesDisplay}`);
 
+        // Resolve employee user_id for entry-level assignment when provider is preselected.
+        let assignedToUserId: string | null = null;
+        if (provider_id) {
+            const { data: providerRow } = await supabase
+                .from('service_providers')
+                .select('id, user_id')
+                .eq('id', provider_id)
+                .maybeSingle();
+            assignedToUserId = providerRow?.user_id || null;
+        }
+
         // 4. Insert Entry with entry_source
         console.log(`[joinQueue] Inserting new queue entry.`);
         const { data, error } = await supabase
@@ -496,7 +507,8 @@ export const joinQueue = async (req: Request, res: Response) => {
                     total_price,
                     total_duration_minutes: serviceDuration,
                     entry_source: entry_source || 'online',
-                    assigned_provider_id: provider_id || null
+                    assigned_provider_id: provider_id || null,
+                    assigned_to: assignedToUserId
                 }
             ])
             .select()
@@ -519,6 +531,7 @@ export const joinQueue = async (req: Request, res: Response) => {
             await supabase.from('queue_entry_services').insert([{
                 queue_entry_id: data.id,
                 service_id: null,
+                assigned_provider_id: provider_id || null,
                 price: queueInfo.businesses?.default_price || 0,
                 duration_minutes: queueInfo.businesses?.default_duration || 5
             }]);
