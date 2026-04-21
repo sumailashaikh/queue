@@ -33,15 +33,15 @@ function leaveRequestToOwnerMessage(language: string, employeeName: string, busi
     const safeEmployee = employeeName || 'Employee';
     const lang = baseLang(language);
     if (lang === 'hi') {
-        return `[QueueUp]\nछुट्टी अनुरोध\n\nकर्मचारी: ${safeEmployee}\nतारीख: ${when}\nकारण: ${noteText || 'उल्लेख नहीं किया गया'}\n\nकृपया डैशबोर्ड में Approve/Reject करें।`;
+        return `QueueUp\nछुट्टी अनुरोध\n\nकर्मचारी: ${safeEmployee}\nतारीख: ${when}\nकारण: ${noteText || 'उल्लेख नहीं किया गया'}\n\nकृपया डैशबोर्ड में Approve/Reject करें।`;
     }
     if (lang === 'ar') {
-        return `[QueueUp]\nطلب إجازة جديد\n\nاسم الموظف: ${safeEmployee}\nالتاريخ: ${when}\nالسبب: ${noteText || 'غير مذكور'}\n\nيرجى الموافقة أو الرفض من لوحة التحكم.`;
+        return `QueueUp\nطلب إجازة جديد\n\nاسم الموظف: ${safeEmployee}\nالتاريخ: ${when}\nالسبب: ${noteText || 'غير مذكور'}\n\nيرجى الموافقة أو الرفض من لوحة التحكم.`;
     }
     if (lang === 'es') {
-        return `[QueueUp]\nNueva solicitud de permiso\n\nEmpleado: ${safeEmployee}\nFecha: ${when}\nMotivo: ${noteText || 'No especificado'}\n\nAprueba o rechaza desde el panel.`;
+        return `QueueUp\nNueva solicitud de permiso\n\nEmpleado: ${safeEmployee}\nFecha: ${when}\nMotivo: ${noteText || 'No especificado'}\n\nAprueba o rechaza desde el panel.`;
     }
-    return `[QueueUp]\nNew Leave Request\n\nEmployee Name: ${safeEmployee}\nDate: ${when}\nReason: ${noteText || 'Not provided'}\n\nApprove or Reject from dashboard.`;
+    return `QueueUp\nNew Leave Request\n\nEmployee Name: ${safeEmployee}\nDate: ${when}\nReason: ${noteText || 'Not provided'}\n\nApprove or Reject from dashboard.`;
 }
 
 function leaveDecisionToEmployeeMessage(language: string, firstName: string, when: string, approved: boolean, reason?: string): string {
@@ -49,15 +49,15 @@ function leaveDecisionToEmployeeMessage(language: string, firstName: string, whe
     const note = String(reason || '').trim();
     const lang = baseLang(language);
     if (approved) {
-        if (lang === 'hi') return `[QueueUp]\nछुट्टी स्वीकृत\n\nनमस्ते ${name},\nआपकी छुट्टी (${when}) स्वीकृत हो गई है।\n\nअपने अवकाश का आनंद लें।`;
-        if (lang === 'ar') return `[QueueUp]\nتمت الموافقة على الإجازة\n\nمرحباً ${name},\nتمت الموافقة على إجازتك بتاريخ ${when}.\n\nنتمنى لك وقتاً سعيداً.`;
-        if (lang === 'es') return `[QueueUp]\nPermiso aprobado\n\nHola ${name},\nTu permiso para ${when} fue aprobado.\n\nDisfruta tu descanso.`;
-        return `[QueueUp]\nLeave Approved\n\nHello ${name},\nYour leave for ${when} has been approved.\n\nEnjoy your time off!`;
+        if (lang === 'hi') return `QueueUp\nछुट्टी स्वीकृत\n\nनमस्ते ${name},\nआपकी छुट्टी (${when}) स्वीकृत हो गई है।\n\nअपने अवकाश का आनंद लें।`;
+        if (lang === 'ar') return `QueueUp\nتمت الموافقة على الإجازة\n\nمرحباً ${name},\nتمت الموافقة على إجازتك بتاريخ ${when}.\n\nنتمنى لك وقتاً سعيداً.`;
+        if (lang === 'es') return `QueueUp\nPermiso aprobado\n\nHola ${name},\nTu permiso para ${when} fue aprobado.\n\nDisfruta tu descanso.`;
+        return `QueueUp\nLeave Approved\n\nHello ${name},\nYour leave for ${when} has been approved.\n\nEnjoy your time off!`;
     }
-    if (lang === 'hi') return `[QueueUp]\nछुट्टी अस्वीकृत\n\nनमस्ते ${name},\n${when} की आपकी छुट्टी अनुरोध अस्वीकृत कर दी गई है।${note ? `\nकारण: ${note}` : ''}\n\nकृपया अनुसार योजना बनाएं।`;
-    if (lang === 'ar') return `[QueueUp]\nتم رفض الإجازة\n\nمرحباً ${name},\nتم رفض طلب إجازتك بتاريخ ${when}.${note ? `\nالسبب: ${note}` : ''}\n\nيرجى التخطيط وفقاً لذلك.`;
-    if (lang === 'es') return `[QueueUp]\nPermiso rechazado\n\nHola ${name},\nTu solicitud de permiso para ${when} fue rechazada.${note ? `\nMotivo: ${note}` : ''}\n\nPor favor, planifica en consecuencia.`;
-    return `[QueueUp]\nLeave Rejected\n\nHello ${name},\nYour leave request for ${when} has been rejected.${note ? `\nReason: ${note}` : ''}\n\nPlease plan accordingly.`;
+    if (lang === 'hi') return `QueueUp\nछुट्टी अस्वीकृत\n\nनमस्ते ${name},\n${when} की आपकी छुट्टी अनुरोध अस्वीकृत कर दी गई है।${note ? `\nकारण: ${note}` : ''}\n\nकृपया अनुसार योजना बनाएं।`;
+    if (lang === 'ar') return `QueueUp\nتم رفض الإجازة\n\nمرحباً ${name},\nتم رفض طلب إجازتك بتاريخ ${when}.${note ? `\nالسبب: ${note}` : ''}\n\nيرجى التخطيط وفقاً لذلك.`;
+    if (lang === 'es') return `QueueUp\nPermiso rechazado\n\nHola ${name},\nTu solicitud de permiso para ${when} fue rechazada.${note ? `\nMotivo: ${note}` : ''}\n\nPor favor, planifica en consecuencia.`;
+    return `QueueUp\nLeave Rejected\n\nHello ${name},\nYour leave request for ${when} has been rejected.${note ? `\nReason: ${note}` : ''}\n\nPlease plan accordingly.`;
 }
 
 function leaveDecisionToOwnerMessage(language: string, employeeName: string, when: string, approved: boolean, reason?: string): string {
@@ -65,15 +65,15 @@ function leaveDecisionToOwnerMessage(language: string, employeeName: string, whe
     const safeEmployee = employeeName || 'Employee';
     const note = String(reason || '').trim();
     if (approved) {
-        if (lang === 'hi') return `[QueueUp]\nछुट्टी निर्णय अपडेट\n\n${safeEmployee} की छुट्टी ${when} के लिए स्वीकृत कर दी गई है।`;
-        if (lang === 'ar') return `[QueueUp]\nتحديث قرار الإجازة\n\nتمت الموافقة على إجازة ${safeEmployee} بتاريخ ${when}.`;
-        if (lang === 'es') return `[QueueUp]\nActualización de permiso\n\nSe aprobó el permiso de ${safeEmployee} para ${when}.`;
-        return `[QueueUp]\nLeave Decision Update\n\n${safeEmployee}'s leave for ${when} has been approved.`;
+        if (lang === 'hi') return `QueueUp\nछुट्टी निर्णय अपडेट\n\n${safeEmployee} की छुट्टी ${when} के लिए स्वीकृत कर दी गई है।`;
+        if (lang === 'ar') return `QueueUp\nتحديث قرار الإجازة\n\nتمت الموافقة على إجازة ${safeEmployee} بتاريخ ${when}.`;
+        if (lang === 'es') return `QueueUp\nActualización de permiso\n\nSe aprobó el permiso de ${safeEmployee} para ${when}.`;
+        return `QueueUp\nLeave Decision Update\n\n${safeEmployee}'s leave for ${when} has been approved.`;
     }
-    if (lang === 'hi') return `[QueueUp]\nछुट्टी निर्णय अपडेट\n\n${safeEmployee} की छुट्टी ${when} के लिए अस्वीकृत कर दी गई है।${note ? `\nकारण: ${note}` : ''}`;
-    if (lang === 'ar') return `[QueueUp]\nتحديث قرار الإجازة\n\nتم رفض إجازة ${safeEmployee} بتاريخ ${when}.${note ? `\nالسبب: ${note}` : ''}`;
-    if (lang === 'es') return `[QueueUp]\nActualización de permiso\n\nSe rechazó el permiso de ${safeEmployee} para ${when}.${note ? `\nMotivo: ${note}` : ''}`;
-    return `[QueueUp]\nLeave Decision Update\n\n${safeEmployee}'s leave for ${when} has been rejected.${note ? `\nReason: ${note}` : ''}`;
+    if (lang === 'hi') return `QueueUp\nछुट्टी निर्णय अपडेट\n\n${safeEmployee} की छुट्टी ${when} के लिए अस्वीकृत कर दी गई है।${note ? `\nकारण: ${note}` : ''}`;
+    if (lang === 'ar') return `QueueUp\nتحديث قرار الإجازة\n\nتم رفض إجازة ${safeEmployee} بتاريخ ${when}.${note ? `\nالسبب: ${note}` : ''}`;
+    if (lang === 'es') return `QueueUp\nActualización de permiso\n\nSe rechazó el permiso de ${safeEmployee} para ${when}.${note ? `\nMotivo: ${note}` : ''}`;
+    return `QueueUp\nLeave Decision Update\n\n${safeEmployee}'s leave for ${when} has been rejected.${note ? `\nReason: ${note}` : ''}`;
 }
 
 function resignationRequestToOwnerMessage(language: string, employeeName: string, requestedLastDate?: string, reason?: string): string {
@@ -82,15 +82,15 @@ function resignationRequestToOwnerMessage(language: string, employeeName: string
     const safeDate = requestedLastDate || 'N/A';
     const safeReason = String(reason || '').trim() || 'Not provided';
     if (lang === 'hi') {
-        return `[QueueUp]\nनया इस्तीफा अनुरोध\n\nकर्मचारी: ${safeEmployee}\nअंतिम कार्य तिथि: ${safeDate}\nकारण: ${safeReason}\n\nकृपया डैशबोर्ड से समीक्षा करें।`;
+        return `QueueUp\nनया इस्तीफा अनुरोध\n\nकर्मचारी: ${safeEmployee}\nअंतिम कार्य तिथि: ${safeDate}\nकारण: ${safeReason}\n\nकृपया डैशबोर्ड से समीक्षा करें।`;
     }
     if (lang === 'ar') {
-        return `[QueueUp]\nطلب استقالة جديد\n\nالموظف: ${safeEmployee}\nآخر يوم عمل: ${safeDate}\nالسبب: ${safeReason}\n\nيرجى المراجعة من لوحة التحكم.`;
+        return `QueueUp\nطلب استقالة جديد\n\nالموظف: ${safeEmployee}\nآخر يوم عمل: ${safeDate}\nالسبب: ${safeReason}\n\nيرجى المراجعة من لوحة التحكم.`;
     }
     if (lang === 'es') {
-        return `[QueueUp]\nNueva solicitud de renuncia\n\nEmpleado: ${safeEmployee}\nUltimo dia laboral: ${safeDate}\nMotivo: ${safeReason}\n\nRevisa la solicitud desde el panel.`;
+        return `QueueUp\nNueva solicitud de renuncia\n\nEmpleado: ${safeEmployee}\nUltimo dia laboral: ${safeDate}\nMotivo: ${safeReason}\n\nRevisa la solicitud desde el panel.`;
     }
-    return `[QueueUp]\nNew Resignation Request\n\nEmployee: ${safeEmployee}\nRequested Last Date: ${safeDate}\nReason: ${safeReason}\n\nPlease review in dashboard.`;
+    return `QueueUp\nNew Resignation Request\n\nEmployee: ${safeEmployee}\nRequested Last Date: ${safeDate}\nReason: ${safeReason}\n\nPlease review in dashboard.`;
 }
 
 const isMissingColumnError = (error: any, columnName: string) => {
