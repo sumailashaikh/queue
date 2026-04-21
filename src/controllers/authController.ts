@@ -32,6 +32,23 @@ function userSafeOtpTemplateMessage(error: unknown): string | null {
     return null;
 }
 
+function normalizeErrorMessage(error: unknown, fallback: string): string {
+    const direct = (error as any)?.message;
+    if (typeof direct === 'string') {
+        const trimmed = direct.trim();
+        if (trimmed && trimmed !== '{}' && trimmed !== '[object Object]') return trimmed;
+    }
+
+    try {
+        const asJson = JSON.stringify(error);
+        if (asJson && asJson !== '{}' && asJson !== 'null' && asJson !== 'undefined') return asJson;
+    } catch {
+        // ignore stringify issues and use fallback
+    }
+
+    return fallback;
+}
+
 export const sendOtp = async (req: Request, res: Response) => {
     try {
         let { phone } = req.body;
@@ -80,7 +97,7 @@ export const sendOtp = async (req: Request, res: Response) => {
             ? connectivity
             : (raw.includes('63038') || raw.includes('daily messages limit') || raw.includes('twilio'))
               ? 'OTP service is temporarily busy. Please try again after some time.'
-              : (error.message || 'Failed to send OTP');
+              : normalizeErrorMessage(error, 'Failed to send OTP');
         res.status(400).json({
             status: 'error',
             message: safeMessage
@@ -404,10 +421,12 @@ export const verifyOtp = async (req: Request, res: Response) => {
         console.error('[AUTH] verifyOtp critical error:', error);
         
         // Differentiate between Auth errors (bad OTP) and Server errors
-        const isAuthError = error.status === 400 || error.message?.toLowerCase().includes('otp') || error.message?.toLowerCase().includes('verification');
+        const rawMessage = normalizeErrorMessage(error, 'An unexpected error occurred');
+        const lowerRaw = rawMessage.toLowerCase();
+        const isAuthError = error.status === 400 || lowerRaw.includes('otp') || lowerRaw.includes('verification');
         const connectivity = userSafeConnectivityMessage(error);
         const message =
-            connectivity || error.message || 'An unexpected error occurred';
+            connectivity || rawMessage;
 
         res.status(isAuthError ? 401 : 500).json({
             status: 'error',
