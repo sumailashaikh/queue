@@ -238,7 +238,7 @@ async function handleApprovedLeaveImpact(
         .gte('appointments.start_time', `${startDate}T00:00:00.000Z`)
         .lte('appointments.start_time', `${endDate}T23:59:59.999Z`);
 
-    const appointmentIds = Array.from(
+    const appointmentIds: string[] = Array.from(
         new Set(
             (affectedApptRows || [])
                 .map((r: any) => String(r.appointment_id || ''))
@@ -255,7 +255,7 @@ async function handleApprovedLeaveImpact(
             })
             .in('id', appointmentIds);
         await Promise.allSettled(
-            appointmentIds.map((id: string) => notifyAppointmentCustomer(adminSupabase, id, 'pending'))
+            appointmentIds.map((id) => notifyAppointmentCustomer(adminSupabase, id, 'pending'))
         );
     }
 
