@@ -30,6 +30,13 @@ begin
   if p_tasks is null or jsonb_typeof(p_tasks) <> 'array' or jsonb_array_length(p_tasks) = 0 then
     raise exception 'At least one task is required to create queue entry';
   end if;
+  if exists (
+    select 1
+    from jsonb_to_recordset(p_tasks) as x(service_id uuid)
+    where x.service_id is null
+  ) then
+    raise exception 'Each task must contain a non-null service_id';
+  end if;
 
   insert into public.queue_entries (
     queue_id,

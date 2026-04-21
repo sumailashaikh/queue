@@ -507,7 +507,7 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
                 *,
                 businesses!business_id (id, name, owner_id, checkin_creates_queue_entry, timezone),
                 appointment_services!appointment_id (
-                    id, price, duration_minutes,
+                    id, price, duration_minutes, assigned_provider_id,
                     services!service_id (id, name)
                 ),
                 profiles (full_name, phone)
@@ -566,6 +566,17 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
                     const totalDur = appointment.appointment_services?.reduce((acc: number, s: any) => acc + (s.duration_minutes || 0), 0) || 0;
                     const totalPri = appointment.appointment_services?.reduce((acc: number, s: any) => acc + (Number(s.price) || 0), 0) || 0;
                     const sNames = appointment.appointment_services?.map((s: any) => s.services?.name).filter(Boolean).join(', ') || 'Service';
+                    const assignedProviderId =
+                        appointment.appointment_services?.find((s: any) => !!s?.assigned_provider_id)?.assigned_provider_id || null;
+                    let assignedToUserId: string | null = null;
+                    if (assignedProviderId) {
+                        const { data: providerRow } = await supabase
+                            .from('service_providers')
+                            .select('user_id')
+                            .eq('id', assignedProviderId)
+                            .maybeSingle();
+                        assignedToUserId = providerRow?.user_id || null;
+                    }
 
                     const { data: newEntry } = await supabase.from('queue_entries').insert([{
                         queue_id: queue.id, appointment_id: id, user_id: appointment.user_id,
@@ -573,12 +584,18 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
                         phone: (appointment.profiles?.phone || appointment.guest_phone || null),
                         service_name: sNames, status: 'waiting', position: nextPos,
                         ticket_number: `A-${nextPos}`, entry_date: todayStr,
-                        total_price: totalPri, total_duration_minutes: totalDur
+                        total_price: totalPri, total_duration_minutes: totalDur,
+                        assigned_provider_id: assignedProviderId,
+                        assigned_to: assignedToUserId
                     }]).select().single();
 
                     if (newEntry && appointment.appointment_services) {
                         const junctions = appointment.appointment_services.map((as: any) => ({
-                            queue_entry_id: newEntry.id, service_id: as.services.id, price: as.price || 0, duration_minutes: as.duration_minutes || 0
+                            queue_entry_id: newEntry.id,
+                            service_id: as.services.id,
+                            price: as.price || 0,
+                            duration_minutes: as.duration_minutes || 0,
+                            assigned_provider_id: as.assigned_provider_id || null
                         }));
                         await supabase.from('queue_entry_services').insert(junctions);
                     }

@@ -383,6 +383,49 @@ export const createQueue = async (req: Request, res: Response) => {
 
 import fs from "fs";
 
+const resolveDefaultServiceForBusiness = async (
+  supabase: any,
+  businessId: string,
+  canCreateDefault: boolean,
+  defaultDuration: number,
+  defaultPrice: number,
+) => {
+  const { data: generalService } = await supabase
+    .from("services")
+    .select("id, name, duration_minutes, price")
+    .eq("business_id", businessId)
+    .ilike("name", "General Service")
+    .limit(1)
+    .maybeSingle();
+  if (generalService?.id) return generalService;
+
+  if (canCreateDefault) {
+    const { data: createdDefault } = await supabase
+      .from("services")
+      .insert([
+        {
+          business_id: businessId,
+          name: "General Service",
+          duration_minutes: Math.max(5, Number(defaultDuration || 10)),
+          price: Number(defaultPrice || 0),
+          translations: {},
+        },
+      ])
+      .select("id, name, duration_minutes, price")
+      .maybeSingle();
+    if (createdDefault?.id) return createdDefault;
+  }
+
+  const { data: firstService } = await supabase
+    .from("services")
+    .select("id, name, duration_minutes, price")
+    .eq("business_id", businessId)
+    .order("created_at", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  return firstService || null;
+};
+
 export const joinQueue = async (req: Request, res: Response) => {
   try {
     const {
@@ -538,13 +581,31 @@ export const joinQueue = async (req: Request, res: Response) => {
     const currentWaitTime = Math.round(currentWaitTimeTotal / providerCount);
 
     // Fetch selected services for duration
-    let selectedServices = [];
+    let selectedServices: any[] = [];
     if (service_ids && service_ids.length > 0) {
       const { data: sData } = await supabase
         .from("services")
         .select("id, name, duration_minutes, price")
         .in("id", service_ids);
       selectedServices = sData || [];
+    }
+
+    if (!selectedServices.length) {
+      const fallbackService = await resolveDefaultServiceForBusiness(
+        supabase,
+        queueInfo.business_id,
+        !!user_id, // allow auto-create only for authenticated owner/admin flows
+        queueInfo.businesses?.default_duration || 10,
+        queueInfo.businesses?.default_price || 0,
+      );
+      if (!fallbackService?.id) {
+        return res.status(400).json({
+          status: "error",
+          message:
+            "No services are configured for this business. Please add at least one service first.",
+        });
+      }
+      selectedServices = [fallbackService];
     }
 
     const serviceDuration = selectedServices.reduce(
@@ -627,14 +688,7 @@ export const joinQueue = async (req: Request, res: Response) => {
             price: service.price || 0,
             duration_minutes: service.duration_minutes || 0,
           }))
-        : [
-            {
-              service_id: null,
-              assigned_provider_id: provider_id || null,
-              price: queueInfo.businesses?.default_price || 0,
-              duration_minutes: queueInfo.businesses?.default_duration || 5,
-            },
-          ];
+        : [];
 
     const { data, error } = await supabase.rpc(
       "create_queue_entry_with_tasks",
@@ -3002,10 +3056,24 @@ export const initializeEntryTasks = async (req: Request, res: Response) => {
       .single();
 
     // 3. Insert default manual service slot (Assign provider immediately if provided)
+    const fallbackService = await resolveDefaultServiceForBusiness(
+      supabase,
+      queueData?.business_id,
+      true,
+      (queueData as any)?.businesses?.default_duration || 10,
+      (queueData as any)?.businesses?.default_price || 0,
+    );
+    if (!fallbackService?.id) {
+      return res.status(400).json({
+        status: "error",
+        message:
+          "No services are configured for this business. Please add at least one service first.",
+      });
+    }
     await supabase.from("queue_entry_services").insert([
       {
         queue_entry_id: id,
-        service_id: null,
+        service_id: fallbackService.id,
         assigned_provider_id: provider_id || null,
         price: (queueData as any)?.businesses?.default_price || 0,
         duration_minutes:
