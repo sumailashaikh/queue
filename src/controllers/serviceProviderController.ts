@@ -2288,6 +2288,7 @@ export const getLeaveAlerts = async (req: Request, res: Response) => {
                 start_date,
                 end_date,
                 leave_type,
+                leave_kind,
                 status,
                 note,
                 service_providers(id, name)
@@ -2321,10 +2322,13 @@ export const getLeaveAlerts = async (req: Request, res: Response) => {
                 const appointmentIds = Array.from(new Set((apptRows || []).map((r: any) => String(r.appointment_id)).filter(Boolean)));
                 return {
                     leave_id: lv.id,
+                    provider_id: lv.provider_id,
                     employee_name: lv.service_providers?.name || 'Employee',
                     leave_date: lv.start_date === lv.end_date ? lv.start_date : `${lv.start_date} to ${lv.end_date}`,
                     leave_type: lv.leave_type,
+                    leave_kind: lv.leave_kind,
                     leave_status: lv.status,
+                    high_priority: String(lv.leave_type || '').toLowerCase() === 'emergency' || String(lv.leave_kind || '').toUpperCase() === 'EMERGENCY',
                     note: lv.note || null,
                     affected_tasks: (taskRows || []).length,
                     affected_appointments: appointmentIds.length
