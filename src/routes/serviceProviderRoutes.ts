@@ -11,6 +11,7 @@ router.post('/', serviceProviderController.createServiceProvider);
 router.get('/me', serviceProviderController.getMyProviderProfile); // ADD ME
 router.get('/leaves/status', serviceProviderController.getBulkLeaveStatus);
 router.get('/leaves/pending-count', serviceProviderController.getPendingLeaveRequestsCount);
+router.get('/leaves/alerts', serviceProviderController.getLeaveAlerts);
 router.get('/', serviceProviderController.getServiceProviders);
 router.patch('/:id', serviceProviderController.updateServiceProvider);
 router.delete('/:id', serviceProviderController.deleteServiceProvider);

@@ -137,6 +137,134 @@ const validateTextByLanguage = (text: string, language: string): boolean => {
     }
 };
 
+function appointmentActionMessage(lang: string, action: 'reassigned' | 'rescheduled' | 'pending'): string {
+    const l = baseLang(lang);
+    if (action === 'reassigned') {
+        if (l === 'hi') return 'आपकी अपॉइंटमेंट को नए कर्मचारी को असाइन कर दिया गया है।';
+        if (l === 'ar') return 'تمت إعادة تعيين موعدك إلى موظف آخر.';
+        if (l === 'es') return 'Tu cita ha sido reasignada a otro empleado.';
+        return 'Your appointment has been reassigned.';
+    }
+    if (action === 'rescheduled') {
+        if (l === 'hi') return 'आपकी अपॉइंटमेंट का समय बदल दिया गया है।';
+        if (l === 'ar') return 'تمت إعادة جدولة موعدك.';
+        if (l === 'es') return 'Tu cita ha sido reprogramada.';
+        return 'Your appointment has been rescheduled.';
+    }
+    if (l === 'hi') return 'हम आपकी बुकिंग अपडेट कर रहे हैं।';
+    if (l === 'ar') return 'نحن نقوم بتحديث حجزك.';
+    if (l === 'es') return 'Estamos actualizando tu reserva.';
+    return 'We are updating your booking.';
+}
+
+async function notifyAppointmentCustomer(
+    adminSupabase: any,
+    appointmentId: string,
+    action: 'reassigned' | 'rescheduled' | 'pending'
+) {
+    const { notificationService, toE164Phone } = require('../services/notificationService');
+    const { data: appt } = await adminSupabase
+        .from('appointments')
+        .select('id, user_id, guest_phone')
+        .eq('id', appointmentId)
+        .maybeSingle();
+    if (!appt) return false;
+
+    let targetPhone: string | null = appt.guest_phone || null;
+    let uiLang = 'en';
+    if (appt.user_id) {
+        const { data: p } = await adminSupabase
+            .from('profiles')
+            .select('phone, ui_language')
+            .eq('id', appt.user_id)
+            .maybeSingle();
+        targetPhone = targetPhone || p?.phone || null;
+        uiLang = p?.ui_language || 'en';
+    }
+    const to = toE164Phone(String(targetPhone || ''));
+    if (!to) return false;
+    const message = appointmentActionMessage(uiLang, action);
+    const [wa, sms] = await Promise.allSettled([
+        notificationService.sendWhatsApp(to, message),
+        notificationService.sendSMS(to, message)
+    ]);
+    return (wa.status === 'fulfilled' && wa.value === true) || (sms.status === 'fulfilled' && sms.value === true);
+}
+
+async function handleApprovedLeaveImpact(
+    adminSupabase: any,
+    leave: any
+): Promise<{ affected_tasks: number; affected_appointments: number }> {
+    const providerId = String(leave?.provider_id || '');
+    const businessId = String(leave?.business_id || '');
+    const startDate = String(leave?.start_date || '').slice(0, 10);
+    const endDate = String(leave?.end_date || '').slice(0, 10);
+    if (!providerId || !businessId || !startDate || !endDate) {
+        return { affected_tasks: 0, affected_appointments: 0 };
+    }
+
+    const { data: affectedTaskRows } = await adminSupabase
+        .from('queue_entry_services')
+        .select(`
+            id,
+            queue_entry_id,
+            task_status,
+            queue_entries!inner(id, entry_date, queue_id)
+        `)
+        .eq('assigned_provider_id', providerId)
+        .in('task_status', ['pending', 'in_progress'])
+        .gte('queue_entries.entry_date', startDate)
+        .lte('queue_entries.entry_date', endDate);
+
+    const taskIds = (affectedTaskRows || []).map((r: any) => r.id);
+    if (taskIds.length > 0) {
+        await adminSupabase
+            .from('queue_entry_services')
+            .update({
+                assigned_provider_id: null,
+                task_status: 'pending',
+                needs_reassignment: true
+            })
+            .in('id', taskIds);
+    }
+
+    const { data: affectedApptRows } = await adminSupabase
+        .from('appointment_services')
+        .select(`
+            appointment_id,
+            appointments:appointment_id(id, start_time, status)
+        `)
+        .eq('assigned_provider_id', providerId)
+        .gte('appointments.start_time', `${startDate}T00:00:00.000Z`)
+        .lte('appointments.start_time', `${endDate}T23:59:59.999Z`);
+
+    const appointmentIds = Array.from(
+        new Set(
+            (affectedApptRows || [])
+                .map((r: any) => String(r.appointment_id || ''))
+                .filter(Boolean)
+        )
+    );
+
+    if (appointmentIds.length > 0) {
+        await adminSupabase
+            .from('appointments')
+            .update({
+                status: 'needs_attention',
+                needs_reschedule: true
+            })
+            .in('id', appointmentIds);
+        await Promise.allSettled(
+            appointmentIds.map((id: string) => notifyAppointmentCustomer(adminSupabase, id, 'pending'))
+        );
+    }
+
+    return {
+        affected_tasks: taskIds.length,
+        affected_appointments: appointmentIds.length
+    };
+}
+
 export const createServiceProvider = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
@@ -1780,6 +1908,7 @@ export const applyAutoReassignPlan = async (req: Request, res: Response) => {
                         .eq('assigned_provider_id', provider.id);
                     if (uErr) throw uErr;
                     await adminSupabase.from('appointments').update({ needs_reschedule: false }).eq('id', appointmentId);
+                    await notifyAppointmentCustomer(adminSupabase, appointmentId, 'reassigned');
                     results.push({ appointment_id: appointmentId, ok: true, action: 'reassigned', to_provider_id: toProviderId });
                 } else {
                     // No provider available: mark needs_reschedule and unassign from appointment_services
@@ -1793,6 +1922,7 @@ export const applyAutoReassignPlan = async (req: Request, res: Response) => {
                         .eq('appointment_id', appointmentId)
                         .eq('assigned_provider_id', provider.id);
                     await adminSupabase.from('appointments').update({ needs_reschedule: true }).eq('id', appointmentId);
+                    await notifyAppointmentCustomer(adminSupabase, appointmentId, 'pending');
                     results.push({ appointment_id: appointmentId, ok: true, action: 'needs_reschedule' });
                 }
             } catch (e: any) {
@@ -1904,6 +2034,11 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
         }
         if (error) throw error;
 
+        let impactSummary = { affected_tasks: 0, affected_appointments: 0 };
+        if (status === 'APPROVED') {
+            impactSummary = await handleApprovedLeaveImpact(adminSupabase, leave);
+        }
+
         // 3. Notify Employee
         let recipientPhone = leave.service_providers?.phone;
         if (!recipientPhone && leave.service_providers?.user_id) {
@@ -1977,6 +2112,8 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             message: 'providers.success_leave_status_updated',
             data,
             leave_status: status,
+            affected_tasks: impactSummary.affected_tasks,
+            affected_appointments: impactSummary.affected_appointments,
             notification_sent: notificationSent,
             owner_notification_sent: ownerNotificationSent
         });
@@ -2121,6 +2258,83 @@ export const getBulkLeaveStatus = async (req: Request, res: Response) => {
 
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const getLeaveAlerts = async (req: Request, res: Response) => {
+    try {
+        const { business_id } = req.query;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
+
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!business_id) return res.status(400).json({ status: 'error', message: 'business_id is required' });
+
+        const { data: business } = await supabase
+            .from('businesses')
+            .select('id')
+            .eq('id', business_id)
+            .eq('owner_id', userId)
+            .maybeSingle();
+        if (!business) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data: leaves } = await adminSupabase
+            .from('provider_leaves')
+            .select(`
+                id,
+                provider_id,
+                business_id,
+                start_date,
+                end_date,
+                leave_type,
+                status,
+                note,
+                service_providers(id, name)
+            `)
+            .eq('business_id', business_id)
+            .in('status', ['PENDING', 'APPROVED'])
+            .order('start_date', { ascending: true })
+            .limit(25);
+
+        const alerts = await Promise.all(
+            (leaves || []).map(async (lv: any) => {
+                const providerId = String(lv.provider_id || '');
+                const startDate = String(lv.start_date || '').slice(0, 10);
+                const endDate = String(lv.end_date || '').slice(0, 10);
+
+                const { data: taskRows } = await adminSupabase
+                    .from('queue_entry_services')
+                    .select('id, queue_entries!inner(entry_date)')
+                    .eq('assigned_provider_id', providerId)
+                    .in('task_status', ['pending', 'in_progress'])
+                    .gte('queue_entries.entry_date', startDate)
+                    .lte('queue_entries.entry_date', endDate);
+
+                const { data: apptRows } = await adminSupabase
+                    .from('appointment_services')
+                    .select('appointment_id, appointments:appointment_id(id, start_time, status)')
+                    .eq('assigned_provider_id', providerId)
+                    .gte('appointments.start_time', `${startDate}T00:00:00.000Z`)
+                    .lte('appointments.start_time', `${endDate}T23:59:59.999Z`);
+
+                const appointmentIds = Array.from(new Set((apptRows || []).map((r: any) => String(r.appointment_id)).filter(Boolean)));
+                return {
+                    leave_id: lv.id,
+                    employee_name: lv.service_providers?.name || 'Employee',
+                    leave_date: lv.start_date === lv.end_date ? lv.start_date : `${lv.start_date} to ${lv.end_date}`,
+                    leave_type: lv.leave_type,
+                    leave_status: lv.status,
+                    note: lv.note || null,
+                    affected_tasks: (taskRows || []).length,
+                    affected_appointments: appointmentIds.length
+                };
+            })
+        );
+
+        return res.status(200).json({ status: 'success', data: alerts });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
     }
 };
 
