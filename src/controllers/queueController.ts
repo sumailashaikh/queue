@@ -2359,7 +2359,22 @@ export const startTask = async (req: Request, res: Response) => {
         .json({ status: "error", message: "Task not found" });
     }
 
-    const businessId = task.queue_entries?.queues?.business_id;
+    // Some PostgREST embeds can be returned as arrays depending on relation inference.
+    // Normalize once so downstream checks don't break with undefined IDs.
+    const taskEntry = Array.isArray((task as any).queue_entries)
+      ? (task as any).queue_entries[0]
+      : (task as any).queue_entries;
+    const taskQueue = Array.isArray(taskEntry?.queues)
+      ? taskEntry?.queues[0]
+      : taskEntry?.queues;
+    const businessId = taskQueue?.business_id;
+    if (!businessId) {
+      return res.status(400).json({
+        status: "error",
+        message: "Invalid task context: missing business information.",
+      });
+    }
+
     const { data: business } = await adminSupabase
       .from("businesses")
       .select("owner_id")
@@ -2437,9 +2452,8 @@ export const startTask = async (req: Request, res: Response) => {
 
     const busyTasks = rawBusyTasks?.filter(
       (b: any) =>
-        b.queue_entries?.entry_date === task.queue_entries.entry_date &&
-        b.queue_entries?.queues?.business_id ===
-          task.queue_entries.queues.business_id &&
+        b.queue_entries?.entry_date === taskEntry?.entry_date &&
+        b.queue_entries?.queues?.business_id === businessId &&
         b.queue_entries?.status === "serving",
     );
 
@@ -2482,7 +2496,7 @@ export const startTask = async (req: Request, res: Response) => {
     });
 
     // 4. Update parent entry status to 'serving' if it's currently 'waiting'
-    if (task.queue_entries.status === "waiting") {
+    if (taskEntry?.status === "waiting") {
       await adminSupabase
         .from("queue_entries")
         .update({
@@ -2490,22 +2504,22 @@ export const startTask = async (req: Request, res: Response) => {
           served_at: now.toISOString(),
           service_started_at: now.toISOString(), // First task start marks entry start
         })
-        .eq("id", task.queue_entries.id);
+        .eq("id", taskEntry.id);
 
       // Sync with parent appointment
-      if (task.queue_entries.appointment_id) {
+      if (taskEntry?.appointment_id) {
         await adminSupabase
           .from("appointments")
           .update({ status: "in_service" })
-          .eq("id", task.queue_entries.appointment_id);
+          .eq("id", taskEntry.appointment_id);
       }
 
       // Send Notification for first service start
       const recipient =
-        task.queue_entries.phone ||
-        (task.queue_entries.user_id
-          ? `User-${task.queue_entries.user_id}`
-          : `Guest-${task.queue_entries.customer_name}`);
+        taskEntry?.phone ||
+        (taskEntry?.user_id
+          ? `User-${taskEntry.user_id}`
+          : `Guest-${taskEntry?.customer_name}`);
       const etaStr = estEnd.toLocaleTimeString("en-IN", {
         hour: "2-digit",
         minute: "2-digit",
@@ -2513,7 +2527,7 @@ export const startTask = async (req: Request, res: Response) => {
       });
       await notificationService.sendSMS(
         recipient,
-        `Hello ${task.queue_entries.customer_name}, your service has started! Estimated time for this task: ${etaStr}. Thank you!`,
+        `Hello ${taskEntry?.customer_name || "Guest"}, your service has started! Estimated time for this task: ${etaStr}. Thank you!`,
       );
     }
 
@@ -2631,13 +2645,23 @@ export const completeTask = async (req: Request, res: Response) => {
       .select();
 
     if (updateError) throw updateError;
-    const updatedTask = Array.isArray(updatedTasks)
+    let updatedTask = Array.isArray(updatedTasks)
       ? updatedTasks[0]
       : updatedTasks;
+    // Some environments may apply update but return empty representation.
+    // Re-read once before failing to avoid false 404s on successful "Done" actions.
     if (!updatedTask) {
-      return res
-        .status(404)
-        .json({ status: "error", message: "Task not found after update" });
+      const { data: refetchedTask, error: refetchErr } = await adminSupabase
+        .from("queue_entry_services")
+        .select("*")
+        .eq("id", id)
+        .maybeSingle();
+      if (refetchErr || !refetchedTask) {
+        return res
+          .status(404)
+          .json({ status: "error", message: "Task not found after update" });
+      }
+      updatedTask = refetchedTask;
     }
 
     // Recompute delays based on actual completion time
