@@ -617,56 +617,47 @@ export const joinQueue = async (req: Request, res: Response) => {
       assignedToUserId = providerRow?.user_id || null;
     }
 
-    // 4. Insert Entry with entry_source
-    console.log(`[joinQueue] Inserting new queue entry.`);
-    const { data, error } = await supabase
-      .from("queue_entries")
-      .insert([
-        {
-          queue_id,
-          user_id: user_id || null,
-          customer_name: customer_name || "Guest",
-          phone: phone || null,
-          service_name: serviceNamesDisplay,
-          status: "waiting",
-          position: nextPosition,
-          ticket_number,
-          status_token,
-          entry_date: todayStr,
-          total_price,
-          total_duration_minutes: serviceDuration,
-          entry_source: entry_source || "online",
-          assigned_provider_id: provider_id || null,
-          assigned_to: assignedToUserId,
-        },
-      ])
-      .select()
-      .single();
+    // 4. Atomic insert (queue entry + tasks) via SQL function.
+    console.log(`[joinQueue] Inserting atomic queue entry + tasks.`);
+    const tasksPayload =
+      selectedServices.length > 0
+        ? selectedServices.map((service: any) => ({
+            service_id: service.id,
+            assigned_provider_id: provider_id || null,
+            price: service.price || 0,
+            duration_minutes: service.duration_minutes || 0,
+          }))
+        : [
+            {
+              service_id: null,
+              assigned_provider_id: provider_id || null,
+              price: queueInfo.businesses?.default_price || 0,
+              duration_minutes: queueInfo.businesses?.default_duration || 5,
+            },
+          ];
 
+    const { data, error } = await supabase.rpc(
+      "create_queue_entry_with_tasks",
+      {
+        p_queue_id: queue_id,
+        p_user_id: user_id || null,
+        p_customer_name: customer_name || "Guest",
+        p_phone: phone || null,
+        p_service_name: serviceNamesDisplay,
+        p_status: "waiting",
+        p_position: nextPosition,
+        p_ticket_number: ticket_number,
+        p_status_token: status_token,
+        p_entry_date: todayStr,
+        p_total_price: total_price,
+        p_total_duration_minutes: serviceDuration,
+        p_entry_source: entry_source || "online",
+        p_assigned_provider_id: provider_id || null,
+        p_assigned_to: assignedToUserId,
+        p_tasks: tasksPayload,
+      },
+    );
     if (error) throw error;
-
-    // Junction table insertion
-    if (selectedServices.length > 0) {
-      const junctionEntries = selectedServices.map((service: any) => ({
-        queue_entry_id: data.id,
-        service_id: service.id,
-        price: service.price || 0,
-        duration_minutes: service.duration_minutes || 0,
-        assigned_provider_id: provider_id || null,
-      }));
-      await supabase.from("queue_entry_services").insert(junctionEntries);
-    } else {
-      // Provide a bare-minimum service slot for manual additions
-      await supabase.from("queue_entry_services").insert([
-        {
-          queue_entry_id: data.id,
-          service_id: null,
-          assigned_provider_id: provider_id || null,
-          price: queueInfo.businesses?.default_price || 0,
-          duration_minutes: queueInfo.businesses?.default_duration || 5,
-        },
-      ]);
-    }
 
     // Send Notifications
     const isOnline = (entry_source || "online") === "online";
