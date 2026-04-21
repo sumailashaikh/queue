@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getAllQueues, createQueue, joinQueue, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry, extendTime, assignTaskProvider, startTask, completeTask, noShowQueueEntry, skipQueueEntry, updateQueueEntryPayment, restoreQueueEntry, initializeEntryTasks, getMyTasks } from '../controllers/queueController';
+import { getAllQueues, createQueue, joinQueue, createWalkIn, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry, extendTime, assignTaskProvider, startTask, completeTask, noShowQueueEntry, skipQueueEntry, updateQueueEntryPayment, restoreQueueEntry, initializeEntryTasks, getMyTasks } from '../controllers/queueController';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -10,6 +10,7 @@ router.post('/join', joinQueue); // Customers can join without login
 
 // Protected/Admin routes
 router.post('/', requireAuth, createQueue);
+router.post('/walk-in', requireAuth, createWalkIn);
 router.get('/my', requireAuth, getMyQueues); // Must be before /:id to avoid conflict
 router.get('/my-tasks', requireAuth, getMyTasks); // ADD THIS
 router.put('/:id', requireAuth, updateQueue);

@@ -10,6 +10,7 @@ import serviceRoutes from './serviceRoutes';
 import adminRoutes from './adminRoutes';
 import publicRoutes from './publicRoutes';
 import serviceProviderRoutes from './serviceProviderRoutes';
+import employeeRoutes from './employeeRoutes';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -29,5 +30,6 @@ router.use('/services', serviceRoutes);
 router.use('/analytics', analyticsRoutes);
 router.use('/admin', adminRoutes);
 router.use('/service-providers', serviceProviderRoutes);
+router.use('/employee', employeeRoutes);
 
 export default router;

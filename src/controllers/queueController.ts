@@ -702,6 +702,23 @@ export const joinQueue = async (req: Request, res: Response) => {
   }
 };
 
+export const createWalkIn = async (req: Request, res: Response) => {
+  const { customer_name } = req.body || {};
+  if (!customer_name || !String(customer_name).trim()) {
+    return res.status(400).json({
+      status: "error",
+      message: "Customer name is required for walk-in",
+    });
+  }
+
+  req.body = {
+    ...req.body,
+    entry_source: "manual",
+  };
+
+  return joinQueue(req, res);
+};
+
 export const updateQueue = async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
