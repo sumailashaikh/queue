@@ -4,6 +4,7 @@ import { notificationService } from "../services/notificationService";
 import { isBusinessOpen, getLocalDateString } from "../utils/timeUtils";
 import { recomputeProviderDelays } from "../utils/delayLogic";
 import { isBlockingApprovedLeave } from "../utils/leaveStatus";
+import { checkProviderAvailabilityAt } from "../utils/providerAvailability";
 
 export const getAllQueues = async (req: Request, res: Response) => {
   try {
@@ -672,9 +673,25 @@ export const joinQueue = async (req: Request, res: Response) => {
     if (provider_id) {
       const { data: providerRow } = await supabase
         .from("service_providers")
-        .select("id, user_id")
+        .select("id, user_id, business_id, businesses(timezone)")
         .eq("id", provider_id)
         .maybeSingle();
+      if (!providerRow?.id) {
+        return res.status(400).json({ status: "error", message: "Selected employee is not valid." });
+      }
+      const availability = await checkProviderAvailabilityAt(
+        require("../config/supabaseClient").adminSupabase,
+        providerRow.id,
+        providerRow.business_id,
+        (providerRow as any)?.businesses?.timezone || "UTC",
+        new Date(),
+      );
+      if (!availability.available) {
+        return res.status(400).json({
+          status: "error",
+          message: "The selected employee is currently unavailable. Please choose another available employee.",
+        });
+      }
       assignedToUserId = providerRow?.user_id || null;
     }
 
@@ -2166,6 +2183,30 @@ export const assignTaskProvider = async (req: Request, res: Response) => {
                 "This expert is on leave and cannot be assigned to tasks on this date.",
             });
         }
+      }
+    }
+
+    if (provider_id) {
+      const { data: providerRow } = await adminSupabase
+        .from("service_providers")
+        .select("id, business_id, businesses(timezone)")
+        .eq("id", provider_id)
+        .maybeSingle();
+      if (!providerRow) {
+        return res.status(400).json({ status: "error", message: "Invalid provider." });
+      }
+      const availability = await checkProviderAvailabilityAt(
+        adminSupabase,
+        providerRow.id,
+        providerRow.business_id,
+        (providerRow as any)?.businesses?.timezone || "UTC",
+        new Date(),
+      );
+      if (!availability.available) {
+        return res.status(400).json({
+          status: "error",
+          message: "This expert is currently unavailable due to schedule, leave, or blocked time.",
+        });
       }
     }
 

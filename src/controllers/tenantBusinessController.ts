@@ -642,6 +642,42 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
         if (pErr) throw pErr;
 
         const providerIds = (providers || []).map((p: any) => p.id);
+        const currentDow = new Date(`${todayStr}T12:00:00`).getDay();
+        const nowLocal = now.toLocaleTimeString('en-GB', {
+            timeZone: business.timezone || 'UTC',
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+        const toMins = (t: string) => {
+            const [hh, mm] = String(t || '00:00').split(':').map(Number);
+            return (hh || 0) * 60 + (mm || 0);
+        };
+        const nowMins = toMins(nowLocal);
+
+        const { data: availabilityRows } = providerIds.length
+            ? await supabase
+                .from('provider_availability')
+                .select('provider_id, day_of_week, start_time, end_time, is_available')
+                .in('provider_id', providerIds)
+                .eq('day_of_week', currentDow)
+            : { data: [] as any[] };
+
+        const { data: dayOffRows } = providerIds.length
+            ? await supabase
+                .from('provider_day_offs')
+                .select('provider_id, day_off_type, start_time, end_time')
+                .in('provider_id', providerIds)
+                .eq('day_off_date', todayStr)
+            : { data: [] as any[] };
+
+        const { data: blockRows } = providerIds.length
+            ? await supabase
+                .from('provider_block_times')
+                .select('provider_id, start_time, end_time')
+                .in('provider_id', providerIds)
+                .eq('block_date', todayStr)
+            : { data: [] as any[] };
         const { data: queueLoadRows } = providerIds.length
             ? await supabase
                 .from('queue_entry_services')
@@ -730,17 +766,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
                 onLeaveNow = true;
                 remaining = 24 * 60;
             } else {
-                const toMins = (t: string) => {
-                    const [hh, mm] = String(t || '00:00').split(':').map(Number);
-                    return (hh || 0) * 60 + (mm || 0);
-                };
-                const nowLocal = now.toLocaleTimeString('en-GB', {
-                    timeZone: business.timezone || 'UTC',
-                    hour12: false,
-                    hour: '2-digit',
-                    minute: '2-digit'
-                });
-                const nowM = toMins(nowLocal);
+                const nowM = nowMins;
                 const startM = toMins(l.start_time || '00:00');
                 const endM = toMins(l.end_time || '23:59');
                 onLeaveNow = nowM >= startM && nowM < endM;
@@ -749,17 +775,55 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             if (onLeaveNow) leaveBusy.set(pid, { on_leave: true, remaining });
         });
 
+        const scheduleBusy = new Map<string, { reason: string; remaining?: number }>();
+        const availabilityMap = new Map<string, any>();
+        (availabilityRows || []).forEach((r: any) => availabilityMap.set(String(r.provider_id), r));
+        (providers || []).forEach((p: any) => {
+            const a = availabilityMap.get(String(p.id));
+            if (!a || a.is_available === false) {
+                scheduleBusy.set(String(p.id), { reason: 'off_day' });
+                return;
+            }
+            const s = toMins(String(a.start_time || '00:00').slice(0, 5));
+            const e = toMins(String(a.end_time || '23:59').slice(0, 5));
+            if (nowMins < s || nowMins >= e) {
+                const rem = nowMins < s ? s - nowMins : 24 * 60 - nowMins + s;
+                scheduleBusy.set(String(p.id), { reason: 'outside_working_hours', remaining: Math.max(0, rem) });
+            }
+        });
+        (dayOffRows || []).forEach((d: any) => {
+            const pid = String(d.provider_id || '');
+            if (!pid) return;
+            const type = String(d.day_off_type || 'full_day').toLowerCase();
+            if (type === 'full_day') {
+                scheduleBusy.set(pid, { reason: 'day_off' });
+                return;
+            }
+            const s = toMins(String(d.start_time || '00:00').slice(0, 5));
+            const e = toMins(String(d.end_time || '23:59').slice(0, 5));
+            if (nowMins >= s && nowMins < e) scheduleBusy.set(pid, { reason: 'day_off_partial', remaining: Math.max(0, e - nowMins) });
+        });
+        (blockRows || []).forEach((b: any) => {
+            const pid = String(b.provider_id || '');
+            if (!pid) return;
+            const s = toMins(String(b.start_time || '00:00').slice(0, 5));
+            const e = toMins(String(b.end_time || '23:59').slice(0, 5));
+            if (nowMins >= s && nowMins < e) scheduleBusy.set(pid, { reason: 'blocked_time', remaining: Math.max(0, e - nowMins) });
+        });
+
         const data = (providers || []).map((p: any) => ({
             ...(() => {
                 const leave = leaveBusy.get(p.id);
+                const schedule = scheduleBusy.get(p.id);
                 const qEta = queueEta.get(p.id) || 0;
                 const qBusy = !!queueInProgress.get(p.id) || (queueAhead.get(p.id) || 0) > 0;
                 const apBusy = !!apptBusyNow.get(p.id);
-                const blocked = !!leave || qBusy || apBusy;
-                const nextAvailable = Math.max(leave?.remaining || 0, qEta, apptNextEta.get(p.id) || 0);
-                const busySource = leave ? 'on_leave' : qBusy ? 'queue' : apBusy ? 'appointment' : 'free';
+                const blocked = !!leave || !!schedule || qBusy || apBusy;
+                const nextAvailable = Math.max(leave?.remaining || 0, schedule?.remaining || 0, qEta, apptNextEta.get(p.id) || 0);
+                const busySource = leave ? 'on_leave' : schedule ? schedule.reason : qBusy ? 'queue' : apBusy ? 'appointment' : 'free';
                 return {
                     is_on_leave: !!leave,
+                    is_on_schedule_block: !!schedule,
                     busy_source: busySource,
                     next_available_in_minutes: blocked ? nextAvailable : 0
                 };
@@ -772,7 +836,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             queue_ahead: Math.max(0, (queueAhead.get(p.id) || 0) - 1),
             estimated_wait_minutes: Math.max(queueEta.get(p.id) || 0, apptNextEta.get(p.id) || 0),
             active_appointments: apptActive.get(p.id) || 0,
-            is_available_now: !leaveBusy.get(p.id) && (queueAhead.get(p.id) || 0) === 0 && !apptBusyNow.get(p.id)
+            is_available_now: !leaveBusy.get(p.id) && !scheduleBusy.get(p.id) && (queueAhead.get(p.id) || 0) === 0 && !apptBusyNow.get(p.id)
         }));
 
         res.status(200).json({ status: 'success', data });
@@ -812,7 +876,21 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
         };
         const openM = parseMins(String(business.open_time || '09:00').slice(0, 5));
         const closeM = parseMins(String(business.close_time || '21:00').slice(0, 5));
-        const bufferClose = closeM - 10;
+        const dayOfWeek = new Date(`${String(date).slice(0, 10)}T12:00:00`).getDay();
+        const { data: providerAvailability } = await supabase
+            .from('provider_availability')
+            .select('is_available, start_time, end_time')
+            .eq('provider_id', providerId)
+            .eq('day_of_week', dayOfWeek)
+            .limit(1)
+            .maybeSingle();
+        if (!providerAvailability || providerAvailability.is_available === false) {
+            return res.status(200).json({ status: 'success', data: { date: String(date).slice(0, 10), slots: [] } });
+        }
+        const providerStartM = parseMins(String(providerAvailability.start_time || '00:00').slice(0, 5));
+        const providerEndM = parseMins(String(providerAvailability.end_time || '23:59').slice(0, 5));
+        const bufferClose = Math.min(closeM - 10, providerEndM);
+
 
         const dayStart = `${String(date).slice(0, 10)}T00:00:00`;
         const dayEnd = `${String(date).slice(0, 10)}T23:59:59`;
@@ -877,6 +955,28 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             leaveBlocks.push({ startM: parse(l.start_time || '00:00'), endM: parse(l.end_time || '23:59') });
         });
 
+        const { data: dayOffRows } = await supabase
+            .from('provider_day_offs')
+            .select('day_off_type, start_time, end_time')
+            .eq('provider_id', providerId)
+            .eq('day_off_date', String(date).slice(0, 10));
+        for (const d of dayOffRows || []) {
+            const type = String(d.day_off_type || 'full_day').toLowerCase();
+            if (type === 'full_day') {
+                return res.status(200).json({ status: 'success', data: { date: String(date).slice(0, 10), slots: [] } });
+            }
+            leaveBlocks.push({ startM: parseMins(String(d.start_time || '00:00').slice(0, 5)), endM: parseMins(String(d.end_time || '23:59').slice(0, 5)) });
+        }
+
+        const { data: blockTimeRows } = await supabase
+            .from('provider_block_times')
+            .select('start_time, end_time')
+            .eq('provider_id', providerId)
+            .eq('block_date', String(date).slice(0, 10));
+        (blockTimeRows || []).forEach((b: any) => {
+            leaveBlocks.push({ startM: parseMins(String(b.start_time || '00:00').slice(0, 5)), endM: parseMins(String(b.end_time || '23:59').slice(0, 5)) });
+        });
+
         const nowLocal = new Date().toLocaleTimeString('en-GB', {
             timeZone: business.timezone || 'UTC',
             hour12: false,
@@ -887,9 +987,9 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
         const targetDate = String(date).slice(0, 10);
         const today = new Date().toLocaleDateString('en-CA', { timeZone: business.timezone || 'UTC' });
 
-        let startM = openM;
+        let startM = Math.max(openM, providerStartM);
         if (targetDate === today) {
-            startM = Math.max(openM, nowM + 15);
+            startM = Math.max(startM, nowM + 15);
             startM = Math.ceil(startM / 15) * 15;
         }
 

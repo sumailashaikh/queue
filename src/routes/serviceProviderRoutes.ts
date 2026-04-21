@@ -18,6 +18,12 @@ router.delete('/:id', serviceProviderController.deleteServiceProvider);
 router.post('/:id/services', serviceProviderController.assignProviderServices);
 router.get('/:id/availability', serviceProviderController.getProviderAvailability);
 router.put('/:id/availability', serviceProviderController.updateProviderAvailability);
+router.get('/:id/day-offs', serviceProviderController.getProviderDayOffs);
+router.post('/:id/day-offs', serviceProviderController.addProviderDayOff);
+router.delete('/day-offs/:dayOffId', serviceProviderController.deleteProviderDayOff);
+router.get('/:id/block-times', serviceProviderController.getProviderBlockTimes);
+router.post('/:id/block-times', serviceProviderController.addProviderBlockTime);
+router.delete('/block-times/:blockId', serviceProviderController.deleteProviderBlockTime);
 router.patch('/assignments/:id', serviceProviderController.assignProviderToEntry);
 
 // Provider Leaves endpoints

@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { countBlockingLiveQueueTasks } from '../utils/liveQueueTaskCount';
 import { isBlockingApprovedLeave } from '../utils/leaveStatus';
+import { checkProviderAvailabilityAt } from '../utils/providerAvailability';
 
 /** Human-readable dates for SMS (en-US, date-only safe). */
 function formatLeaveDateForMessage(isoOrDate: string): string {
@@ -836,6 +837,176 @@ export const updateProviderAvailability = async (req: Request, res: Response) =>
     }
 };
 
+export const getProviderDayOffs = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { data, error } = await supabase
+            .from('provider_day_offs')
+            .select('*')
+            .eq('provider_id', id)
+            .order('day_off_date', { ascending: true });
+        if (error) throw error;
+        return res.status(200).json({ status: 'success', data: data || [] });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const addProviderDayOff = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const { day_off_date, day_off_type, start_time, end_time, reason } = req.body || {};
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!day_off_date) return res.status(400).json({ status: 'error', message: 'day_off_date is required' });
+
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id, business_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        const { data: biz } = await supabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', provider.business_id)
+            .maybeSingle();
+        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const payload = {
+            provider_id: id,
+            business_id: provider.business_id,
+            day_off_date: String(day_off_date).slice(0, 10),
+            day_off_type: String(day_off_type || 'full_day').toLowerCase() === 'partial' ? 'partial' : 'full_day',
+            start_time: start_time ? String(start_time).slice(0, 5) : null,
+            end_time: end_time ? String(end_time).slice(0, 5) : null,
+            reason: reason || null,
+            created_by: userId
+        };
+        const { data, error } = await supabase.from('provider_day_offs').insert([payload]).select().maybeSingle();
+        if (error) throw error;
+        return res.status(201).json({ status: 'success', data });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const deleteProviderDayOff = async (req: Request, res: Response) => {
+    try {
+        const { dayOffId } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data: row } = await supabase
+            .from('provider_day_offs')
+            .select('id, business_id')
+            .eq('id', dayOffId)
+            .maybeSingle();
+        if (!row) return res.status(404).json({ status: 'error', message: 'Day off not found' });
+
+        const { data: biz } = await supabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', row.business_id)
+            .maybeSingle();
+        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        await supabase.from('provider_day_offs').delete().eq('id', dayOffId);
+        return res.status(200).json({ status: 'success', message: 'Day off removed' });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const getProviderBlockTimes = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { data, error } = await supabase
+            .from('provider_block_times')
+            .select('*')
+            .eq('provider_id', id)
+            .order('block_date', { ascending: true })
+            .order('start_time', { ascending: true });
+        if (error) throw error;
+        return res.status(200).json({ status: 'success', data: data || [] });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const addProviderBlockTime = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const { block_date, start_time, end_time, reason } = req.body || {};
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!block_date || !start_time || !end_time) return res.status(400).json({ status: 'error', message: 'block_date, start_time, end_time are required' });
+
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id, business_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        const { data: biz } = await supabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', provider.business_id)
+            .maybeSingle();
+        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const payload = {
+            provider_id: id,
+            business_id: provider.business_id,
+            block_date: String(block_date).slice(0, 10),
+            start_time: String(start_time).slice(0, 5),
+            end_time: String(end_time).slice(0, 5),
+            reason: reason || null,
+            created_by: userId
+        };
+        const { data, error } = await supabase.from('provider_block_times').insert([payload]).select().maybeSingle();
+        if (error) throw error;
+        return res.status(201).json({ status: 'success', data });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const deleteProviderBlockTime = async (req: Request, res: Response) => {
+    try {
+        const { blockId } = req.params;
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data: row } = await supabase
+            .from('provider_block_times')
+            .select('id, business_id')
+            .eq('id', blockId)
+            .maybeSingle();
+        if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
+
+        const { data: biz } = await supabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', row.business_id)
+            .maybeSingle();
+        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        await supabase.from('provider_block_times').delete().eq('id', blockId);
+        return res.status(200).json({ status: 'success', message: 'Block time removed' });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const assignProviderToEntry = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // entry_id
@@ -873,7 +1044,7 @@ export const assignProviderToEntry = async (req: Request, res: Response) => {
         if (provider_id) {
             const { data: provider } = await supabase
                 .from('service_providers')
-                .select('id')
+                .select('id, business_id, businesses(timezone)')
                 .eq('id', provider_id)
                 .eq('business_id', (entry as any).queues.business_id)
                 .eq('is_active', true)
@@ -881,6 +1052,16 @@ export const assignProviderToEntry = async (req: Request, res: Response) => {
 
             if (!provider) {
                 return res.status(400).json({ status: 'error', message: 'Invalid or inactive provider' });
+            }
+            const availability = await checkProviderAvailabilityAt(
+                require('../config/supabaseClient').adminSupabase,
+                provider_id,
+                provider.business_id,
+                (provider as any)?.businesses?.timezone || 'UTC',
+                new Date()
+            );
+            if (!availability.available) {
+                return res.status(400).json({ status: 'error', message: `Provider unavailable: ${availability.reason}` });
             }
         }
 
