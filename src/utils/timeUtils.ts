@@ -99,7 +99,7 @@ export const canCompleteBeforeClosing = (
     bizInput: any,
     currentWaitMins: number,
     serviceDurationMins: number,
-    bufferMins: number = 10 // Default 10 min buffer
+    _graceBufferMins: number = 0
 ): { canJoin: boolean; finishTimeStr?: string; closingTimeStr?: string; message?: string } => {
     // 0. Handle array vs object
     const business = Array.isArray(bizInput) ? bizInput[0] : bizInput;
@@ -125,11 +125,11 @@ export const canCompleteBeforeClosing = (
 
     const estimatedStartMins = nowMins + currentWaitMins;
     const estimatedEndMins = estimatedStartMins + serviceDurationMins;
-    const limitMins = closeMins - bufferMins;
+    const hardLimitMins = closeMins;
 
-    console.log(`[canCompleteBeforeClosing] Now: ${nowMins} | Wait: ${currentWaitMins} | Service: ${serviceDurationMins} | EstEnd: ${estimatedEndMins} | Limit: ${limitMins} (Close: ${closeMins})`);
+    console.log(`[canCompleteBeforeClosing] Now: ${nowMins} | Wait: ${currentWaitMins} | Service: ${serviceDurationMins} | EstEnd: ${estimatedEndMins} | HardLimit: ${hardLimitMins} (Close: ${closeMins})`);
 
-    if (estimatedEndMins > limitMins) {
+    if (estimatedEndMins > hardLimitMins) {
         const h = Math.floor(estimatedEndMins / 60) % 24;
         const m = estimatedEndMins % 60;
         const finishTimeStr = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`;

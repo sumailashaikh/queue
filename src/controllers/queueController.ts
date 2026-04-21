@@ -625,7 +625,7 @@ export const joinQueue = async (req: Request, res: Response) => {
           queueInfo.businesses,
           currentWaitTime,
           serviceDuration,
-          10, // 10 min buffer as requested
+          0,
         );
 
       if (!closingProtection.canJoin) {
