@@ -643,6 +643,7 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
     try {
         const { business_id, service_ids, start_time, end_time, customer_name, phone, provider_id } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!business_id || !start_time || !customer_name || !phone) {
             return res.status(400).json({
@@ -660,6 +661,24 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
 
         if (bizError || !business) {
             return res.status(404).json({ status: 'error', message: 'Business not found' });
+        }
+
+        // Try to resolve an existing profile user_id from phone for public bookings.
+        // This prevents user_id from staying null when customer already exists.
+        let effectiveUserId: string | null = null;
+        {
+            const normalize = (v: any) => String(v || '').replace(/[^\d]/g, '');
+            const raw = String(phone || '').trim();
+            const digits = normalize(raw);
+            const candidates = Array.from(new Set([raw, digits, `+${digits}`].filter((p) => !!p && String(p).length >= 8)));
+            if (candidates.length > 0) {
+                const { data: profilesByPhone } = await adminSupabase
+                    .from('profiles')
+                    .select('id, phone')
+                    .in('phone', candidates);
+                const exact = (profilesByPhone || []).find((p: any) => normalize(p?.phone) === digits);
+                if (exact?.id) effectiveUserId = String(exact.id);
+            }
         }
 
         // Insert appointment with customer details in metadata or a separate guest column if exists
@@ -702,6 +721,7 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
             .from('appointments')
             .insert([
                 {
+                    user_id: effectiveUserId,
                     business_id,
                     service_id: firstServiceId,
                     start_time,
