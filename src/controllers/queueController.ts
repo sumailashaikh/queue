@@ -122,6 +122,29 @@ export const getMyTasks = async (req: Request, res: Response) => {
       if (row?.id) providerIds.add(String(row.id));
     });
     if (provider?.id) providerIds.add(String(provider.id));
+
+    // Additional fallback: include provider rows matched by employee phone.
+    // This handles legacy/invited staff records where user_id is not yet linked
+    // to the exact provider row used during owner assignment.
+    const normalizePhone = (v: any) => String(v || "").replace(/[^\d]/g, "");
+    const { data: meProfile } = await adminSupabase
+      .from("profiles")
+      .select("phone")
+      .eq("id", userId)
+      .maybeSingle();
+    const myPhone = normalizePhone(meProfile?.phone);
+    if (myPhone && (provider as any)?.business_id) {
+      const { data: sameBizProviders } = await adminSupabase
+        .from("service_providers")
+        .select("id, phone")
+        .eq("business_id", (provider as any).business_id);
+      (sameBizProviders || []).forEach((row: any) => {
+        if (normalizePhone(row?.phone) === myPhone && row?.id) {
+          providerIds.add(String(row.id));
+        }
+      });
+    }
+
     const providerIdList = Array.from(providerIds);
 
     if (!(provider as any).business_id && provider.id) {
@@ -441,6 +464,7 @@ export const joinQueue = async (req: Request, res: Response) => {
     const user_id = req.user?.id;
     const supabase =
       req.supabase || require("../config/supabaseClient").supabase;
+    const { adminSupabase } = require("../config/supabaseClient");
 
     const logState = (msg: string) => {
       fs.appendFileSync(
@@ -668,6 +692,33 @@ export const joinQueue = async (req: Request, res: Response) => {
       `[joinQueue] Total price: ${total_price}, Service names display: ${serviceNamesDisplay}`,
     );
 
+    // Resolve customer user_id:
+    // - use authenticated user if available
+    // - otherwise attempt phone-based profile match (walk-in/public flow)
+    let effectiveUserId: string | null = user_id || null;
+    if (!effectiveUserId && phone) {
+      const normalize = (v: any) => String(v || "").replace(/[^\d]/g, "");
+      const phoneRaw = String(phone || "").trim();
+      const phoneDigits = normalize(phoneRaw);
+      const phoneCandidates = Array.from(
+        new Set(
+          [phoneRaw, phoneDigits, `+${phoneDigits}`].filter(
+            (p) => !!p && String(p).length >= 8,
+          ),
+        ),
+      );
+      if (phoneCandidates.length > 0) {
+        const { data: profilesByPhone } = await adminSupabase
+          .from("profiles")
+          .select("id, phone")
+          .in("phone", phoneCandidates);
+        const exact = (profilesByPhone || []).find(
+          (p: any) => normalize(p?.phone) === phoneDigits,
+        );
+        if (exact?.id) effectiveUserId = String(exact.id);
+      }
+    }
+
     // Resolve employee user_id for entry-level assignment when provider is preselected.
     let assignedToUserId: string | null = null;
     if (provider_id) {
@@ -711,7 +762,7 @@ export const joinQueue = async (req: Request, res: Response) => {
       "create_queue_entry_with_tasks",
       {
         p_queue_id: queue_id,
-        p_user_id: user_id || null,
+        p_user_id: effectiveUserId,
         p_customer_name: customer_name || "Guest",
         p_phone: phone || null,
         p_service_name: serviceNamesDisplay,
