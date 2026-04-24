@@ -789,10 +789,10 @@ export const updateProviderAvailability = async (req: Request, res: Response) =>
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
-        // 1. Verify ownership
+        // 1. Verify ownership or self-management
         const { data: provider } = await supabase
             .from('service_providers')
-            .select('id, business_id')
+            .select('id, business_id, user_id')
             .eq('id', id)
             .single();
 
@@ -802,12 +802,12 @@ export const updateProviderAvailability = async (req: Request, res: Response) =>
 
         const { data: business } = await supabase
             .from('businesses')
-            .select('id')
+            .select('id, owner_id')
             .eq('id', provider.business_id)
-            .eq('owner_id', userId)
-            .single();
-
-        if (!business) {
+            .maybeSingle();
+        const isOwner = business?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!isOwner && !isSelf) {
             return res.status(403).json({ status: 'error', message: 'Unauthorized' });
         }
 
@@ -864,7 +864,7 @@ export const addProviderDayOff = async (req: Request, res: Response) => {
 
         const { data: provider } = await supabase
             .from('service_providers')
-            .select('id, business_id')
+            .select('id, business_id, user_id')
             .eq('id', id)
             .maybeSingle();
         if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
@@ -874,7 +874,9 @@ export const addProviderDayOff = async (req: Request, res: Response) => {
             .select('id, owner_id')
             .eq('id', provider.business_id)
             .maybeSingle();
-        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        const isOwner = biz?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
         const payload = {
             provider_id: id,
@@ -903,7 +905,7 @@ export const deleteProviderDayOff = async (req: Request, res: Response) => {
 
         const { data: row } = await supabase
             .from('provider_day_offs')
-            .select('id, business_id')
+            .select('id, business_id, provider_id')
             .eq('id', dayOffId)
             .maybeSingle();
         if (!row) return res.status(404).json({ status: 'error', message: 'Day off not found' });
@@ -913,7 +915,14 @@ export const deleteProviderDayOff = async (req: Request, res: Response) => {
             .select('id, owner_id')
             .eq('id', row.business_id)
             .maybeSingle();
-        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id, user_id')
+            .eq('id', row.provider_id)
+            .maybeSingle();
+        const isOwner = biz?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
         await supabase.from('provider_day_offs').delete().eq('id', dayOffId);
         return res.status(200).json({ status: 'success', message: 'Day off removed' });
@@ -950,7 +959,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
 
         const { data: provider } = await supabase
             .from('service_providers')
-            .select('id, business_id')
+            .select('id, business_id, user_id')
             .eq('id', id)
             .maybeSingle();
         if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
@@ -960,7 +969,9 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             .select('id, owner_id')
             .eq('id', provider.business_id)
             .maybeSingle();
-        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        const isOwner = biz?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
         const payload = {
             provider_id: id,
@@ -988,7 +999,7 @@ export const deleteProviderBlockTime = async (req: Request, res: Response) => {
 
         const { data: row } = await supabase
             .from('provider_block_times')
-            .select('id, business_id')
+            .select('id, business_id, provider_id')
             .eq('id', blockId)
             .maybeSingle();
         if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
@@ -998,7 +1009,14 @@ export const deleteProviderBlockTime = async (req: Request, res: Response) => {
             .select('id, owner_id')
             .eq('id', row.business_id)
             .maybeSingle();
-        if (!biz || biz.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        const { data: provider } = await supabase
+            .from('service_providers')
+            .select('id, user_id')
+            .eq('id', row.provider_id)
+            .maybeSingle();
+        const isOwner = biz?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
         await supabase.from('provider_block_times').delete().eq('id', blockId);
         return res.status(200).json({ status: 'success', message: 'Block time removed' });

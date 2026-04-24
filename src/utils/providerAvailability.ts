@@ -49,13 +49,18 @@ export async function checkProviderAvailabilityAt(
       .gte("end_date", dateStr),
   ]);
 
-  if (!weekly || weekly.is_available === false) {
+  // Backward-compatible behavior:
+  // if weekly hours are not configured yet, treat provider as available
+  // and only enforce explicit leave/day-off/block rules.
+  if (weekly && weekly.is_available === false) {
     return { available: false, reason: "off_day" };
   }
-  const shiftStart = toMinutes(String(weekly.start_time || "00:00").slice(0, 5));
-  const shiftEnd = toMinutes(String(weekly.end_time || "23:59").slice(0, 5));
-  if (nowMins < shiftStart || nowMins >= shiftEnd) {
-    return { available: false, reason: "outside_working_hours" };
+  if (weekly) {
+    const shiftStart = toMinutes(String(weekly.start_time || "00:00").slice(0, 5));
+    const shiftEnd = toMinutes(String(weekly.end_time || "23:59").slice(0, 5));
+    if (nowMins < shiftStart || nowMins >= shiftEnd) {
+      return { available: false, reason: "outside_working_hours" };
+    }
   }
 
   for (const d of dayOffs || []) {
