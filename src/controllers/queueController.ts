@@ -106,7 +106,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
         .from("queue_entries")
         .select(fallbackSelect)
         .eq("assigned_to", userId)
-        .in("status", ["serving", "waiting", "completed"])
+        .in("status", ["pending", "serving", "waiting", "completed"])
         .order("position", { ascending: true });
       if (fallbackErr) throw fallbackErr;
       return res.status(200).json({ status: "success", data: fallbackRows || [] });
@@ -166,13 +166,13 @@ export const getMyTasks = async (req: Request, res: Response) => {
         .select(baseSelect)
         .eq("assigned_to", userId)
         .eq("entry_date", todayStr)
-        .in("status", ["serving", "waiting", "completed"]),
+        .in("status", ["pending", "serving", "waiting", "completed"]),
       adminSupabase
         .from("queue_entries")
         .select(baseSelect)
         .in("queue_entry_services.assigned_provider_id", providerIdList)
         .eq("entry_date", todayStr)
-        .in("status", ["serving", "waiting", "completed"]),
+        .in("status", ["pending", "serving", "waiting", "completed"]),
     ]);
 
     if (primaryAssigned.error) throw primaryAssigned.error;
@@ -216,7 +216,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
               .filter(
                 (r: any) =>
                   r?.queue_entries?.entry_date === todayStr &&
-                  ["waiting", "serving", "completed"].includes(
+                  ["pending", "waiting", "serving", "completed"].includes(
                     String(r?.queue_entries?.status || ""),
                   ),
               )
@@ -232,7 +232,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
               .select(baseSelect)
               .in("id", eligibleEntryIds)
               .eq("entry_date", todayStr)
-              .in("status", ["serving", "waiting", "completed"]);
+              .in("status", ["pending", "serving", "waiting", "completed"]);
           if (!fallbackErr) {
             (fallbackEntries || []).forEach((row: any) =>
               mergedMap.set(row.id, row),
