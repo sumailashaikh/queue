@@ -89,7 +89,8 @@ export const getMyTasks = async (req: Request, res: Response) => {
 
     if (!provider) {
       // Fallback for accounts where provider linkage is missing:
-      // still show tasks explicitly assigned at entry level.
+      // return both direct entry-level assignment and per-service assignment
+      // discovered by employee phone number.
       const fallbackSelect = `
             *,
             queue_entry_services (
@@ -102,14 +103,60 @@ export const getMyTasks = async (req: Request, res: Response) => {
                 business_id
             )
         `;
-      const { data: fallbackRows, error: fallbackErr } = await adminSupabase
+      const normalizeDigits = (v: any) => String(v || "").replace(/[^\d]/g, "");
+      const { data: meProfile } = await adminSupabase
+        .from("profiles")
+        .select("phone")
+        .eq("id", userId)
+        .maybeSingle();
+      const myPhoneDigits = normalizeDigits(meProfile?.phone);
+
+      const fallbackMap = new Map<string, any>();
+      const { data: directRows, error: directErr } = await adminSupabase
         .from("queue_entries")
         .select(fallbackSelect)
         .eq("assigned_to", userId)
         .in("status", ["pending", "serving", "waiting", "completed"])
         .order("position", { ascending: true });
-      if (fallbackErr) throw fallbackErr;
-      return res.status(200).json({ status: "success", data: fallbackRows || [] });
+      if (directErr) throw directErr;
+      (directRows || []).forEach((row: any) => fallbackMap.set(String(row.id), row));
+
+      if (myPhoneDigits) {
+        const { data: phoneMatchedProviders } = await adminSupabase
+          .from("service_providers")
+          .select("id, phone")
+          .not("phone", "is", null);
+        const phoneProviderIds = (phoneMatchedProviders || [])
+          .filter((row: any) => normalizeDigits(row?.phone) === myPhoneDigits)
+          .map((row: any) => row?.id)
+          .filter(Boolean);
+
+        if (phoneProviderIds.length > 0) {
+          const { data: serviceTaskRows } = await adminSupabase
+            .from("queue_entry_services")
+            .select("queue_entry_id")
+            .in("assigned_provider_id", phoneProviderIds)
+            .in("task_status", ["pending", "in_progress", "done"]);
+          const entryIds = Array.from(
+            new Set((serviceTaskRows || []).map((r: any) => String(r.queue_entry_id)).filter(Boolean)),
+          );
+          if (entryIds.length > 0) {
+            const { data: serviceRows, error: serviceRowsErr } = await adminSupabase
+              .from("queue_entries")
+              .select(fallbackSelect)
+              .in("id", entryIds)
+              .in("status", ["pending", "serving", "waiting", "completed"])
+              .order("position", { ascending: true });
+            if (serviceRowsErr) throw serviceRowsErr;
+            (serviceRows || []).forEach((row: any) => fallbackMap.set(String(row.id), row));
+          }
+        }
+      }
+
+      const fallbackRows = Array.from(fallbackMap.values()).sort(
+        (a: any, b: any) => (a.position || 0) - (b.position || 0),
+      );
+      return res.status(200).json({ status: "success", data: fallbackRows });
     }
 
     // Include all provider rows linked to this employee user to avoid missing tasks
