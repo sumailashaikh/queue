@@ -4,6 +4,31 @@ import { notificationService } from '../services/notificationService';
 import crypto from 'crypto';
 import { countBlockingLiveQueueTasks } from '../utils/liveQueueTaskCount';
 
+function getInviteDefaultMessage(language: string, name: string, businessName: string, inviteUrl: string): string {
+    const safeName = name || 'there';
+    const safeBusiness = businessName || 'QueueUp';
+    const lang = String(language || 'en').toLowerCase();
+
+    if (lang === 'ar') {
+        return `مرحبًا ${safeName}!\n` +
+            `لقد تمت دعوتك كموظف في ${safeBusiness} على QueueUp.\n` +
+            `افتح رابط الدعوة لتسجيل الدخول عبر OTP:\n${inviteUrl}`;
+    }
+    if (lang === 'hi') {
+        return `नमस्ते ${safeName}!\n` +
+            `आपको QueueUp पर ${safeBusiness} में कर्मचारी के रूप में आमंत्रित किया गया है।\n` +
+            `OTP से लॉगिन करने के लिए अपना आमंत्रण लिंक खोलें:\n${inviteUrl}`;
+    }
+    if (lang === 'es') {
+        return `Hola ${safeName}!\n` +
+            `Has sido invitado como empleado en ${safeBusiness} en QueueUp.\n` +
+            `Abre tu enlace de invitación para iniciar sesión con OTP:\n${inviteUrl}`;
+    }
+    return `Hello ${safeName}!\n` +
+        `You have been invited as an Employee at ${safeBusiness} on QueueUp.\n` +
+        `Open your invite link to login with OTP:\n${inviteUrl}`;
+}
+
 /**
  * Get all users registered on the platform
  */
@@ -160,12 +185,14 @@ export const inviteAdmin = async (req: any, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Phone number is required' });
         }
 
+        const normalizedPhone = String(phone).replace(/[^\d+]/g, '');
+
         // Check if user exists - Try multiple formats for phone matching robustness
         const formats = [
-            phone,                                   // e.g. +91 98765 43210
-            phone.replace(/\+/g, ''),               // e.g. 91 98765 43210
-            phone.replace(/\D/g, ''),               // e.g. 919876543210
-            phone.replace(/\D/g, '').slice(-10)     // e.g. 9876543210
+            normalizedPhone,                                   // e.g. +919876543210
+            normalizedPhone.replace(/\+/g, ''),               // e.g. 919876543210
+            normalizedPhone.replace(/\D/g, ''),               // e.g. 919876543210
+            normalizedPhone.replace(/\D/g, '').slice(-10)     // e.g. 9876543210
         ];
         
         const uniqueFormats = [...new Set(formats)];
@@ -183,7 +210,7 @@ export const inviteAdmin = async (req: any, res: Response) => {
                 const { error: pendingError } = await supabase
                     .from('pending_registrations')
                     .upsert([{
-                        phone: phone,
+                        phone: normalizedPhone,
                         role: 'admin',
                         is_verified: true,
                         full_name: 'Invited Admin'
@@ -204,7 +231,7 @@ export const inviteAdmin = async (req: any, res: Response) => {
             }
 
             const msg = `Hello! You have been invited as an Admin on QueueUp. Please login with your phone number to gain access: https://queue-admin-182k.vercel.app/`;
-            await notificationService.sendWhatsApp(phone, msg);
+            await notificationService.sendWhatsApp(normalizedPhone, msg);
 
             return res.status(200).json({
                 status: 'success',
@@ -257,11 +284,15 @@ export const getBusinessDetails = async (req: any, res: Response) => {
             .select(`
                 id,
                 status,
+                completed_at,
+                payment_status,
+                paid_at,
                 customer_name,
                 ticket_number,
                 joined_at,
                 total_price,
                 queue_entry_services!queue_entry_id (
+                    task_status,
                     services!service_id (id, name, price)
                 ),
                 queues!inner (business_id)
@@ -315,15 +346,28 @@ export const getBusinessDetails = async (req: any, res: Response) => {
 
         // 5. Merge Recent Activity for Detail View
         const recentActivity = [
-            ...(qEntries?.map((e: any) => ({
-                id: e.id,
-                type: 'queue',
-                name: e.customer_name,
-                token: e.ticket_number,
-                status: e.status,
-                time: e.joined_at,
-                service: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || 'Walk-in'
-            })) || []),
+            ...(qEntries?.map((e: any) => {
+                const allTasksDone = Array.isArray(e.queue_entry_services) &&
+                    e.queue_entry_services.length > 0 &&
+                    e.queue_entry_services.every((task: any) => ['done', 'cancelled'].includes(String(task?.task_status || '').toLowerCase()));
+                const normalizedStatus = String(e.status || '').toLowerCase();
+                const displayStatus = (
+                    normalizedStatus === 'completed' ||
+                    !!e.completed_at ||
+                    !!e.paid_at ||
+                    String(e.payment_status || '').toLowerCase() === 'paid' ||
+                    allTasksDone
+                ) ? 'completed' : normalizedStatus;
+                return {
+                    id: e.id,
+                    type: 'queue',
+                    name: e.customer_name,
+                    token: e.ticket_number,
+                    status: displayStatus,
+                    time: e.joined_at,
+                    service: e.queue_entry_services?.map((as: any) => as.services?.name).filter(Boolean).join(', ') || 'Walk-in'
+                };
+            }) || []),
             ...(appointments?.map((a: any) => ({
                 id: a.id,
                 type: 'appointment',
@@ -425,7 +469,7 @@ export const createUser = async (req: any, res: Response) => {
         if (['23503', '23502', '42501'].includes(error.code) || error.message?.includes('violates') || error.message?.includes('security')) {
             try {
                 const { full_name, phone, role } = req.body;
-                const supabase = req.supabase || require('../config/supabaseClient').supabase;
+                const supabase = req.supabase || require('../config/supabaseClient').adminSupabase;
                 const { error: pError } = await supabase.from('pending_registrations').upsert([{
                     phone: phone,
                     full_name: full_name,
@@ -482,7 +526,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
         }
 
         // 1. Verify ownership of business
-        const adminSupabase = require('../config/supabaseClient').supabase;
+        const adminSupabase = require('../config/supabaseClient').adminSupabase;
         
         const { data: business } = await adminSupabase
             .from('businesses')
@@ -607,10 +651,14 @@ export const inviteEmployee = async (req: any, res: Response) => {
             console.warn('[ADMIN] employee_invites insert failed (legacy fallback):', (e as any)?.message);
         }
 
-        // 4. Notify via Message (Custom or default). Include invite link.
-        const defaultMsg =
-            `Hello ${full_name || 'there'}! You have been invited as an Employee at ${business.name} on QueueUp.\n` +
-            `Open your invite link to login with OTP:\n${inviteUrl}`;
+        // 4. Notify via Message (Custom or localized default). Include invite link.
+        const { data: ownerProfile } = await adminSupabase
+            .from('profiles')
+            .select('ui_language')
+            .eq('id', userId)
+            .maybeSingle();
+        const ownerLang = String((business as any)?.language || ownerProfile?.ui_language || 'en');
+        const defaultMsg = getInviteDefaultMessage(ownerLang, full_name || 'there', business.name, inviteUrl);
         const msg = custom_message ? `${custom_message}\n\n${inviteUrl}` : defaultMsg;
         
         const { notificationService } = require('../services/notificationService');
@@ -661,7 +709,7 @@ export const deactivateEmployee = async (req: any, res: Response) => {
         const userId = req.user?.id;
 
         // 1. Fetch service provider to confirm existence and identify linked profile
-        const adminSupabase = require('../config/supabaseClient').supabase;
+        const adminSupabase = require('../config/supabaseClient').adminSupabase;
         
         const { data: provider } = await adminSupabase
             .from('service_providers')

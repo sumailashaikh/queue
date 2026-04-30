@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import { supabase } from '../config/supabaseClient';
+import { adminSupabase, supabase } from '../config/supabaseClient';
 
 export const getProfile = async (req: Request, res: Response) => {
     try {
@@ -91,7 +91,7 @@ export const updateUiLanguage = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'ui_language is required' });
         }
 
-        let { data, error } = await supabase
+        let { data, error } = await adminSupabase
             .from('profiles')
             .update({ ui_language })
             .eq('id', userId)
@@ -102,13 +102,7 @@ export const updateUiLanguage = async (req: Request, res: Response) => {
 
         // If no data, the profile doesn't exist yet, so we upsert it
         if (!data) {
-            const { createClient } = require('@supabase/supabase-js');
-            const supabaseAdmin = createClient(
-                process.env.SUPABASE_URL || '',
-                process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || ''
-            );
-
-            const { data: upsertData, error: upsertError } = await supabaseAdmin
+            const { data: upsertData, error: upsertError } = await adminSupabase
                 .from('profiles')
                 .upsert({ id: userId, ui_language })
                 .select()

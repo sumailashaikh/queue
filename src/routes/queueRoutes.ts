@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { getAllQueues, createQueue, joinQueue, createWalkIn, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry, extendTime, assignTaskProvider, startTask, completeTask, noShowQueueEntry, skipQueueEntry, updateQueueEntryPayment, restoreQueueEntry, initializeEntryTasks, getMyTasks } from '../controllers/queueController';
+import { getAllQueues, createQueue, joinQueue, createWalkIn, updateQueue, deleteQueue, getMyQueues, getTodayQueue, updateQueueEntryStatus, resetQueueEntries, nextEntry, extendTime, assignTaskProvider, startTask, completeTask, noShowQueueEntry, skipQueueEntry, updateQueueEntryPayment, restoreQueueEntry, initializeEntryTasks, getMyTasks, getBillingEntriesToday } from '../controllers/queueController';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -13,6 +13,7 @@ router.post('/', requireAuth, createQueue);
 router.post('/walk-in', requireAuth, createWalkIn);
 router.get('/my', requireAuth, getMyQueues); // Must be before /:id to avoid conflict
 router.get('/my-tasks', requireAuth, getMyTasks); // ADD THIS
+router.get('/billing/today', requireAuth, getBillingEntriesToday);
 router.put('/:id', requireAuth, updateQueue);
 router.delete('/:id', requireAuth, deleteQueue);
 router.get('/:id/today', requireAuth, getTodayQueue); // Dashboard View

@@ -6,6 +6,36 @@ import { recomputeProviderDelays } from "../utils/delayLogic";
 import { isBlockingApprovedLeave } from "../utils/leaveStatus";
 import { checkProviderAvailabilityAt } from "../utils/providerAvailability";
 
+const queueWaMessage = (
+  lang: string,
+  kind: "join" | "delay" | "next" | "ready",
+  businessName: string,
+) => {
+  const l = String(lang || "en").toLowerCase();
+  if (l === "hi") {
+    if (kind === "join") return `${businessName} की कतार में जुड़ने के लिए धन्यवाद। आपकी बारी नजदीक आने पर हम आपको सूचित करेंगे।`;
+    if (kind === "delay") return `हम इस समय व्यस्त हैं और पूर्ण क्षमता पर काम कर रहे हैं। कृपया धैर्य रखें।`;
+    if (kind === "next") return `अब आपकी बारी है ${businessName} में। कृपया काउंटर पर आएं।`;
+    return `आपकी बारी ${businessName} में जल्द आने वाली है। कृपया पास में रहें।`;
+  }
+  if (l === "ar") {
+    if (kind === "join") return `شكرًا لانضمامك إلى الطابور في ${businessName}. سنقوم بإشعارك عندما يقترب دورك.`;
+    if (kind === "delay") return `نحن نخدم الضيوف حاليًا ونعمل بكامل الطاقة. شكرًا لصبرك.`;
+    if (kind === "next") return `حان دورك الآن في ${businessName}. يرجى التوجه إلى المنضدة.`;
+    return `دورك في ${businessName} سيأتي قريبًا. يرجى البقاء بالقرب.`;
+  }
+  if (l === "es") {
+    if (kind === "join") return `Gracias por unirte a la cola en ${businessName}. Te avisaremos cuando se acerque tu turno.`;
+    if (kind === "delay") return `Actualmente estamos atendiendo clientes y operando a plena capacidad. Gracias por tu paciencia.`;
+    if (kind === "next") return `Tu turno es ahora en ${businessName}. Por favor acércate al mostrador.`;
+    return `Tu turno en ${businessName} está por llegar. Por favor mantente cerca.`;
+  }
+  if (kind === "join") return `Thank you for joining the queue at ${businessName}. We’ll notify you as your turn approaches.`;
+  if (kind === "delay") return `We’re currently serving guests and operating at full capacity. Thank you for your patience.`;
+  if (kind === "next") return `Your turn is now at ${businessName}. Please proceed to the counter.`;
+  return `Your turn at ${businessName} is coming up soon. Please stay nearby.`;
+};
+
 export const getAllQueues = async (req: Request, res: Response) => {
   try {
     const supabase =
@@ -110,13 +140,15 @@ export const getMyTasks = async (req: Request, res: Response) => {
         .eq("id", userId)
         .maybeSingle();
       const myPhoneDigits = normalizeDigits(meProfile?.phone);
+      const todayStr = getLocalDateString("Asia/Kolkata");
 
       const fallbackMap = new Map<string, any>();
       const { data: directRows, error: directErr } = await adminSupabase
         .from("queue_entries")
         .select(fallbackSelect)
         .eq("assigned_to", userId)
-        .in("status", ["pending", "serving", "waiting", "completed"])
+        .eq("entry_date", todayStr)
+        .in("status", ["pending", "serving", "waiting"])
         .order("position", { ascending: true });
       if (directErr) throw directErr;
       (directRows || []).forEach((row: any) => fallbackMap.set(String(row.id), row));
@@ -132,11 +164,20 @@ export const getMyTasks = async (req: Request, res: Response) => {
           .filter(Boolean);
 
         if (phoneProviderIds.length > 0) {
+          const { data: directProviderRows, error: directProviderErr } = await adminSupabase
+            .from("queue_entries")
+            .select(fallbackSelect)
+            .in("assigned_provider_id", phoneProviderIds)
+            .eq("entry_date", todayStr)
+            .in("status", ["pending", "serving", "waiting"])
+            .order("position", { ascending: true });
+          if (directProviderErr) throw directProviderErr;
+          (directProviderRows || []).forEach((row: any) => fallbackMap.set(String(row.id), row));
+
           const { data: serviceTaskRows } = await adminSupabase
             .from("queue_entry_services")
             .select("queue_entry_id")
-            .in("assigned_provider_id", phoneProviderIds)
-            .in("task_status", ["pending", "in_progress", "done"]);
+            .in("assigned_provider_id", phoneProviderIds);
           const entryIds = Array.from(
             new Set((serviceTaskRows || []).map((r: any) => String(r.queue_entry_id)).filter(Boolean)),
           );
@@ -145,7 +186,8 @@ export const getMyTasks = async (req: Request, res: Response) => {
               .from("queue_entries")
               .select(fallbackSelect)
               .in("id", entryIds)
-              .in("status", ["pending", "serving", "waiting", "completed"])
+              .eq("entry_date", todayStr)
+              .in("status", ["pending", "serving", "waiting"])
               .order("position", { ascending: true });
             if (serviceRowsErr) throw serviceRowsErr;
             (serviceRows || []).forEach((row: any) => fallbackMap.set(String(row.id), row));
@@ -193,6 +235,12 @@ export const getMyTasks = async (req: Request, res: Response) => {
     }
 
     const providerIdList = Array.from(providerIds);
+    const { data: bizRow } = await adminSupabase
+      .from("businesses")
+      .select("timezone")
+      .eq("id", (provider as any).business_id)
+      .maybeSingle();
+    const todayStr = getLocalDateString(bizRow?.timezone || "Asia/Kolkata");
 
     if (!(provider as any).business_id && provider.id) {
       const { data: pRow } = await adminSupabase
@@ -203,23 +251,10 @@ export const getMyTasks = async (req: Request, res: Response) => {
       if (pRow?.business_id) (provider as any).business_id = pRow.business_id;
     }
 
-    // 2. Today's date in the business timezone (matches queue entry_date)
-    let todayStr = new Date().toISOString().split("T")[0];
-    const bizId = (provider as any).business_id;
-    if (bizId) {
-      const { data: bizTz } = await adminSupabase
-        .from("businesses")
-        .select("timezone")
-        .eq("id", bizId)
-        .maybeSingle();
-      const tz = bizTz?.timezone || "UTC";
-      todayStr = new Date().toLocaleDateString("en-CA", { timeZone: tz });
-    }
-
     // 2. Fetch tasks via two safe queries (avoid PostgREST .or raw parser issues with UUIDs)
     const baseSelect = `
             *,
-            queue_entry_services!inner (
+            queue_entry_services (
                 *,
                 services (id, name)
             ),
@@ -230,26 +265,36 @@ export const getMyTasks = async (req: Request, res: Response) => {
             )
         `;
 
-    const [primaryAssigned, serviceAssigned] = await Promise.all([
+    const [primaryAssigned, entryProviderAssigned, serviceAssigned] = await Promise.all([
       adminSupabase
         .from("queue_entries")
         .select(baseSelect)
         .eq("assigned_to", userId)
         .eq("entry_date", todayStr)
-        .in("status", ["pending", "serving", "waiting", "completed"]),
+        .in("status", ["pending", "serving", "waiting"]),
+      adminSupabase
+        .from("queue_entries")
+        .select(baseSelect)
+        .in("assigned_provider_id", providerIdList)
+        .eq("entry_date", todayStr)
+        .in("status", ["pending", "serving", "waiting"]),
       adminSupabase
         .from("queue_entries")
         .select(baseSelect)
         .in("queue_entry_services.assigned_provider_id", providerIdList)
         .eq("entry_date", todayStr)
-        .in("status", ["pending", "serving", "waiting", "completed"]),
+        .in("status", ["pending", "serving", "waiting"]),
     ]);
 
     if (primaryAssigned.error) throw primaryAssigned.error;
+    if (entryProviderAssigned.error) throw entryProviderAssigned.error;
     if (serviceAssigned.error) throw serviceAssigned.error;
 
     const mergedMap = new Map<string, any>();
     (primaryAssigned.data || []).forEach((row: any) =>
+      mergedMap.set(row.id, row),
+    );
+    (entryProviderAssigned.data || []).forEach((row: any) =>
       mergedMap.set(row.id, row),
     );
     (serviceAssigned.data || []).forEach((row: any) =>
@@ -276,8 +321,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
                     )
                 `,
           )
-          .in("assigned_provider_id", providerIdList)
-          .in("task_status", ["pending", "in_progress", "done"]);
+          .in("assigned_provider_id", providerIdList);
 
       if (!serviceTaskErr) {
         const eligibleEntryIds = Array.from(
@@ -285,10 +329,9 @@ export const getMyTasks = async (req: Request, res: Response) => {
             (serviceTaskRows || [])
               .filter(
                 (r: any) =>
-                  r?.queue_entries?.entry_date === todayStr &&
-                  ["pending", "waiting", "serving", "completed"].includes(
+                  ["pending", "waiting", "serving"].includes(
                     String(r?.queue_entries?.status || ""),
-                  ),
+                  ) && String(r?.queue_entries?.entry_date || "") === todayStr,
               )
               .map((r: any) => String(r.queue_entry_id))
               .filter(Boolean),
@@ -302,7 +345,7 @@ export const getMyTasks = async (req: Request, res: Response) => {
               .select(baseSelect)
               .in("id", eligibleEntryIds)
               .eq("entry_date", todayStr)
-              .in("status", ["pending", "serving", "waiting", "completed"]);
+              .in("status", ["pending", "serving", "waiting"]);
           if (!fallbackErr) {
             (fallbackEntries || []).forEach((row: any) =>
               mergedMap.set(row.id, row),
@@ -313,37 +356,30 @@ export const getMyTasks = async (req: Request, res: Response) => {
     }
 
     const providerIdSet = new Set(providerIdList);
+    const isTaskOpen = (s: any) => {
+      const st = String(s?.task_status || "").toLowerCase();
+      return st !== "done" && st !== "completed" && st !== "cancelled" && st !== "skipped";
+    };
     const hasOpenWorkForProvider = (entry: any) => {
       const services = entry.queue_entry_services || [];
       const mine = services.filter((s: any) =>
         providerIdSet.has(String(s.assigned_provider_id || "")),
       );
       if (mine.length > 0) {
-        if (String(entry?.status || "").toLowerCase() === "completed") {
-          return mine.some(
-            (s: any) => String(s?.task_status || "").toLowerCase() === "done",
-          );
-        }
-        return mine.some(
-          (s: any) => s.task_status !== "done" && s.task_status !== "cancelled",
-        );
+        // Employee "My Work" should show only actionable/open tasks.
+        return mine.some(isTaskOpen);
       }
       if (entry.assigned_to === userId) {
         if (services.length === 0) {
           return (
             entry.status === "waiting" ||
-            entry.status === "serving" ||
-            entry.status === "completed"
+            entry.status === "serving"
           );
         }
-        if (String(entry?.status || "").toLowerCase() === "completed") {
-          return services.some(
-            (s: any) => String(s?.task_status || "").toLowerCase() === "done",
-          );
+        if (["waiting", "pending", "serving"].includes(String(entry?.status || "").toLowerCase())) {
+          return services.some(isTaskOpen);
         }
-        return services.some(
-          (s: any) => s.task_status !== "done" && s.task_status !== "cancelled",
-        );
+        return services.some(isTaskOpen);
       }
       return false;
     };
@@ -351,6 +387,60 @@ export const getMyTasks = async (req: Request, res: Response) => {
     const data = Array.from(mergedMap.values())
       .filter(hasOpenWorkForProvider)
       .sort((a: any, b: any) => (a.position || 0) - (b.position || 0));
+
+    // Normalize customer label for appointment-backed entries.
+    // Older data may have queue_entries.customer_name captured from a wrong profile.
+    const appointmentIds = Array.from(
+      new Set(
+        (data || [])
+          .map((row: any) => row?.appointment_id)
+          .filter((v: any) => !!v)
+          .map((v: any) => String(v)),
+      ),
+    );
+    if (appointmentIds.length > 0) {
+      const { data: apptRows } = await adminSupabase
+        .from("appointments")
+        .select("id, guest_name, profiles:user_id(full_name)")
+        .in("id", appointmentIds);
+      const apptMap = new Map<string, any>();
+      (apptRows || []).forEach((a: any) => apptMap.set(String(a.id), a));
+      data.forEach((row: any) => {
+        const appt = apptMap.get(String(row?.appointment_id || ""));
+        if (!appt) return;
+        const profileObj = Array.isArray(appt.profiles) ? appt.profiles[0] : appt.profiles;
+        const displayName =
+          String(appt?.guest_name || "").trim() ||
+          String(profileObj?.full_name || "").trim() ||
+          String(row?.customer_name || "").trim();
+        if (displayName) row.customer_name = displayName;
+      });
+    }
+
+    // Temporary targeted tracing for live debugging of a reported missing entry.
+    const debugEntryId = "d34127c5-fbe4-4226-8b2d-a3778ae83074";
+    const debugBefore = mergedMap.get(debugEntryId);
+    const debugAfter = data.find((row: any) => String(row?.id) === debugEntryId);
+    if (debugBefore || debugAfter) {
+      console.log("[getMyTasks:debug-entry]", {
+        userId,
+        providerIds: providerIdList,
+        beforeFilter: debugBefore
+          ? {
+              id: debugBefore.id,
+              status: debugBefore.status,
+              assigned_to: debugBefore.assigned_to,
+              assigned_provider_id: debugBefore.assigned_provider_id,
+              queue_entry_services: (debugBefore.queue_entry_services || []).map((s: any) => ({
+                id: s.id,
+                assigned_provider_id: s.assigned_provider_id,
+                task_status: s.task_status,
+              })),
+            }
+          : null,
+        visibleAfterFilter: !!debugAfter,
+      });
+    }
 
     res.status(200).json({
       status: "success",
@@ -540,7 +630,7 @@ export const joinQueue = async (req: Request, res: Response) => {
     // 0. Get Queue and Business info early
     const { data: queueInfo, error: queueInfoError } = await supabase
       .from("queues")
-      .select("*, businesses(name, open_time, close_time, is_closed, timezone)")
+      .select("*, businesses(name, language, open_time, close_time, is_closed, timezone)")
       .eq("id", queue_id)
       .single();
 
@@ -550,11 +640,12 @@ export const joinQueue = async (req: Request, res: Response) => {
     const timezone = queueInfo.businesses?.timezone || "UTC";
     const todayStr = getLocalDateString(timezone);
 
+    let appointmentCustomerUserId: string | null = null;
     // --- STRONG APP RULE: Appointment Validation ---
     if (appointment_id) {
       const { data: appt, error: apptError } = await supabase
         .from("appointments")
-        .select("id, start_time, status, business_id")
+        .select("id, user_id, start_time, status, business_id")
         .eq("id", appointment_id)
         .single();
 
@@ -602,6 +693,7 @@ export const joinQueue = async (req: Request, res: Response) => {
               "Please book a new appointment. Your appointment time has passed the 30-minute grace period.",
           });
       }
+      appointmentCustomerUserId = appt.user_id || null;
     }
     // ----------------------------------------------
 
@@ -740,9 +832,21 @@ export const joinQueue = async (req: Request, res: Response) => {
     );
 
     // Resolve customer user_id:
-    // - use authenticated user if available
-    // - otherwise attempt phone-based profile match (walk-in/public flow)
-    let effectiveUserId: string | null = user_id || null;
+    // - if this join is for an appointment, use appointment.user_id
+    // - otherwise only keep authenticated user_id when role is customer
+    // - fallback to phone-based profile match for public/walk-in flows
+    let effectiveUserId: string | null = appointmentCustomerUserId;
+    if (!effectiveUserId && user_id) {
+      const { data: actorProfile } = await adminSupabase
+        .from("profiles")
+        .select("role")
+        .eq("id", user_id)
+        .maybeSingle();
+      const actorRole = String(actorProfile?.role || "").toLowerCase();
+      if (actorRole === "customer") {
+        effectiveUserId = user_id;
+      }
+    }
     if (!effectiveUserId && phone) {
       const normalize = (v: any) => String(v || "").replace(/[^\d]/g, "");
       const phoneRaw = String(phone || "").trim();
@@ -831,19 +935,20 @@ export const joinQueue = async (req: Request, res: Response) => {
     // Send Notifications
     const isOnline = (entry_source || "online") === "online";
     const businessName = queueInfo?.businesses?.name || "the salon";
+    const businessLang = String(queueInfo?.businesses?.language || "en");
 
     if (isOnline && phone) {
       // 1. Join Notification
       await notificationService.sendWhatsApp(
         phone,
-        `Thank you for joining the queue at ${businessName}. We’ll notify you as your turn approaches.`,
+        queueWaMessage(businessLang, "join", businessName),
       );
 
       // 2. High Demand Notification (if delay >= 15)
       if (currentWaitTime >= 15) {
         await notificationService.sendWhatsApp(
           phone,
-          `We’re currently serving guests and operating at full capacity. Thank you for your patience.`,
+          queueWaMessage(businessLang, "delay", businessName),
         );
       }
 
@@ -1038,6 +1143,87 @@ export const getMyQueues = async (req: Request, res: Response) => {
   }
 };
 
+export const getBillingEntriesToday = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    const supabase =
+      req.supabase || require("../config/supabaseClient").supabase;
+
+    if (!userId) {
+      return res.status(401).json({ status: "error", message: "Unauthorized" });
+    }
+
+    const { data: ownerBusinesses, error: bizError } = await supabase
+      .from("businesses")
+      .select("id, timezone")
+      .eq("owner_id", userId);
+    if (bizError) throw bizError;
+
+    const businessIds = (ownerBusinesses || []).map((b: any) => b.id);
+    if (businessIds.length === 0) {
+      return res.status(200).json({ status: "success", data: [] });
+    }
+
+    const timezone = ownerBusinesses?.[0]?.timezone || "UTC";
+    const todayStr = getLocalDateString(timezone);
+
+    const { data: queues, error: queueErr } = await supabase
+      .from("queues")
+      .select("id, name, business_id")
+      .in("business_id", businessIds);
+    if (queueErr) throw queueErr;
+
+    const queueIds = (queues || []).map((q: any) => q.id);
+    if (queueIds.length === 0) {
+      return res.status(200).json({ status: "success", data: [] });
+    }
+
+    const queueNameMap = new Map<string, string>(
+      (queues || []).map((q: any) => [String(q.id), String(q.name || "Queue")]),
+    );
+
+    const { data: entries, error: entryError } = await supabase
+      .from("queue_entries")
+      .select(
+        `
+          *,
+          queue_entry_services (
+            id,
+            price,
+            duration_minutes,
+            assigned_provider_id,
+            task_status,
+            started_at,
+            completed_at,
+            estimated_end_at,
+            actual_minutes,
+            delay_minutes,
+            services!service_id (id, name),
+            service_providers!assigned_provider_id (name)
+          )
+        `,
+      )
+      .in("queue_id", queueIds)
+      .eq("entry_date", todayStr)
+      .in("status", ["waiting", "serving", "completed"])
+      .or("payment_method.eq.unpaid,payment_method.is.null")
+      .order("joined_at", { ascending: false });
+    if (entryError) throw entryError;
+
+    const data = (entries || []).map((entry: any) => ({
+      ...entry,
+      queue_name: queueNameMap.get(String(entry.queue_id)) || "Queue",
+    }));
+
+    return res.status(200).json({ status: "success", data });
+  } catch (error: any) {
+    return res.status(500).json({
+      status: "error",
+      message: error.message || "Failed to load billing entries",
+    });
+  }
+};
+
 export const getTodayQueue = async (req: Request, res: Response) => {
   try {
     const { id } = req.params; // queue_id
@@ -1222,8 +1408,25 @@ export const getTodayQueue = async (req: Request, res: Response) => {
     const enhancedData = (data || []).map((entry: any) => {
       let totalDelay = 0;
       let maxEstEnd: Date | null = null;
+      const normalizedServices = (entry.queue_entry_services || []).map((s: any) => {
+        const rawStatus = String(s?.task_status || "").toLowerCase();
+        // Defensive normalization: if DB lags task_status but timestamps are present,
+        // infer the effective status so UI does not regress after Start/Done.
+        if (!["done", "completed", "cancelled", "skipped", "in_progress", "pending", "waiting"].includes(rawStatus)) {
+          if (s?.completed_at) return { ...s, task_status: "done" };
+          if (s?.started_at && !s?.completed_at) return { ...s, task_status: "in_progress" };
+          return { ...s, task_status: "pending" };
+        }
+        if ((rawStatus === "pending" || rawStatus === "waiting") && s?.started_at && !s?.completed_at) {
+          return { ...s, task_status: "in_progress" };
+        }
+        if ((rawStatus === "in_progress" || rawStatus === "pending" || rawStatus === "waiting") && s?.completed_at) {
+          return { ...s, task_status: "done" };
+        }
+        return s;
+      });
 
-      entry.queue_entry_services?.forEach((s: any) => {
+      normalizedServices.forEach((s: any) => {
         totalDelay += s.delay_minutes || 0;
 
         // Track the latest estimated finish time
@@ -1238,8 +1441,24 @@ export const getTodayQueue = async (req: Request, res: Response) => {
         }
       });
 
+      const hasInProgress = normalizedServices.some(
+        (s: any) => String(s?.task_status || "").toLowerCase() === "in_progress",
+      );
+      const hasOpen = normalizedServices.some((s: any) =>
+        !["done", "completed", "cancelled", "skipped"].includes(
+          String(s?.task_status || "").toLowerCase(),
+        ),
+      );
+      const normalizedEntryStatus = hasInProgress
+        ? "serving"
+        : hasOpen
+          ? (entry.status || "waiting")
+          : entry.status;
+
       return {
         ...entry,
+        status: normalizedEntryStatus,
+        queue_entry_services: normalizedServices,
         total_delay: totalDelay,
         estimated_end_at: maxEstEnd ? (maxEstEnd as Date).toISOString() : null,
       };
@@ -1289,7 +1508,7 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
     }
 
     // --- SEQUENTIAL SERVING LOGIC & PROVIDER ASSIGNMENT ---
-    const { data: currentEntry } = await supabase
+    const { data: currentEntryRows } = await supabase
       .from("queue_entries")
       .select(
         `
@@ -1303,7 +1522,10 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
             `,
       )
       .eq("id", id)
-      .single();
+      .limit(1);
+    const currentEntry = Array.isArray(currentEntryRows)
+      ? currentEntryRows[0]
+      : currentEntryRows;
 
     const timezone = currentEntry?.queues?.businesses?.timezone || "UTC";
     const todayStr = getLocalDateString(timezone);
@@ -1400,11 +1622,14 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
         updates.assigned_provider_id = eligibleProviderId;
 
         // Also link to the user profile if the provider has one
-        const { data: provProfile } = await supabase
+        const { data: provProfileRows } = await supabase
           .from("service_providers")
           .select("user_id")
           .eq("id", eligibleProviderId)
-          .single();
+          .limit(1);
+        const provProfile = Array.isArray(provProfileRows)
+          ? provProfileRows[0]
+          : provProfileRows;
 
         if (provProfile?.user_id) {
           updates.assigned_to = provProfile.user_id;
@@ -1448,22 +1673,24 @@ export const updateQueueEntryStatus = async (req: Request, res: Response) => {
       updates.completed_by_id = userId;
 
       // Determine role
-      const { data: profile } = await supabase
+      const { data: profileRows } = await supabase
         .from("profiles")
         .select("role")
         .eq("id", userId)
-        .single();
+        .limit(1);
+      const profile = Array.isArray(profileRows) ? profileRows[0] : profileRows;
       updates.completed_by_role =
         profile?.role === "owner" || profile?.role === "admin"
           ? "OWNER"
           : "EMPLOYEE";
 
       // Fetch start and estimated end timestamps to calculate actual duration and delay
-      const { data: timingData } = await supabase
+      const { data: timingRows } = await supabase
         .from("queue_entries")
         .select("service_started_at, estimated_end_at, total_duration_minutes")
         .eq("id", id)
-        .single();
+        .limit(1);
+      const timingData = Array.isArray(timingRows) ? timingRows[0] : timingRows;
 
       if (timingData?.service_started_at) {
         const start = new Date(timingData.service_started_at);
@@ -1699,7 +1926,7 @@ export const processQueueNotifications = async (
                 notified_top3, notified_next,
                 queues (
                     business_id,
-                    businesses ( name )
+                    businesses ( name, language )
                 )
             `,
       )
@@ -1721,6 +1948,9 @@ export const processQueueNotifications = async (
       // Extract business name from join
       const businessName =
         (entry.queues as any)?.businesses?.name || "the salon";
+      const businessLang = String(
+        (entry.queues as any)?.businesses?.language || "en",
+      );
 
       if (!isOnline || !entry.phone) continue;
 
@@ -1728,7 +1958,7 @@ export const processQueueNotifications = async (
       if (rank === 1 && !entry.notified_next) {
         await notificationService.sendWhatsApp(
           entry.phone,
-          `Your turn is now at ${businessName}. Please proceed to the counter.`,
+          queueWaMessage(businessLang, "next", businessName),
         );
         await supabase
           .from("queue_entries")
@@ -1739,7 +1969,7 @@ export const processQueueNotifications = async (
       else if (rank <= 3 && rank > 1 && !entry.notified_top3) {
         await notificationService.sendWhatsApp(
           entry.phone,
-          `Your turn at ${businessName} is coming up soon. Please stay nearby.`,
+          queueWaMessage(businessLang, "ready", businessName),
         );
         await supabase
           .from("queue_entries")
@@ -2012,10 +2242,10 @@ export const nextEntry = async (req: Request, res: Response) => {
     const explicitProviderId =
       taskAssignments.length > 0 ? String(taskAssignments[0]) : null;
     if (!explicitProviderId) {
-      return res.status(400).json({
-        status: "error",
+      return res.status(200).json({
+        status: "success",
         message:
-          "Please assign an expert to the next customer before starting service.",
+          "No ready customer to call right now. Please assign an expert first.",
       });
     }
 
@@ -2034,9 +2264,10 @@ export const nextEntry = async (req: Request, res: Response) => {
         ?.map((s: any) => s.service_id)
         .filter(Boolean) || [];
     if (busyProviderIds.includes(explicitProviderId)) {
-      return res.status(400).json({
-        status: "error",
-        message: "Assigned expert is currently serving another customer.",
+      return res.status(200).json({
+        status: "success",
+        message:
+          "No ready customer to call right now. Assigned expert is currently busy.",
       });
     }
 
@@ -2051,10 +2282,10 @@ export const nextEntry = async (req: Request, res: Response) => {
       (p: any) => String(p.id) === explicitProviderId,
     );
     if (!assignedProvider) {
-      return res.status(400).json({
-        status: "error",
+      return res.status(200).json({
+        status: "success",
         message:
-          "Assigned expert is unavailable. Please choose another expert.",
+          "No ready customer to call right now. Assigned expert is unavailable.",
       });
     }
 
@@ -2067,10 +2298,10 @@ export const nextEntry = async (req: Request, res: Response) => {
       );
     })();
     if (!supportsAll) {
-      return res.status(400).json({
-        status: "error",
+      return res.status(200).json({
+        status: "success",
         message:
-          "Assigned expert cannot perform all selected services. Please reassign.",
+          "No ready customer to call right now. Assigned expert cannot perform selected services.",
       });
     }
 
@@ -2466,13 +2697,15 @@ export const startTask = async (req: Request, res: Response) => {
     const { id } = req.params; // queue_entry_service_id
     const userId = req.user?.id;
     const { adminSupabase } = require("../config/supabaseClient");
+    // Prefer authenticated request client first, then admin fallback.
+    const writeSupabase = req.supabase || adminSupabase;
 
     if (!userId) {
       return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
 
     // 1. Fetch task (admin client: employees often lack RLS read on queue_entry_services)
-    const { data: task, error: taskError } = await adminSupabase
+    const { data: taskRows, error: taskError } = await adminSupabase
       .from("queue_entry_services")
       .select(
         `
@@ -2490,7 +2723,8 @@ export const startTask = async (req: Request, res: Response) => {
             `,
       )
       .eq("id", id)
-      .maybeSingle();
+      .limit(1);
+    const task = Array.isArray(taskRows) ? taskRows[0] : taskRows;
 
     if (taskError || !task) {
       return res
@@ -2609,18 +2843,47 @@ export const startTask = async (req: Request, res: Response) => {
     const duration = Number(task.duration_minutes || 0);
     const estEnd = new Date(now.getTime() + duration * 60000);
 
-    const { data: updatedTask, error: updateError } = await adminSupabase
-      .from("queue_entry_services")
-      .update({
-        task_status: "in_progress",
-        started_at: now.toISOString(),
-        estimated_end_at: estEnd.toISOString(),
-      })
-      .eq("id", id)
-      .select()
-      .single();
+    const startPayload = {
+      task_status: "in_progress",
+      started_at: now.toISOString(),
+      estimated_end_at: estEnd.toISOString(),
+    };
+    const tryPersistStart = async (client: any) => {
+      if (!client) return null;
+      const { error: updateErr } = await client
+        .from("queue_entry_services")
+        .update(startPayload)
+        .eq("id", id);
+      if (updateErr) return null;
+      for (let i = 0; i < 8; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const { data: row } = await client
+          .from("queue_entry_services")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle();
+        const st = String((row as any)?.task_status || "").toLowerCase();
+        if (row && st === "in_progress" && (row as any)?.started_at) {
+          return row;
+        }
+      }
+      return null;
+    };
 
-    if (updateError) throw updateError;
+    let updatedTask: any = await tryPersistStart(writeSupabase);
+    if (!updatedTask && req.supabase && req.supabase !== writeSupabase) {
+      updatedTask = await tryPersistStart(req.supabase);
+    }
+    if (!updatedTask && adminSupabase && adminSupabase !== writeSupabase) {
+      updatedTask = await tryPersistStart(adminSupabase);
+    }
+    if (!updatedTask) {
+      return res.status(409).json({
+        status: "error",
+        message:
+          "Task start did not persist. Please refresh and try again.",
+      });
+    }
 
     // 3.5 Recompute delays for this provider's upcoming appointments
     await recomputeProviderDelays(
@@ -2635,8 +2898,8 @@ export const startTask = async (req: Request, res: Response) => {
     });
 
     // 4. Update parent entry status to 'serving' if it's currently 'waiting'
-    if (taskEntry?.status === "waiting") {
-      await adminSupabase
+    if (["waiting", "pending"].includes(String(taskEntry?.status || "").toLowerCase())) {
+      await writeSupabase
         .from("queue_entries")
         .update({
           status: "serving",
@@ -2647,7 +2910,7 @@ export const startTask = async (req: Request, res: Response) => {
 
       // Sync with parent appointment
       if (taskEntry?.appointment_id) {
-        await adminSupabase
+        await writeSupabase
           .from("appointments")
           .update({ status: "in_service" })
           .eq("id", taskEntry.appointment_id);
@@ -2687,13 +2950,17 @@ export const completeTask = async (req: Request, res: Response) => {
     const supabase =
       req.supabase || require("../config/supabaseClient").supabase;
     const { adminSupabase } = require("../config/supabaseClient");
+    // Prefer authenticated request client first (honors user context),
+    // then fallback to admin client when available.
+    const writeSupabase =
+      req.supabase || adminSupabase;
 
     if (!userId) {
       return res.status(401).json({ status: "error", message: "Unauthorized" });
     }
 
     // 1. Fetch task details and business owner info (admin client: employee RLS + correct service id required)
-    const { data: task, error: taskError } = await adminSupabase
+    const { data: taskRows, error: taskError } = await adminSupabase
       .from("queue_entry_services")
       .select(
         `
@@ -2709,7 +2976,8 @@ export const completeTask = async (req: Request, res: Response) => {
             `,
       )
       .eq("id", id)
-      .maybeSingle();
+      .limit(1);
+    const task = Array.isArray(taskRows) ? taskRows[0] : taskRows;
 
     if (taskError || !task) {
       return res
@@ -2770,37 +3038,50 @@ export const completeTask = async (req: Request, res: Response) => {
         ? "OWNER"
         : "EMPLOYEE";
 
-    const { data: updatedTasks, error: updateError } = await adminSupabase
-      .from("queue_entry_services")
-      .update({
-        task_status: "done",
-        completed_at: now.toISOString(),
-        actual_minutes: actualMinutes,
-        delay_minutes: delayMinutes,
-        completed_by_id: userId,
-        completed_by_role: userRole,
-      })
-      .eq("id", id)
-      .select();
+    const completionPayload = {
+      task_status: "done",
+      completed_at: now.toISOString(),
+      actual_minutes: actualMinutes,
+      delay_minutes: delayMinutes,
+      completed_by_id: userId,
+      completed_by_role: userRole,
+    };
 
-    if (updateError) throw updateError;
-    let updatedTask = Array.isArray(updatedTasks)
-      ? updatedTasks[0]
-      : updatedTasks;
-    // Some environments may apply update but return empty representation.
-    // Re-read once before failing to avoid false 404s on successful "Done" actions.
-    if (!updatedTask) {
-      const { data: refetchedTask, error: refetchErr } = await adminSupabase
+    const tryPersistCompletion = async (client: any) => {
+      if (!client) return null;
+      const { error: updateErr } = await client
         .from("queue_entry_services")
-        .select("*")
-        .eq("id", id)
-        .maybeSingle();
-      if (refetchErr || !refetchedTask) {
-        return res
-          .status(404)
-          .json({ status: "error", message: "Task not found after update" });
+        .update(completionPayload)
+        .eq("id", id);
+      if (updateErr) return null;
+
+      for (let i = 0; i < 8; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        const { data: row } = await client
+          .from("queue_entry_services")
+          .select("*")
+          .eq("id", id)
+          .maybeSingle();
+        const st = String((row as any)?.task_status || "").toLowerCase();
+        if (row && ["done", "completed"].includes(st) && (row as any)?.completed_at) {
+          return row;
+        }
       }
-      updatedTask = refetchedTask;
+      return null;
+    };
+
+    let updatedTask: any = await tryPersistCompletion(writeSupabase);
+    if (!updatedTask && req.supabase && req.supabase !== writeSupabase) {
+      updatedTask = await tryPersistCompletion(req.supabase);
+    }
+    if (!updatedTask && adminSupabase && adminSupabase !== writeSupabase) {
+      updatedTask = await tryPersistCompletion(adminSupabase);
+    }
+    if (!updatedTask) {
+      return res.status(409).json({
+        status: "error",
+        message: "Task completion did not persist. Please refresh and try again.",
+      });
     }
 
     // Recompute delays based on actual completion time

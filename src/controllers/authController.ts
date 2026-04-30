@@ -204,7 +204,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
         // block normal owner/admin login — ignore invalid/expired/used/mismatch and continue.
         if (invite_token) {
             try {
-                const adminSupabase = require('../config/supabaseClient').supabase;
+                const adminSupabase = require('../config/supabaseClient').adminSupabase;
                 const { data: invite, error: invErr } = await adminSupabase
                     .from('employee_invites')
                     .select('token, phone, expires_at, used_at, business_id, role, full_name')
@@ -305,14 +305,16 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
         // 4b. Existing account + pending row (e.g. phone mismatch on invite): become employee if no owned business
         try {
-            const adminSupabase = require('../config/supabaseClient').supabase;
+            const adminSupabase = require('../config/supabaseClient').adminSupabase;
             if (profile && pending?.business_id) {
+                const currentRole = String(profile?.role || '').toLowerCase();
+                const preservePrivilegedRole = ['admin', 'owner'].includes(currentRole);
                 const { data: ownedBiz } = await adminSupabase
                     .from('businesses')
                     .select('id')
                     .eq('owner_id', user.id)
                     .limit(1);
-                if (!ownedBiz?.length) {
+                if (!ownedBiz?.length && !preservePrivilegedRole) {
                     const pendRole = String(pending.role || 'employee').toLowerCase();
                     const { data: merged, error: mErr } = await adminSupabase
                         .from('profiles')
@@ -338,7 +340,14 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
         // 4c. Apply validated invite link — sets role + business_id (fixes former owners still marked owner)
         try {
-            const adminSupabase = require('../config/supabaseClient').supabase;
+            const adminSupabase = require('../config/supabaseClient').adminSupabase;
+            if (validatedInvite) {
+                const currentRole = String(finalProfileData?.role || profile?.role || '').toLowerCase();
+                if (['admin', 'owner'].includes(currentRole)) {
+                    console.warn('[AUTH] Skipping invite role override for privileged profile:', currentRole);
+                    validatedInvite = null;
+                }
+            }
             if (validatedInvite) {
                 const inviteRole = String(validatedInvite.role || 'employee').toLowerCase();
                 const { data: upserted, error: invUpErr } = await adminSupabase
@@ -376,7 +385,7 @@ export const verifyOtp = async (req: Request, res: Response) => {
 
         // 5. Ensure invited provider row is linked to this auth user (critical for employee dashboard/tasks/leaves)
         try {
-            const adminSupabase = require('../config/supabaseClient').supabase;
+            const adminSupabase = require('../config/supabaseClient').adminSupabase;
             const normalizedPhone = phone.replace(/[^\d+]/g, '');
             const employerBizId = finalProfileData?.business_id;
             const { data: existingLinked } = await adminSupabase
@@ -423,10 +432,25 @@ export const verifyOtp = async (req: Request, res: Response) => {
         // Differentiate between Auth errors (bad OTP) and Server errors
         const rawMessage = normalizeErrorMessage(error, 'An unexpected error occurred');
         const lowerRaw = rawMessage.toLowerCase();
-        const isAuthError = error.status === 400 || lowerRaw.includes('otp') || lowerRaw.includes('verification');
+        const authCode = String(error?.code || '').toLowerCase();
+        const isOtpExpiredOrInvalid =
+            authCode === 'otp_expired' ||
+            lowerRaw.includes('token has expired') ||
+            lowerRaw.includes('expired or is invalid') ||
+            lowerRaw.includes('invalid otp');
+        const isAuthError =
+            error.status === 400 ||
+            error.status === 401 ||
+            error.status === 403 ||
+            lowerRaw.includes('otp') ||
+            lowerRaw.includes('verification') ||
+            isOtpExpiredOrInvalid;
         const connectivity = userSafeConnectivityMessage(error);
-        const message =
-            connectivity || rawMessage;
+        const message = connectivity
+            ? connectivity
+            : isOtpExpiredOrInvalid
+              ? 'OTP has expired or is invalid. Please request a new OTP and try again.'
+              : rawMessage;
 
         res.status(isAuthError ? 401 : 500).json({
             status: 'error',

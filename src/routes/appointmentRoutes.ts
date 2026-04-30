@@ -4,6 +4,8 @@ import {
   getMyAppointments,
   getBusinessAppointments,
   updateAppointmentStatus,
+  acceptAppointment,
+  rejectAppointment,
   sendAppointmentAlert,
   rescheduleAppointment,
   cancelAppointment,
@@ -23,6 +25,8 @@ router.get('/assigned/me', requireAuth, getMyAssignedAppointments);
 // Owner
 router.get('/business', requireAuth, getBusinessAppointments);
 router.patch('/:id/status', requireAuth, updateAppointmentStatus);
+router.patch('/:id/accept', requireAuth, acceptAppointment);
+router.patch('/:id/reject', requireAuth, rejectAppointment);
 router.patch('/:id/reschedule', requireAuth, rescheduleAppointment); // NEW
 router.patch('/:id/cancel', requireAuth, cancelAppointment); // NEW
 router.patch('/:id/reassign', requireAuth, reassignAppointment); // NEW

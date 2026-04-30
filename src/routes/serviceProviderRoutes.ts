@@ -18,11 +18,15 @@ router.delete('/:id', serviceProviderController.deleteServiceProvider);
 router.post('/:id/services', serviceProviderController.assignProviderServices);
 router.get('/:id/availability', serviceProviderController.getProviderAvailability);
 router.put('/:id/availability', serviceProviderController.updateProviderAvailability);
+router.get('/:id/attendance', serviceProviderController.getProviderAttendance);
+router.post('/:id/attendance', serviceProviderController.markProviderAttendance);
 router.get('/:id/day-offs', serviceProviderController.getProviderDayOffs);
 router.post('/:id/day-offs', serviceProviderController.addProviderDayOff);
+router.patch('/day-offs/:dayOffId', serviceProviderController.updateProviderDayOff);
 router.delete('/day-offs/:dayOffId', serviceProviderController.deleteProviderDayOff);
 router.get('/:id/block-times', serviceProviderController.getProviderBlockTimes);
 router.post('/:id/block-times', serviceProviderController.addProviderBlockTime);
+router.patch('/block-times/:blockId', serviceProviderController.updateProviderBlockTime);
 router.delete('/block-times/:blockId', serviceProviderController.deleteProviderBlockTime);
 router.patch('/assignments/:id', serviceProviderController.assignProviderToEntry);
 
@@ -38,6 +42,7 @@ router.delete('/leaves/:leaveId', serviceProviderController.deleteProviderLeave)
 // Resignation Resquests
 router.post('/resignation', serviceProviderController.submitResignation);
 router.get('/resignation/list', serviceProviderController.getResignationRequests);
+router.get('/resignation/my', serviceProviderController.getMyResignationRequests);
 router.patch('/resignation/:requestId/status', serviceProviderController.updateResignationStatus);
 
 export default router;

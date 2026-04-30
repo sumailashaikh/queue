@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { Business } from '../types';
 import { notificationService } from '../services/notificationService';
+import { resolveBusinessAvailability } from '../utils/timeUtils';
 
 const COUNTRY_DEFAULTS: Record<string, { currency: string, timezone: string, language: string }> = {
     'IN': { currency: 'INR', timezone: 'Asia/Kolkata', language: 'hi' },
@@ -14,7 +15,7 @@ const COUNTRY_DEFAULTS: Record<string, { currency: string, timezone: string, lan
 export const createBusiness = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
-        const { name, slug, address, phone, whatsapp_number, open_time, close_time, is_closed, currency, timezone, language, country_code } = req.body;
+        const { name, slug, address, phone, whatsapp_number, open_time, close_time, staff_open_time, staff_close_time, is_closed, currency, timezone, language, country_code } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         if (!userId) {
@@ -82,6 +83,8 @@ export const createBusiness = async (req: Request, res: Response) => {
             whatsapp_number,
             open_time,
             close_time,
+            staff_open_time: staff_open_time || open_time,
+            staff_close_time: staff_close_time || close_time,
             is_closed,
             country_code: cCode,
             currency: currency || defaults.currency,
@@ -89,11 +92,27 @@ export const createBusiness = async (req: Request, res: Response) => {
             language: language || defaults.language
         };
 
-        const { data, error } = await supabase
+        let { data, error } = await supabase
             .from('businesses')
             .insert(newBusiness)
             .select()
             .single();
+
+        if (error) {
+            const msg = String((error as any)?.message || '');
+            if (msg.includes("staff_open_time") || msg.includes("staff_close_time")) {
+                const fallbackBusiness = { ...newBusiness } as any;
+                delete fallbackBusiness.staff_open_time;
+                delete fallbackBusiness.staff_close_time;
+                const retry = await supabase
+                    .from('businesses')
+                    .insert(fallbackBusiness)
+                    .select()
+                    .single();
+                data = retry.data as any;
+                error = retry.error as any;
+            }
+        }
 
         if (error) throw error;
 
@@ -254,13 +273,31 @@ export const updateBusiness = async (req: Request, res: Response) => {
         delete updatePayload.owner_id;
         delete updatePayload.id;
 
-        const { data, error } = await supabase
+        let { data, error } = await supabase
             .from('businesses')
             .update(updatePayload)
             .eq('id', id)
             .eq('owner_id', userId) // Extra safety
             .select('*, currency, timezone, language, country_code')
             .single();
+
+        if (error) {
+            const msg = String((error as any)?.message || '');
+            if (msg.includes("staff_open_time") || msg.includes("staff_close_time")) {
+                const fallbackPayload = { ...updatePayload } as any;
+                delete fallbackPayload.staff_open_time;
+                delete fallbackPayload.staff_close_time;
+                const retry = await supabase
+                    .from('businesses')
+                    .update(fallbackPayload)
+                    .eq('id', id)
+                    .eq('owner_id', userId)
+                    .select('*, currency, timezone, language, country_code')
+                    .single();
+                data = retry.data as any;
+                error = retry.error as any;
+            }
+        }
 
         if (error) throw error;
 
@@ -435,6 +472,11 @@ export const getBusinessBySlug = async (req: Request, res: Response) => {
             }
         }
 
+        const availability = resolveBusinessAvailability(data);
+        (data as any).availability_status = availability.state;
+        (data as any).availability_message = availability.message || null;
+        (data as any).availability = availability;
+
         res.status(200).json({
             status: 'success',
             data
@@ -467,6 +509,8 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 slug,
                 open_time,
                 close_time,
+                staff_open_time,
+                staff_close_time,
                 is_closed,
                 language,
                 queues (id, name),
@@ -501,6 +545,11 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
                 business.queues = [newQueue];
             }
         }
+
+        const availability = resolveBusinessAvailability(business);
+        (business as any).availability_status = availability.state;
+        (business as any).availability_message = availability.message || null;
+        (business as any).availability = availability;
 
         const queueIds = (business.queues || []).map((q: any) => q.id);
 
@@ -856,7 +905,7 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
 
         const { data: business } = await supabase
             .from('businesses')
-            .select('id, timezone, open_time, close_time')
+            .select('id, timezone, open_time, close_time, staff_open_time, staff_close_time')
             .eq('slug', slug)
             .maybeSingle();
         if (!business) return res.status(404).json({ status: 'error', message: 'Business not found' });
@@ -874,8 +923,10 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             const [hh, mm] = String(t || '00:00').split(':').map(Number);
             return (hh || 0) * 60 + (mm || 0);
         };
-        const openM = parseMins(String(business.open_time || '09:00').slice(0, 5));
-        const closeM = parseMins(String(business.close_time || '21:00').slice(0, 5));
+        const effectiveOpen = String((business as any).staff_open_time || business.open_time || '09:00').slice(0, 5);
+        const effectiveClose = String((business as any).staff_close_time || business.close_time || '21:00').slice(0, 5);
+        const openM = parseMins(effectiveOpen);
+        const closeM = parseMins(effectiveClose);
         const dayOfWeek = new Date(`${String(date).slice(0, 10)}T12:00:00`).getDay();
         const { data: providerAvailability } = await supabase
             .from('provider_availability')
@@ -884,11 +935,17 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             .eq('day_of_week', dayOfWeek)
             .limit(1)
             .maybeSingle();
-        if (!providerAvailability || providerAvailability.is_available === false) {
+        // For newly added employees, availability rows may not exist yet.
+        // In that case, default to business hours instead of showing no slots.
+        if (providerAvailability && providerAvailability.is_available === false) {
             return res.status(200).json({ status: 'success', data: { date: String(date).slice(0, 10), slots: [] } });
         }
-        const providerStartM = parseMins(String(providerAvailability.start_time || '00:00').slice(0, 5));
-        const providerEndM = parseMins(String(providerAvailability.end_time || '23:59').slice(0, 5));
+        const providerStartM = providerAvailability
+            ? parseMins(String(providerAvailability.start_time || '00:00').slice(0, 5))
+            : openM;
+        const providerEndM = providerAvailability
+            ? parseMins(String(providerAvailability.end_time || '23:59').slice(0, 5))
+            : closeM;
         const bufferClose = Math.min(closeM - 10, providerEndM);
 
 
@@ -955,11 +1012,18 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             leaveBlocks.push({ startM: parse(l.start_time || '00:00'), endM: parse(l.end_time || '23:59') });
         });
 
-        const { data: dayOffRows } = await supabase
+        const { data: dayOffRows, error: dayOffErr } = await supabase
             .from('provider_day_offs')
             .select('day_off_type, start_time, end_time')
             .eq('provider_id', providerId)
             .eq('day_off_date', String(date).slice(0, 10));
+        if (dayOffErr) {
+            const msg = String(dayOffErr.message || '').toLowerCase();
+            // Some deployments may not have this optional table yet.
+            if (!msg.includes('provider_day_offs')) {
+                throw dayOffErr;
+            }
+        }
         for (const d of dayOffRows || []) {
             const type = String(d.day_off_type || 'full_day').toLowerCase();
             if (type === 'full_day') {
@@ -968,11 +1032,18 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             leaveBlocks.push({ startM: parseMins(String(d.start_time || '00:00').slice(0, 5)), endM: parseMins(String(d.end_time || '23:59').slice(0, 5)) });
         }
 
-        const { data: blockTimeRows } = await supabase
+        const { data: blockTimeRows, error: blockTimeErr } = await supabase
             .from('provider_block_times')
             .select('start_time, end_time')
             .eq('provider_id', providerId)
             .eq('block_date', String(date).slice(0, 10));
+        if (blockTimeErr) {
+            const msg = String(blockTimeErr.message || '').toLowerCase();
+            // Some deployments may not have this optional table yet.
+            if (!msg.includes('provider_block_times')) {
+                throw blockTimeErr;
+            }
+        }
         (blockTimeRows || []).forEach((b: any) => {
             leaveBlocks.push({ startM: parseMins(String(b.start_time || '00:00').slice(0, 5)), endM: parseMins(String(b.end_time || '23:59').slice(0, 5)) });
         });

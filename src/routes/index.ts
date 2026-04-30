@@ -11,6 +11,8 @@ import adminRoutes from './adminRoutes';
 import publicRoutes from './publicRoutes';
 import serviceProviderRoutes from './serviceProviderRoutes';
 import employeeRoutes from './employeeRoutes';
+import paymentSettingsRoutes from './paymentSettingsRoutes';
+import notificationRoutes from './notificationRoutes';
 import { requireAuth } from '../middleware/authMiddleware';
 
 const router = Router();
@@ -31,5 +33,7 @@ router.use('/analytics', analyticsRoutes);
 router.use('/admin', adminRoutes);
 router.use('/service-providers', serviceProviderRoutes);
 router.use('/employee', employeeRoutes);
+router.use('/payment-settings', paymentSettingsRoutes);
+router.use('/notifications', notificationRoutes);
 
 export default router;

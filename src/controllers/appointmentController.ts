@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
-import { isBusinessOpen, getLocalMinutes, getLocalDateString } from '../utils/timeUtils';
+import { isBusinessOpen, getLocalMinutes, getLocalDateString, resolveBusinessAvailability } from '../utils/timeUtils';
 import { recomputeProviderDelays } from '../utils/delayLogic';
 
 async function resolveMyProviderForUser(userId: string, adminSupabase: any) {
@@ -37,10 +37,81 @@ function appointmentRescheduledMessage(lang: string, businessName: string, when:
     return `Your appointment at ${businessName} has been rescheduled to ${when}.`;
 }
 
+function isMissingEmployeeIdColumnError(err: any): boolean {
+    const msg = String(err?.message || err || '').toLowerCase();
+    return msg.includes('employee_id') && (msg.includes('schema cache') || msg.includes('column') || msg.includes('does not exist'));
+}
+
+async function createBusinessNotification(
+    supabaseClient: any,
+    businessId: string,
+    title: string,
+    message: string,
+    type: string,
+    meta: Record<string, any> = {},
+    userId?: string | null
+) {
+    await supabaseClient.from('notifications').insert([{
+        business_id: businessId,
+        user_id: userId || null,
+        title,
+        message,
+        type,
+        meta
+    }]);
+}
+
+async function notifyOwnerForNewAppointment(
+    supabaseClient: any,
+    businessId: string,
+    customerName: string,
+    startTime: string
+) {
+    const { data: business } = await supabaseClient
+        .from('businesses')
+        .select('id, name, owner_id, phone, whatsapp_number, timezone')
+        .eq('id', businessId)
+        .maybeSingle();
+    if (!business) return;
+
+    const when = new Date(startTime).toLocaleString('en-IN', { timeZone: business.timezone || 'UTC' });
+    const title = 'New appointment request';
+    const message = `${customerName} requested an appointment for ${when}.`;
+    await createBusinessNotification(
+        supabaseClient,
+        businessId,
+        title,
+        message,
+        'appointment_request',
+        { start_time: startTime, customer_name: customerName }
+    );
+
+    const ownerTargets = new Set<string>();
+    if (business.owner_id) {
+        const { data: ownerProfile } = await supabaseClient
+            .from('profiles')
+            .select('phone')
+            .eq('id', business.owner_id)
+            .maybeSingle();
+        if (ownerProfile?.phone) ownerTargets.add(String(ownerProfile.phone));
+    }
+    if (business.phone) ownerTargets.add(String(business.phone));
+    if (business.whatsapp_number) ownerTargets.add(String(business.whatsapp_number));
+
+    if (ownerTargets.size > 0) {
+        await Promise.allSettled(
+            Array.from(ownerTargets).flatMap((to) => [
+                notificationService.sendWhatsApp(to, message),
+                notificationService.sendSMS(to, message)
+            ])
+        );
+    }
+}
+
 export const createAppointment = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
-        const { business_id, service_ids, start_time, end_time } = req.body; // service_ids is now an array
+        const { business_id, service_ids, start_time, end_time, employee_id } = req.body; // service_ids is now an array
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         if (!userId) {
@@ -60,7 +131,7 @@ export const createAppointment = async (req: Request, res: Response) => {
         // Check business hours
         const { data: business, error: bizError } = await supabase
             .from('businesses')
-            .select('name, open_time, close_time, is_closed, timezone')
+            .select('name, open_time, close_time, staff_open_time, staff_close_time, is_closed, timezone')
             .eq('id', business_id)
             .single();
 
@@ -68,9 +139,14 @@ export const createAppointment = async (req: Request, res: Response) => {
             return res.status(404).json({ status: 'error', message: 'Business not found' });
         }
 
-        // Check business manually closed status (completely offline)
-        if (business.is_closed) {
-            return res.status(400).json({ status: 'error', message: 'Business is closed. Please book during working hours.' });
+        // Emergency closure must override regular timing.
+        const availability = resolveBusinessAvailability(business);
+        if (!availability.isOpen) {
+            return res.status(400).json({
+                status: 'error',
+                message: availability.message || 'Business is closed. Please book during working hours.',
+                availability_status: availability.state
+            });
         }
 
         // Calculate total duration from services
@@ -92,7 +168,8 @@ export const createAppointment = async (req: Request, res: Response) => {
         const bufferMins = 15;
         const timezone = business.timezone || 'UTC';
         const nowMins = getLocalMinutes(timezone);
-        const closeMins = require('../utils/timeUtils').parseTimeToMinutes(business.close_time);
+        const effectiveClose = (business as any).staff_close_time || business.close_time;
+        const closeMins = require('../utils/timeUtils').parseTimeToMinutes(effectiveClose);
 
         // Check if appointment date is today
         const todayStr = getLocalDateString(timezone);
@@ -123,21 +200,42 @@ export const createAppointment = async (req: Request, res: Response) => {
 
         const calculatedEndTime = end_time || new Date(new Date(start_time).getTime() + totalDuration * 60000).toISOString();
 
-        const { data, error } = await supabase
+        let employeeProviderId: string | null = null;
+        if (employee_id) {
+            const { data: providerRow } = await supabase
+                .from('service_providers')
+                .select('id')
+                .eq('user_id', employee_id)
+                .eq('business_id', business_id)
+                .maybeSingle();
+            employeeProviderId = providerRow?.id || null;
+        }
+
+        let insertPayload: any = {
+            user_id: userId,
+            business_id,
+            service_id, // Legacy compatibility
+            start_time,
+            end_time: calculatedEndTime,
+            status: 'pending',
+            employee_id: employee_id || null
+        };
+        let { data, error } = await supabase
             .from('appointments')
-            .insert([
-                {
-                    user_id: userId,
-                    business_id,
-                    service_id, // Legacy compatibility
-                    start_time,
-                    end_time: calculatedEndTime,
-                    status: 'scheduled' // Updated status to scheduled
-                }
-            ])
+            .insert([insertPayload])
             .select()
             .single();
 
+        if (error && isMissingEmployeeIdColumnError(error)) {
+            const { employee_id: _ignore, ...fallbackPayload } = insertPayload;
+            const retry = await supabase
+                .from('appointments')
+                .insert([fallbackPayload])
+                .select()
+                .single();
+            data = retry.data as any;
+            error = retry.error as any;
+        }
         if (error) throw error;
 
         // Link services in junction table with snapshots
@@ -152,19 +250,23 @@ export const createAppointment = async (req: Request, res: Response) => {
                     appointment_id: data.id,
                     service_id: s.id,
                     price: s.price || 0,
-                    duration_minutes: s.duration_minutes || 0
+                    duration_minutes: s.duration_minutes || 0,
+                    assigned_provider_id: employeeProviderId
                 }));
                 await supabase.from('appointment_services').insert(junctionEntries);
             }
         }
 
-        // Send Notification
-        const recipient = `User-${userId}`; // Mock phone lookup
-        await notificationService.sendSMS(recipient, `Your appointment is scheduled for ${start_time}.`);
+        await notifyOwnerForNewAppointment(
+            supabase,
+            business_id,
+            'Customer',
+            start_time
+        );
 
         res.status(201).json({
             status: 'success',
-            message: 'Appointment scheduled successfully',
+            message: 'Appointment request sent successfully',
             data
         });
 
@@ -273,6 +375,7 @@ export const getMyAssignedAppointments = async (req: Request, res: Response) => 
               )
             `)
             .eq('assigned_provider_id', provider.id)
+            .in('appointments.status', ['confirmed', 'checked_in', 'in_service', 'rescheduled'])
             .order('reassigned_at', { ascending: false, nullsFirst: false });
 
         if (error) throw error;
@@ -312,14 +415,41 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
+        const { data: myProfile } = await supabase
+            .from('profiles')
+            .select('role, business_id')
+            .eq('id', userId)
+            .maybeSingle();
+        const myRole = String(myProfile?.role || '').toLowerCase();
+        if (myRole === 'employee') {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
 
-        // 1. Get businesses owned by user
-        const { data: businesses, error: businessError } = await supabase
+        // 1. Get businesses for owner/admin/provider
+        let businesses: any[] = [];
+        const { data: ownedBusinesses, error: businessError } = await supabase
             .from('businesses')
             .select('id, timezone')
             .eq('owner_id', userId);
 
         if (businessError) throw businessError;
+        businesses = ownedBusinesses || [];
+
+        if (businesses.length === 0) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('business_id')
+                .eq('id', userId)
+                .maybeSingle();
+            if (profile?.business_id) {
+                const { data: byProfile } = await supabase
+                    .from('businesses')
+                    .select('id, timezone')
+                    .eq('id', profile.business_id)
+                    .limit(1);
+                businesses = byProfile || [];
+            }
+        }
 
         if (!businesses || businesses.length === 0) {
             return res.status(200).json({ status: 'success', data: [] });
@@ -327,39 +457,63 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
 
         const businessIds = businesses.map((b: any) => b.id);
 
-        // 1.5 Auto-Process No-Shows & Expirations (60-min grace period)
+        // 1.5 Auto-Process unattended approved appointments (30-min grace period)
         const now = new Date();
-        const sixtyMinsAgo = new Date(now.getTime() - 60 * 60000).toISOString();
+        const thirtyMinsAgo = new Date(now.getTime() - 30 * 60000).toISOString();
         const primaryTimezone = businesses[0]?.timezone || 'UTC';
         const todayStr = getLocalDateString(primaryTimezone);
 
-        // A. Mark 'scheduled' (Pending) as 'expired' if 60 mins late
+        // A. Mark unapproved requests as expired if stale
         await supabase
             .from('appointments')
             .update({ status: 'expired' })
             .in('business_id', businessIds)
-            .eq('status', 'scheduled')
-            .lt('start_time', sixtyMinsAgo)
+            .in('status', ['pending', 'scheduled', 'requested'])
+            .lt('start_time', thirtyMinsAgo)
             .gte('start_time', todayStr + 'T00:00:00Z');
 
-        // B. Mark 'confirmed' as 'no_show' if 60 mins late
-        const { data: noShowAppointments } = await supabase
+        // B. Auto-cancel approved appointments if customer does not arrive in 30 minutes
+        const { data: autoCancelledAppointments } = await supabase
             .from('appointments')
-            .update({ status: 'no_show' })
+            .update({ status: 'cancelled' })
             .in('business_id', businessIds)
             .eq('status', 'confirmed')
-            .lt('start_time', sixtyMinsAgo)
+            .lt('start_time', thirtyMinsAgo)
             .gte('start_time', todayStr + 'T00:00:00Z')
-            .select('id');
+            .select('id, guest_phone, guest_name, user_id, business_id');
 
-        // Sync no_shows with queue entries if any existed
-        if (noShowAppointments && noShowAppointments.length > 0) {
-            const noShowIds = noShowAppointments.map((a: { id: string }) => a.id);
+        // Sync queue entries + notify customers for auto-cancelled rows
+        if (autoCancelledAppointments && autoCancelledAppointments.length > 0) {
+            const cancelledIds = autoCancelledAppointments.map((a: { id: string }) => a.id);
             await supabase
                 .from('queue_entries')
-                .update({ status: 'no_show' })
-                .in('appointment_id', noShowIds)
+                .update({ status: 'cancelled' })
+                .in('appointment_id', cancelledIds)
                 .in('status', ['waiting', 'serving']);
+
+            for (const row of autoCancelledAppointments as any[]) {
+                try {
+                    let toPhone = row.guest_phone || null;
+                    if (!toPhone && row.user_id) {
+                        const { data: p } = await supabase
+                            .from('profiles')
+                            .select('phone')
+                            .eq('id', row.user_id)
+                            .maybeSingle();
+                        toPhone = p?.phone || null;
+                    }
+                    if (toPhone) {
+                        const customerName = row.guest_name || 'Customer';
+                        const msg = `Hi ${customerName}, your appointment was cancelled because check-in was not completed within 30 minutes of scheduled time. Please book again.`;
+                        await Promise.allSettled([
+                            notificationService.sendWhatsApp(toPhone, msg),
+                            notificationService.sendSMS(toPhone, msg)
+                        ]);
+                    }
+                } catch {
+                    // non-blocking
+                }
+            }
         }
 
         // 2. Get appointments for these businesses
@@ -369,6 +523,7 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
                 *,
                 profiles (full_name, id, phone, ui_language),
                 appointment_services!appointment_id (
+                    assigned_provider_id,
                     services!service_id (id, name, duration_minutes, translations)
                 ),
                 queue_entries (id, status, ticket_number)
@@ -378,16 +533,73 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
+        const employeeIds = Array.from(
+            new Set(
+                (data || [])
+                    .map((a: any) => a?.employee_id)
+                    .filter(Boolean)
+                    .map((id: any) => String(id))
+            )
+        );
+        const assignedProviderIds = Array.from(
+            new Set(
+                (data || [])
+                    .flatMap((a: any) => (a?.appointment_services || []).map((s: any) => s?.assigned_provider_id))
+                    .filter(Boolean)
+                    .map((id: any) => String(id))
+            )
+        );
+        const employeeMap = new Map<string, any>();
+        if (employeeIds.length > 0) {
+            const { data: employeeRows } = await supabase
+                .from('profiles')
+                .select('id, full_name, phone')
+                .in('id', employeeIds);
+            (employeeRows || []).forEach((e: any) => employeeMap.set(String(e.id), e));
+        }
+        if (assignedProviderIds.length > 0) {
+            const { data: providerRows } = await supabase
+                .from('service_providers')
+                .select('id, user_id')
+                .in('id', assignedProviderIds);
+            const fallbackEmployeeIds = Array.from(new Set((providerRows || []).map((p: any) => p?.user_id).filter(Boolean).map((v: any) => String(v))));
+            if (fallbackEmployeeIds.length > 0) {
+                const { data: fallbackEmployees } = await supabase
+                    .from('profiles')
+                    .select('id, full_name, phone')
+                    .in('id', fallbackEmployeeIds);
+                (fallbackEmployees || []).forEach((e: any) => {
+                    if (!employeeMap.has(String(e.id))) employeeMap.set(String(e.id), e);
+                });
+                const providerToEmployee = new Map<string, any>();
+                (providerRows || []).forEach((p: any) => {
+                    const emp = p?.user_id ? employeeMap.get(String(p.user_id)) : null;
+                    if (emp) providerToEmployee.set(String(p.id), emp);
+                });
+                (data || []).forEach((a: any) => {
+                    if (!a?.employee_id) {
+                        const providerId = (a?.appointment_services || []).find((s: any) => !!s?.assigned_provider_id)?.assigned_provider_id;
+                        if (providerId) {
+                            const mapped = providerToEmployee.get(String(providerId));
+                            if (mapped) a.__employeeFallback = mapped;
+                        }
+                    }
+                });
+            }
+        }
+
         const enhancedData = data.map((appt: any) => {
             const startTime = new Date(appt.start_time);
             const duration = appt.appointment_services?.reduce((acc: number, s: any) => acc + (s.services?.duration_minutes || 0), 0) || 30;
             const expectedEndAt = new Date(startTime.getTime() + duration * 60000);
 
-            const isLate = ['scheduled', 'confirmed', 'checked_in'].includes(appt.status) && now > startTime;
+            const isLate = ['confirmed'].includes(String(appt.status || '').toLowerCase()) && now > startTime;
             const lateMinutes = isLate ? Math.max(0, Math.round((now.getTime() - startTime.getTime()) / 60000)) : 0;
 
             let appointmentState = appt.status.toUpperCase();
             if (isLate) appointmentState = 'LATE';
+            if (String(appt.status || '').toLowerCase() === 'pending') appointmentState = 'PENDING';
+            if (String(appt.status || '').toLowerCase() === 'in_service') appointmentState = 'RUNNING';
             if (appt.status === 'scheduled' && now < startTime) appointmentState = 'UPCOMING';
 
             const isToday = getLocalDateString(primaryTimezone, new Date(appt.start_time)) === todayStr;
@@ -400,6 +612,9 @@ export const getBusinessAppointments = async (req: Request, res: Response) => {
 
             return {
                 ...appt,
+                employee: appt?.employee_id
+                    ? (employeeMap.get(String(appt.employee_id)) || null)
+                    : (appt?.__employeeFallback || null),
                 appointment_state: appointmentState,
                 is_late: isLate,
                 late_minutes: lateMinutes,
@@ -490,13 +705,13 @@ export const reassignAppointment = async (req: Request, res: Response) => {
 export const updateAppointmentStatus = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
-        const { status } = req.body;
+        const { status, employee_id } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
-        const validStatuses = ['scheduled', 'confirmed', 'checked_in', 'in_service', 'completed', 'cancelled', 'no_show', 'expired'];
+        const validStatuses = ['pending', 'scheduled', 'confirmed', 'checked_in', 'in_service', 'completed', 'cancelled', 'no_show', 'expired'];
         if (!validStatuses.includes(status)) {
             return res.status(400).json({ status: 'error', message: 'Invalid status' });
         }
@@ -518,7 +733,29 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         if (fetchError || !appointment) return res.status(404).json({ status: 'error', message: 'Appointment not found' });
 
         const business = Array.isArray(appointment.businesses) ? appointment.businesses[0] : appointment.businesses;
-        if (!business || business.owner_id !== userId) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        if (!business) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        const { data: myProfile } = await supabase
+            .from('profiles')
+            .select('business_id, role')
+            .eq('id', userId)
+            .maybeSingle();
+        const isSameBusiness = myProfile?.business_id && String(myProfile.business_id) === String(appointment.business_id);
+        const isOwner = String(business.owner_id || '') === String(userId);
+        const isAdmin = String(myProfile?.role || '').toLowerCase() === 'admin';
+        const { data: providerLink } = await supabase
+            .from('service_providers')
+            .select('id')
+            .eq('user_id', userId)
+            .eq('business_id', appointment.business_id)
+            .limit(1)
+            .maybeSingle();
+        const isProvider = !!providerLink?.id;
+        if (!(isOwner || (isSameBusiness && (isAdmin || isProvider)))) {
+            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        }
+        if (['confirmed', 'cancelled'].includes(String(status || '').toLowerCase()) && !(isOwner || isAdmin)) {
+            return res.status(403).json({ status: 'error', message: 'Only owner/admin can approve or reject appointments' });
+        }
 
         const timezone = business.timezone || 'UTC';
         const todayStr = getLocalDateString(timezone);
@@ -532,6 +769,23 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         let updateData: any = { status };
         if (status === 'checked_in') updateData.checked_in_at = new Date().toISOString();
         if (status === 'completed') updateData.completed_at = new Date().toISOString();
+        if (status === 'confirmed' && typeof employee_id !== 'undefined') {
+            updateData.employee_id = employee_id || null;
+            if (employee_id) {
+                const { data: providerRow } = await supabase
+                    .from('service_providers')
+                    .select('id')
+                    .eq('user_id', employee_id)
+                    .eq('business_id', appointment.business_id)
+                    .maybeSingle();
+                if (providerRow?.id) {
+                    await supabase
+                        .from('appointment_services')
+                        .update({ assigned_provider_id: providerRow.id })
+                        .eq('appointment_id', id);
+                }
+            }
+        }
 
         // 1. Sync with Queue
         if (status === 'checked_in' && business.checkin_creates_queue_entry !== false) {
@@ -580,8 +834,8 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
 
                     const { data: newEntry } = await supabase.from('queue_entries').insert([{
                         queue_id: queue.id, appointment_id: id, user_id: appointment.user_id,
-                        customer_name: (appointment.profiles?.full_name || appointment.guest_name || 'Customer'),
-                        phone: (appointment.profiles?.phone || appointment.guest_phone || null),
+                        customer_name: (appointment.guest_name || appointment.profiles?.full_name || 'Customer'),
+                        phone: (appointment.guest_phone || appointment.profiles?.phone || null),
                         service_name: sNames, status: 'waiting', position: nextPos,
                         ticket_number: `A-${nextPos}`, entry_date: todayStr,
                         total_price: totalPri, total_duration_minutes: totalDur,
@@ -628,8 +882,60 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
         }
 
         // 2. Update Appointment
-        const { data: updated, error: updateError } = await supabase.from('appointments').update(updateData).eq('id', id).select().single();
+        let { data: updated, error: updateError } = await supabase.from('appointments').update(updateData).eq('id', id).select().single();
+        if (updateError && isMissingEmployeeIdColumnError(updateError) && Object.prototype.hasOwnProperty.call(updateData, 'employee_id')) {
+            const { employee_id: _ignore, ...fallbackUpdateData } = updateData;
+            const retry = await supabase.from('appointments').update(fallbackUpdateData).eq('id', id).select().single();
+            updated = retry.data as any;
+            updateError = retry.error as any;
+        }
         if (updateError) throw updateError;
+
+        // Notifications after owner decision
+        const appointmentServices = appointment.appointment_services || [];
+        const providerIds = Array.from(new Set(
+            appointmentServices
+                .map((row: any) => row?.assigned_provider_id)
+                .filter(Boolean)
+                .map((v: any) => String(v))
+        ));
+        if (status === 'confirmed' && (providerIds.length > 0 || updateData.employee_id)) {
+            const { data: providerUsers } = await supabase
+                .from('service_providers')
+                .select('user_id')
+                .in('id', providerIds);
+            const employeeUserIds = Array.from(new Set([
+                ...(providerUsers || []).map((p: any) => p?.user_id).filter(Boolean),
+                updateData.employee_id || null
+            ].filter(Boolean)));
+            await Promise.allSettled(
+                employeeUserIds.map((employeeId: any) =>
+                    createBusinessNotification(
+                        supabase,
+                        appointment.business_id,
+                        'Appointment confirmed',
+                        `A new confirmed appointment is assigned to you.`,
+                        'appointment_confirmed',
+                        { appointment_id: appointment.id, start_time: appointment.start_time },
+                        String(employeeId)
+                    )
+                )
+            );
+        }
+
+        if (['confirmed', 'cancelled'].includes(status)) {
+            const guestName = appointment.guest_name || appointment.profiles?.full_name || 'Customer';
+            const customerPhone = appointment.guest_phone || appointment.profiles?.phone || null;
+            if (customerPhone) {
+                const msg = status === 'confirmed'
+                    ? `Hi ${guestName}, your appointment has been confirmed.`
+                    : `Hi ${guestName}, your appointment request has been cancelled.`;
+                await Promise.allSettled([
+                    notificationService.sendWhatsApp(customerPhone, msg),
+                    notificationService.sendSMS(customerPhone, msg)
+                ]);
+            }
+        }
 
         res.status(200).json({ status: 'success', data: updated });
 
@@ -639,9 +945,19 @@ export const updateAppointmentStatus = async (req: Request, res: Response) => {
     }
 };
 
+export const acceptAppointment = async (req: Request, res: Response) => {
+    req.body = { ...(req.body || {}), status: 'confirmed' };
+    return updateAppointmentStatus(req, res);
+};
+
+export const rejectAppointment = async (req: Request, res: Response) => {
+    req.body = { ...(req.body || {}), status: 'cancelled' };
+    return updateAppointmentStatus(req, res);
+};
+
 export const bookPublicAppointment = async (req: Request, res: Response) => {
     try {
-        const { business_id, service_ids, start_time, end_time, customer_name, phone, provider_id } = req.body;
+        const { business_id, service_ids, start_time, end_time, customer_name, phone, provider_id, employee_id } = req.body;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
         const { adminSupabase } = require('../config/supabaseClient');
 
@@ -655,12 +971,21 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
         // Fetch business for closing time validation
         const { data: business, error: bizError } = await supabase
             .from('businesses')
-            .select('name, close_time, is_closed, timezone')
+            .select('name, close_time, staff_close_time, is_closed, timezone')
             .eq('id', business_id)
             .single();
 
         if (bizError || !business) {
             return res.status(404).json({ status: 'error', message: 'Business not found' });
+        }
+
+        const availability = resolveBusinessAvailability(business);
+        if (!availability.isOpen) {
+            return res.status(400).json({
+                status: 'error',
+                message: availability.message || 'Business is currently closed.',
+                availability_status: availability.state
+            });
         }
 
         // Try to resolve an existing profile user_id from phone for public bookings.
@@ -674,9 +999,11 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
             if (candidates.length > 0) {
                 const { data: profilesByPhone } = await adminSupabase
                     .from('profiles')
-                    .select('id, phone')
+                    .select('id, phone, role')
                     .in('phone', candidates);
-                const exact = (profilesByPhone || []).find((p: any) => normalize(p?.phone) === digits);
+                const exactMatches = (profilesByPhone || []).filter((p: any) => normalize(p?.phone) === digits);
+                const customerExact = exactMatches.find((p: any) => String(p?.role || '').toLowerCase() === 'customer');
+                const exact = customerExact || exactMatches[0];
                 if (exact?.id) effectiveUserId = String(exact.id);
             }
         }
@@ -704,7 +1031,8 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
         // Buffer for closing time protection
         const bufferMins = 10;
         const timezone = business.timezone || 'UTC';
-        const closeMins = require('../utils/timeUtils').parseTimeToMinutes(business.close_time);
+        const effectiveClose = (business as any).staff_close_time || business.close_time;
+        const closeMins = require('../utils/timeUtils').parseTimeToMinutes(effectiveClose);
         const startMins = getLocalMinutes(timezone, new Date(start_time));
         const estEndMins = startMins + totalDuration;
 
@@ -717,23 +1045,52 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
 
         const calculatedEndTime = end_time || new Date(new Date(start_time).getTime() + totalDuration * 60000).toISOString();
 
-        const { data, error } = await supabase
+        let resolvedEmployeeId: string | null = employee_id || null;
+        let resolvedProviderId: string | null = provider_id || null;
+        if (!resolvedProviderId && resolvedEmployeeId) {
+            const { data: pByEmployee } = await supabase
+                .from('service_providers')
+                .select('id')
+                .eq('business_id', business_id)
+                .eq('user_id', resolvedEmployeeId)
+                .maybeSingle();
+            resolvedProviderId = pByEmployee?.id || null;
+        } else if (resolvedProviderId && !resolvedEmployeeId) {
+            const { data: pByProvider } = await supabase
+                .from('service_providers')
+                .select('user_id')
+                .eq('id', resolvedProviderId)
+                .maybeSingle();
+            resolvedEmployeeId = pByProvider?.user_id || null;
+        }
+
+        let publicInsertPayload: any = {
+            user_id: effectiveUserId,
+            business_id,
+            service_id: firstServiceId,
+            start_time,
+            end_time: calculatedEndTime,
+            status: 'pending',
+            employee_id: resolvedEmployeeId,
+            guest_name: customer_name,
+            guest_phone: phone
+        };
+        let { data, error } = await supabase
             .from('appointments')
-            .insert([
-                {
-                    user_id: effectiveUserId,
-                    business_id,
-                    service_id: firstServiceId,
-                    start_time,
-                    end_time: calculatedEndTime,
-                    status: 'scheduled', // Updated status to scheduled
-                    guest_name: customer_name,
-                    guest_phone: phone
-                }
-            ])
+            .insert([publicInsertPayload])
             .select()
             .single();
 
+        if (error && isMissingEmployeeIdColumnError(error)) {
+            const { employee_id: _ignore, ...fallbackPublicPayload } = publicInsertPayload;
+            const retry = await supabase
+                .from('appointments')
+                .insert([fallbackPublicPayload])
+                .select()
+                .single();
+            data = retry.data as any;
+            error = retry.error as any;
+        }
         if (error) throw error;
         console.log('[bookPublicAppointment] Supabase Insert Result:', { data, error });
 
@@ -758,15 +1115,18 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
                     service_id: s.id,
                     price: s.price || 0,
                     duration_minutes: s.duration_minutes || 0,
-                    assigned_provider_id: provider_id || null
+                    assigned_provider_id: resolvedProviderId || null
                 }));
                 await supabase.from('appointment_services').insert(junctionEntries);
             }
         }
 
-        // Send Notification to Business Owner
-        // For simplicity, just log it
-        console.log(`[PUBLIC APPOINTMENT] New request from ${customer_name} (${phone}) for ${start_time}`);
+        await notifyOwnerForNewAppointment(
+            supabase,
+            business_id,
+            customer_name,
+            start_time
+        );
 
         res.status(201).json({
             status: 'success',
@@ -971,9 +1331,24 @@ export const cancelAppointment = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
-        // Notify client
-        const recipient = appointment.guest_phone || `User-${appointment.user_id}`;
-        await notificationService.sendSMS(recipient, `Your appointment at ${appointment.businesses.name} has been cancelled.`);
+        // Notify customer by WhatsApp/SMS (best effort)
+        let recipient = appointment.guest_phone || null;
+        if (!recipient && appointment.user_id) {
+            const { data: customerProfile } = await supabase
+                .from('profiles')
+                .select('phone')
+                .eq('id', appointment.user_id)
+                .maybeSingle();
+            recipient = customerProfile?.phone || null;
+        }
+        if (recipient) {
+            const customerName = appointment.guest_name || 'Customer';
+            const msg = `Hi ${customerName}, your appointment at ${appointment.businesses.name} has been cancelled by the owner.`;
+            await Promise.allSettled([
+                notificationService.sendWhatsApp(recipient, msg),
+                notificationService.sendSMS(recipient, msg)
+            ]);
+        }
 
         res.status(200).json({
             status: 'success',

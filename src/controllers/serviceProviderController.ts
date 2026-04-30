@@ -120,6 +120,17 @@ const isLeaveOverlapConstraintError = (error: any): boolean => {
     return raw.includes('exclusion constraint') || raw.includes('provider_leaves_overlap');
 };
 
+const isMissingTableError = (error: any, tableName: string): boolean => {
+    const raw = String(error?.message || error?.error || (error as any)?.details || '').toLowerCase();
+    const t = String(tableName || '').toLowerCase();
+    if (!raw || !t) return false;
+    return (
+        (raw.includes('could not find the table') && raw.includes(t)) ||
+        (raw.includes('relation') && raw.includes(t) && raw.includes('does not exist')) ||
+        (raw.includes('schema cache') && raw.includes(t))
+    );
+};
+
 const validateTextByLanguage = (text: string, language: string): boolean => {
     if (!text || !text.trim()) return true;
     const baseLang = (language || 'en').split('-')[0].toLowerCase();
@@ -783,14 +794,14 @@ export const updateProviderAvailability = async (req: Request, res: Response) =>
         const { id } = req.params; // provider_id
         const { availability } = req.body; // Array of {day_of_week, start_time, end_time, is_available}
         const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!userId) {
             return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         }
 
         // 1. Verify ownership or self-management
-        const { data: provider } = await supabase
+        const { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, business_id, user_id')
             .eq('id', id)
@@ -800,19 +811,18 @@ export const updateProviderAvailability = async (req: Request, res: Response) =>
             return res.status(404).json({ status: 'error', message: 'Provider not found' });
         }
 
-        const { data: business } = await supabase
+        const { data: business } = await adminSupabase
             .from('businesses')
             .select('id, owner_id')
             .eq('id', provider.business_id)
             .maybeSingle();
         const isOwner = business?.owner_id === userId;
-        const isSelf = provider?.user_id === userId;
-        if (!isOwner && !isSelf) {
+        if (!isOwner) {
             return res.status(403).json({ status: 'error', message: 'Unauthorized' });
         }
 
         // 2. Clear existing availability
-        await supabase.from('provider_availability').delete().eq('provider_id', id);
+        await adminSupabase.from('provider_availability').delete().eq('provider_id', id);
 
         // 3. Insert new availability
         if (Array.isArray(availability) && availability.length > 0) {
@@ -823,7 +833,7 @@ export const updateProviderAvailability = async (req: Request, res: Response) =>
                 end_time: a.end_time,
                 is_available: a.is_available ?? true
             }));
-            const { error: insertError } = await supabase.from('provider_availability').insert(inserts);
+            const { error: insertError } = await adminSupabase.from('provider_availability').insert(inserts);
             if (insertError) throw insertError;
         }
 
@@ -837,16 +847,185 @@ export const updateProviderAvailability = async (req: Request, res: Response) =>
     }
 };
 
+export const getProviderAttendance = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const { adminSupabase } = require('../config/supabaseClient');
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, business_id, user_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        const { data: biz } = await adminSupabase
+            .from('businesses')
+            .select('id, owner_id, timezone')
+            .eq('id', provider.business_id)
+            .maybeSingle();
+        const isOwner = biz?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: biz.timezone || 'UTC' });
+        const { data: rows, error } = await adminSupabase
+            .from('provider_attendance')
+            .select('*')
+            .eq('provider_id', id)
+            .order('attendance_date', { ascending: false })
+            .order('created_at', { ascending: false })
+            .limit(30);
+        if (error) {
+            const msg = String((error as any)?.message || '');
+            if (msg.includes("Could not find the table 'public.provider_attendance'")) {
+                return res.status(500).json({
+                    status: 'error',
+                    message: "Attendance table is missing. Please run migration 20260428173000_add_provider_attendance_table.sql"
+                });
+            }
+            throw error;
+        }
+        const list = rows || [];
+        const todayRecord = list.find((r: any) => String(r.attendance_date || '') === today) || null;
+        return res.status(200).json({ status: 'success', data: { today: todayRecord, records: list } });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const markProviderAttendance = async (req: Request, res: Response) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user?.id;
+        const { action } = req.body || {};
+        const { adminSupabase } = require('../config/supabaseClient');
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        if (!['clock_in', 'clock_out'].includes(String(action || ''))) {
+            return res.status(400).json({ status: 'error', message: 'Invalid action' });
+        }
+
+        const { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, business_id, user_id')
+            .eq('id', id)
+            .maybeSingle();
+        if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+        const isSelf = provider?.user_id === userId;
+        if (!isSelf) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data: biz } = await adminSupabase
+            .from('businesses')
+            .select('timezone')
+            .eq('id', provider.business_id)
+            .maybeSingle();
+        const timezone = biz?.timezone || 'UTC';
+        const nowIso = new Date().toISOString();
+        const today = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+
+        const { data: rows, error: fetchErr } = await adminSupabase
+            .from('provider_attendance')
+            .select('*')
+            .eq('provider_id', id)
+            .eq('attendance_date', today)
+            .order('created_at', { ascending: false })
+            .limit(1);
+        if (fetchErr) {
+            const msg = String((fetchErr as any)?.message || '');
+            if (msg.includes("Could not find the table 'public.provider_attendance'")) {
+                return res.status(500).json({
+                    status: 'error',
+                    message: "Attendance table is missing. Please run migration 20260428173000_add_provider_attendance_table.sql"
+                });
+            }
+            throw fetchErr;
+        }
+        const row = (rows || [])[0];
+
+        if (String(action) === 'clock_in') {
+            if (row?.clock_in_time && !row?.clock_out_time) {
+                return res.status(200).json({ status: 'success', data: row, message: 'Already clocked in' });
+            }
+            const payload = {
+                provider_id: id,
+                business_id: provider.business_id,
+                attendance_date: today,
+                clock_in_time: nowIso,
+                clock_out_time: null,
+                clock_in_by: userId
+            } as any;
+            const { data: created, error: insertErr } = await adminSupabase
+                .from('provider_attendance')
+                .insert([payload])
+                .select()
+                .maybeSingle();
+            if (insertErr) throw insertErr;
+            return res.status(200).json({ status: 'success', data: created });
+        }
+
+        if (!row?.clock_in_time) {
+            return res.status(400).json({ status: 'error', message: 'Please clock in first.' });
+        }
+        if (row?.clock_out_time) {
+            return res.status(200).json({ status: 'success', data: row, message: 'Already clocked out' });
+        }
+
+        const { data: updated, error: updateErr } = await adminSupabase
+            .from('provider_attendance')
+            .update({
+                clock_out_time: nowIso,
+                clock_out_by: userId
+            })
+            .eq('id', row.id)
+            .select()
+            .maybeSingle();
+        if (updateErr) throw updateErr;
+        return res.status(200).json({ status: 'success', data: updated });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const getProviderDayOffs = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
         const { data, error } = await supabase
             .from('provider_day_offs')
             .select('*')
             .eq('provider_id', id)
             .order('day_off_date', { ascending: true });
-        if (error) throw error;
+        if (error) {
+            if (isMissingTableError(error, 'provider_day_offs')) {
+                // Fallback path: older schemas store day-offs as provider_leaves.
+                const { data: leaveRows, error: leaveError } = await adminSupabase
+                    .from('provider_leaves')
+                    .select('id, provider_id, business_id, start_date, end_date, leave_kind, start_time, end_time, note, status')
+                    .eq('provider_id', id)
+                    .order('start_date', { ascending: true });
+                if (leaveError) throw leaveError;
+
+                const normalized = (leaveRows || [])
+                    .filter((row: any) => String(row.start_date || '') === String(row.end_date || ''))
+                    .map((row: any) => ({
+                        id: row.id,
+                        provider_id: row.provider_id,
+                        business_id: row.business_id,
+                        day_off_date: row.start_date,
+                        day_off_type: String(row.leave_kind || '').toUpperCase() === 'HALF_DAY' ? 'partial' : 'full_day',
+                        start_time: row.start_time || null,
+                        end_time: row.end_time || null,
+                        reason: row.note || null,
+                        source: 'provider_leaves',
+                        status: row.status || null,
+                    }));
+                return res.status(200).json({ status: 'success', data: normalized });
+            }
+            throw error;
+        }
         return res.status(200).json({ status: 'success', data: data || [] });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
@@ -858,18 +1037,18 @@ export const addProviderDayOff = async (req: Request, res: Response) => {
         const { id } = req.params;
         const userId = req.user?.id;
         const { day_off_date, day_off_type, start_time, end_time, reason } = req.body || {};
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         if (!day_off_date) return res.status(400).json({ status: 'error', message: 'day_off_date is required' });
 
-        const { data: provider } = await supabase
+        const { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, business_id, user_id')
             .eq('id', id)
             .maybeSingle();
         if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
 
-        const { data: biz } = await supabase
+        const { data: biz } = await adminSupabase
             .from('businesses')
             .select('id, owner_id')
             .eq('id', provider.business_id)
@@ -888,8 +1067,67 @@ export const addProviderDayOff = async (req: Request, res: Response) => {
             reason: reason || null,
             created_by: userId
         };
-        const { data, error } = await supabase.from('provider_day_offs').insert([payload]).select().maybeSingle();
-        if (error) throw error;
+        const { data, error } = await adminSupabase.from('provider_day_offs').insert([payload]).select().maybeSingle();
+        if (error) {
+            if (isLeaveOverlapConstraintError(error)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'You already have a leave request for these dates.',
+                    message_key: 'providers.err_leave_overlap'
+                });
+            }
+            if (isMissingTableError(error, 'provider_day_offs')) {
+                // Fallback for environments where provider_day_offs table is not present.
+                const leavePayload = {
+                    provider_id: id,
+                    business_id: provider.business_id,
+                    start_date: String(day_off_date).slice(0, 10),
+                    end_date: String(day_off_date).slice(0, 10),
+                    leave_type: String(day_off_type || 'full_day').toLowerCase() === 'partial' ? 'EMERGENCY' : 'VACATION',
+                    leave_kind: String(day_off_type || 'full_day').toLowerCase() === 'partial' ? 'HALF_DAY' : 'FULL_DAY',
+                    start_time: start_time ? String(start_time).slice(0, 5) : null,
+                    end_time: end_time ? String(end_time).slice(0, 5) : null,
+                    note: reason || null,
+                    status: 'PENDING',
+                    approved_by: null
+                } as any;
+                const fallbackTypeCandidates = [
+                    leavePayload.leave_type,
+                    'VACATION', 'vacation',
+                    'PLANNED', 'planned',
+                    'NORMAL', 'normal',
+                    'OTHER', 'other',
+                    'SICK', 'sick',
+                    'EMERGENCY', 'emergency'
+                ];
+                let fallbackInserted: any = null;
+                let fallbackErr: any = null;
+                for (const candidate of fallbackTypeCandidates) {
+                    leavePayload.leave_type = candidate;
+                    const ins = await adminSupabase.from('provider_leaves').insert([leavePayload]).select().maybeSingle();
+                    fallbackInserted = ins.data;
+                    fallbackErr = ins.error;
+                    if (!fallbackErr) break;
+                    if (isLeaveOverlapConstraintError(fallbackErr)) {
+                        return res.status(400).json({
+                            status: 'error',
+                            message: 'You already have a leave request for these dates.',
+                            message_key: 'providers.err_leave_overlap'
+                        });
+                    }
+                    if (!String(fallbackErr?.message || '').toLowerCase().includes('provider_leaves_leave_type_check')) {
+                        break;
+                    }
+                }
+                if (fallbackErr) throw fallbackErr;
+                return res.status(201).json({
+                    status: 'success',
+                    data: fallbackInserted,
+                    message: 'Day off saved as leave fallback'
+                });
+            }
+            throw error;
+        }
         return res.status(201).json({ status: 'success', data });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
@@ -900,22 +1138,27 @@ export const deleteProviderDayOff = async (req: Request, res: Response) => {
     try {
         const { dayOffId } = req.params;
         const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
-        const { data: row } = await supabase
+        const rowRes = await adminSupabase
             .from('provider_day_offs')
             .select('id, business_id, provider_id')
             .eq('id', dayOffId)
             .maybeSingle();
+        if (rowRes.error && isMissingTableError(rowRes.error, 'provider_day_offs')) {
+            return res.status(200).json({ status: 'success', message: 'Day off table not configured; nothing to delete' });
+        }
+        if (rowRes.error) throw rowRes.error;
+        const row = rowRes.data;
         if (!row) return res.status(404).json({ status: 'error', message: 'Day off not found' });
 
-        const { data: biz } = await supabase
+        const { data: biz } = await adminSupabase
             .from('businesses')
             .select('id, owner_id')
             .eq('id', row.business_id)
             .maybeSingle();
-        const { data: provider } = await supabase
+        const { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, user_id')
             .eq('id', row.provider_id)
@@ -924,7 +1167,7 @@ export const deleteProviderDayOff = async (req: Request, res: Response) => {
         const isSelf = provider?.user_id === userId;
         if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
-        await supabase.from('provider_day_offs').delete().eq('id', dayOffId);
+        await adminSupabase.from('provider_day_offs').delete().eq('id', dayOffId);
         return res.status(200).json({ status: 'success', message: 'Day off removed' });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
@@ -941,7 +1184,14 @@ export const getProviderBlockTimes = async (req: Request, res: Response) => {
             .eq('provider_id', id)
             .order('block_date', { ascending: true })
             .order('start_time', { ascending: true });
-        if (error) throw error;
+        if (error) {
+            const msg = String((error as any)?.message || '');
+            if (msg.includes("Could not find the table 'public.provider_block_times'")) {
+                console.warn('[getProviderBlockTimes] provider_block_times table missing in DB schema; returning empty list.');
+                return res.status(200).json({ status: 'success', data: [] });
+            }
+            throw error;
+        }
         return res.status(200).json({ status: 'success', data: data || [] });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
@@ -953,18 +1203,18 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
         const { id } = req.params;
         const userId = req.user?.id;
         const { block_date, start_time, end_time, reason } = req.body || {};
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         if (!block_date || !start_time || !end_time) return res.status(400).json({ status: 'error', message: 'block_date, start_time, end_time are required' });
 
-        const { data: provider } = await supabase
+        const { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, business_id, user_id')
             .eq('id', id)
             .maybeSingle();
         if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
 
-        const { data: biz } = await supabase
+        const { data: biz } = await adminSupabase
             .from('businesses')
             .select('id, owner_id')
             .eq('id', provider.business_id)
@@ -973,16 +1223,40 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
         const isSelf = provider?.user_id === userId;
         if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
+        const toMinutes = (value: string) => {
+            const [h, m] = String(value || '00:00').slice(0, 5).split(':').map(Number);
+            return (Number(h) || 0) * 60 + (Number(m) || 0);
+        };
+        const startMins = toMinutes(start_time);
+        const endMins = toMinutes(end_time);
+        if (endMins <= startMins) {
+            return res.status(400).json({ status: 'error', message: 'End time must be after start time' });
+        }
+        const normalizedDate = String(block_date).slice(0, 10);
+        const { data: existing } = await adminSupabase
+            .from('provider_block_times')
+            .select('id, start_time, end_time')
+            .eq('provider_id', id)
+            .eq('block_date', normalizedDate);
+        const hasOverlap = (existing || []).some((r: any) => {
+            const es = toMinutes(String(r.start_time || '').slice(0, 5));
+            const ee = toMinutes(String(r.end_time || '').slice(0, 5));
+            return startMins < ee && endMins > es;
+        });
+        if (hasOverlap) {
+            return res.status(400).json({ status: 'error', message: 'Block time overlaps an existing slot' });
+        }
+
         const payload = {
             provider_id: id,
             business_id: provider.business_id,
-            block_date: String(block_date).slice(0, 10),
+            block_date: normalizedDate,
             start_time: String(start_time).slice(0, 5),
             end_time: String(end_time).slice(0, 5),
             reason: reason || null,
             created_by: userId
         };
-        const { data, error } = await supabase.from('provider_block_times').insert([payload]).select().maybeSingle();
+        const { data, error } = await adminSupabase.from('provider_block_times').insert([payload]).select().maybeSingle();
         if (error) throw error;
         return res.status(201).json({ status: 'success', data });
     } catch (error: any) {
@@ -994,22 +1268,22 @@ export const deleteProviderBlockTime = async (req: Request, res: Response) => {
     try {
         const { blockId } = req.params;
         const userId = req.user?.id;
-        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
-        const { data: row } = await supabase
+        const { data: row } = await adminSupabase
             .from('provider_block_times')
             .select('id, business_id, provider_id')
             .eq('id', blockId)
             .maybeSingle();
         if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
 
-        const { data: biz } = await supabase
+        const { data: biz } = await adminSupabase
             .from('businesses')
             .select('id, owner_id')
             .eq('id', row.business_id)
             .maybeSingle();
-        const { data: provider } = await supabase
+        const { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, user_id')
             .eq('id', row.provider_id)
@@ -1018,8 +1292,144 @@ export const deleteProviderBlockTime = async (req: Request, res: Response) => {
         const isSelf = provider?.user_id === userId;
         if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
-        await supabase.from('provider_block_times').delete().eq('id', blockId);
+        await adminSupabase.from('provider_block_times').delete().eq('id', blockId);
         return res.status(200).json({ status: 'success', message: 'Block time removed' });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const updateProviderDayOff = async (req: Request, res: Response) => {
+    try {
+        const { dayOffId } = req.params;
+        const userId = req.user?.id;
+        const { day_off_date, day_off_type, start_time, end_time, reason } = req.body || {};
+        const { adminSupabase } = require('../config/supabaseClient');
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        const rowRes = await adminSupabase
+            .from('provider_day_offs')
+            .select('id, business_id, provider_id')
+            .eq('id', dayOffId)
+            .maybeSingle();
+        if (rowRes.error && isMissingTableError(rowRes.error, 'provider_day_offs')) {
+            return res.status(200).json({ status: 'success', message: 'Day off table not configured; update skipped' });
+        }
+        if (rowRes.error) throw rowRes.error;
+        const row = rowRes.data;
+        if (!row) return res.status(404).json({ status: 'error', message: 'Day off not found' });
+
+        const { data: biz } = await adminSupabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', row.business_id)
+            .maybeSingle();
+        const { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, user_id')
+            .eq('id', row.provider_id)
+            .maybeSingle();
+        const isOwner = biz?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const nextType = String(day_off_type || 'full_day').toLowerCase() === 'partial' ? 'partial' : 'full_day';
+        const nextStart = start_time ? String(start_time).slice(0, 5) : null;
+        const nextEnd = end_time ? String(end_time).slice(0, 5) : null;
+        if (nextType === 'partial' && (!nextStart || !nextEnd)) {
+            return res.status(400).json({ status: 'error', message: 'Start time and end time are required for partial day off' });
+        }
+
+        const { data, error } = await adminSupabase
+            .from('provider_day_offs')
+            .update({
+                day_off_date: day_off_date ? String(day_off_date).slice(0, 10) : undefined,
+                day_off_type: nextType,
+                start_time: nextStart,
+                end_time: nextEnd,
+                reason: reason ?? null
+            })
+            .eq('id', dayOffId)
+            .select()
+            .maybeSingle();
+        if (error) throw error;
+        return res.status(200).json({ status: 'success', data });
+    } catch (error: any) {
+        return res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
+export const updateProviderBlockTime = async (req: Request, res: Response) => {
+    try {
+        const { blockId } = req.params;
+        const userId = req.user?.id;
+        const { block_date, start_time, end_time, reason } = req.body || {};
+        const { adminSupabase } = require('../config/supabaseClient');
+        if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        const { data: row } = await adminSupabase
+            .from('provider_block_times')
+            .select('id, business_id, provider_id')
+            .eq('id', blockId)
+            .maybeSingle();
+        if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
+
+        const { data: biz } = await adminSupabase
+            .from('businesses')
+            .select('id, owner_id')
+            .eq('id', row.business_id)
+            .maybeSingle();
+        const { data: provider } = await adminSupabase
+            .from('service_providers')
+            .select('id, user_id')
+            .eq('id', row.provider_id)
+            .maybeSingle();
+        const isOwner = biz?.owner_id === userId;
+        const isSelf = provider?.user_id === userId;
+        if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+        const toMinutes = (value: string) => {
+            const [h, m] = String(value || '00:00').slice(0, 5).split(':').map(Number);
+            return (Number(h) || 0) * 60 + (Number(m) || 0);
+        };
+        const dateValue = String(block_date || '').slice(0, 10);
+        const startValue = String(start_time || '').slice(0, 5);
+        const endValue = String(end_time || '').slice(0, 5);
+        if (!dateValue || !startValue || !endValue) {
+            return res.status(400).json({ status: 'error', message: 'block_date, start_time, end_time are required' });
+        }
+        if (toMinutes(endValue) <= toMinutes(startValue)) {
+            return res.status(400).json({ status: 'error', message: 'End time must be after start time' });
+        }
+
+        const { data: existing } = await adminSupabase
+            .from('provider_block_times')
+            .select('id, start_time, end_time')
+            .eq('provider_id', row.provider_id)
+            .eq('block_date', dateValue)
+            .neq('id', blockId);
+        const hasOverlap = (existing || []).some((r: any) => {
+            const es = toMinutes(String(r.start_time || '').slice(0, 5));
+            const ee = toMinutes(String(r.end_time || '').slice(0, 5));
+            return toMinutes(startValue) < ee && toMinutes(endValue) > es;
+        });
+        if (hasOverlap) {
+            return res.status(400).json({ status: 'error', message: 'Block time overlaps an existing slot' });
+        }
+
+        const { data, error } = await adminSupabase
+            .from('provider_block_times')
+            .update({
+                block_date: dateValue,
+                start_time: startValue,
+                end_time: endValue,
+                reason: reason ?? null
+            })
+            .eq('id', blockId)
+            .select()
+            .maybeSingle();
+        if (error) throw error;
+        return res.status(200).json({ status: 'success', data });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
     }
@@ -1155,7 +1565,7 @@ export const getProviderLeaves = async (req: Request, res: Response) => {
 export const addProviderLeave = async (req: Request, res: Response) => {
     try {
         const { id } = req.params; // provider_id or user_id
-        const { start_date, end_date, leave_type, leave_kind, start_time, end_time, note, ui_language, allow_owner_approval } = req.body;
+        const { start_date, end_date, leave_type, leave_kind, start_time, end_time, note, ui_language, allow_owner_approval, allow_conflict_override } = req.body;
         const userId = req.user?.id;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
         const { adminSupabase } = require('../config/supabaseClient');
@@ -1167,6 +1577,17 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         if (!start_date || !end_date || !leave_type) {
             return res.status(400).json({ status: 'error', message: 'Missing required fields' });
         }
+
+        const normalizeLeaveType = (raw: any): string => {
+            const v = String(raw || '').trim().toLowerCase();
+            if (!v) return 'VACATION';
+            if (['normal', 'planned', 'regular', 'holiday', 'vacation', 'annual', 'paid_leave', 'paid'].includes(v)) return 'VACATION';
+            if (['emergency', 'urgent'].includes(v)) return 'EMERGENCY';
+            if (['sick', 'medical', 'illness'].includes(v)) return 'SICK';
+            if (['casual', 'personal', 'other'].includes(v)) return 'OTHER';
+            return 'VACATION';
+        };
+        const normalizedLeaveType = normalizeLeaveType(leave_type);
 
         const normalizedKind = String(leave_kind || 'FULL_DAY').toUpperCase();
         const isEmergency = normalizedKind === 'EMERGENCY';
@@ -1271,7 +1692,8 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         if (overlaps && overlaps.length > 0) {
             return res.status(400).json({
                 status: 'error',
-                message: 'This provider already has a leave scheduled or pending during these dates.'
+                message: 'You already have a leave request for these dates.',
+                message_key: 'providers.err_leave_overlap'
             });
         }
 
@@ -1280,7 +1702,8 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         const isAdminOrOwner = profile?.role === 'owner' || profile?.role === 'admin';
         const status = isAdminOrOwner ? 'APPROVED' : 'PENDING';
 
-        if (note && !validateTextByLanguage(note, profile?.ui_language || 'en')) {
+        const selectedLanguage = String(ui_language || profile?.ui_language || 'en');
+        if (note && !validateTextByLanguage(note, selectedLanguage)) {
             return res.status(400).json({
                 status: 'error',
                 message: 'common.err_invalid_chars'
@@ -1294,6 +1717,7 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         let totalAffected = 0;
         let requiresOwnerApproval = false;
         const impactAppointments: any[] = [];
+        const resolvedEmployeeUserId = String(provider?.user_id || userId || '');
         try {
             // Find appointment_services assigned to this provider within date range.
             const fromIso = new Date(`${String(start_date).slice(0, 10)}T00:00:00.000Z`).toISOString();
@@ -1319,10 +1743,33 @@ export const addProviderLeave = async (req: Request, res: Response) => {
                 .gte('appointments.start_time', fromIso)
                 .lte('appointments.start_time', toIso);
 
-            const appts = (apptSvc || [])
+            const { data: employeeMappedAppointments } = await adminSupabase
+                .from('appointments')
+                .select(`
+                    id,
+                    business_id,
+                    user_id,
+                    start_time,
+                    end_time,
+                    status,
+                    profiles:user_id (id, full_name, phone)
+                `)
+                .eq('business_id', provider.business_id)
+                .eq('employee_id', resolvedEmployeeUserId)
+                .gte('start_time', fromIso)
+                .lte('start_time', toIso);
+
+            const apptsFromServices = (apptSvc || [])
                 .map((r: any) => r.appointments)
                 .filter(Boolean)
-                .filter((a: any) => !['cancelled', 'completed', 'no_show'].includes(String(a.status || '').toLowerCase()));
+                .filter((a: any) => ['confirmed', 'checked_in', 'in_service', 'rescheduled'].includes(String(a.status || '').toLowerCase()));
+            const apptsFromEmployeeMap = (employeeMappedAppointments || [])
+                .filter((a: any) => ['confirmed', 'checked_in', 'in_service', 'rescheduled'].includes(String(a.status || '').toLowerCase()));
+            const mergedAppointmentMap = new Map<string, any>();
+            [...apptsFromServices, ...apptsFromEmployeeMap].forEach((a: any) => {
+                if (a?.id) mergedAppointmentMap.set(String(a.id), a);
+            });
+            const appts = Array.from(mergedAppointmentMap.values());
 
             // Emergency leave: only count overlapping time-window appointments on the same day.
             const timeOverlaps = (a: any) => {
@@ -1398,6 +1845,20 @@ export const addProviderLeave = async (req: Request, res: Response) => {
                 }
             }
 
+            if (totalAffected > 0 && !allow_conflict_override && !isAdminOrOwner) {
+                return res.status(409).json({
+                    status: 'error',
+                    message: 'You have scheduled appointments on this date. Please reschedule or contact the owner before applying leave.',
+                    message_key: 'employee.leave_conflict_warning',
+                    impact: {
+                        total_appointments: totalAffected,
+                        regular_customers: regularCount,
+                        vip_customers: vipCount,
+                        appointments: impactAppointments
+                    }
+                });
+            }
+
             // Emergency leave requires handling first: force reassignment/reschedule by blocking when affected appts exist
             if ((isEmergency || isHalfDay) && totalAffected > 0 && !isAdminOrOwner) {
                 return res.status(409).json({
@@ -1411,8 +1872,26 @@ export const addProviderLeave = async (req: Request, res: Response) => {
                     }
                 });
             }
-        } catch {
-            // If schema isn't present yet, skip smart enforcement (do not block leave creation).
+        } catch (validationError: any) {
+            const raw = String(validationError?.message || '').toLowerCase();
+            const isSchemaIssue =
+                raw.includes('employee_id') ||
+                raw.includes('schema cache') ||
+                raw.includes('column') ||
+                raw.includes('does not exist') ||
+                raw.includes('relation');
+            // Strict mode for employees: if conflict validation fails for non-owner/admin, do not allow silent leave submission.
+            if (!isAdminOrOwner) {
+                return res.status(409).json({
+                    status: 'error',
+                    message: isSchemaIssue
+                        ? 'Unable to validate leave conflicts because appointment assignment schema is not ready. Please contact owner/admin.'
+                        : 'Unable to validate leave conflicts right now. Please try again shortly.',
+                    message_key: isSchemaIssue
+                        ? 'providers.err_leave_conflict_validation_schema'
+                        : 'providers.err_leave_conflict_validation_unavailable'
+                });
+            }
         }
 
         // 5. Insert leave
@@ -1421,7 +1900,7 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             business_id: provider.business_id,
             start_date,
             end_date,
-            leave_type,
+            leave_type: normalizedLeaveType,
             leave_kind: normalizedKind,
             start_time: start_time ? String(start_time).slice(0, 5) : null,
             end_time: end_time ? String(end_time).slice(0, 5) : null,
@@ -1435,7 +1914,18 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         };
         let data: any = null;
         let error: any = null;
-        for (let attempt = 0; attempt < 5; attempt++) {
+        const leaveTypeFallbacks = [
+            normalizedLeaveType,
+            String(leave_type || ''),
+            'VACATION', 'vacation',
+            'PLANNED', 'planned',
+            'NORMAL', 'normal',
+            'EMERGENCY', 'emergency',
+            'SICK', 'sick',
+            'OTHER', 'other'
+        ].filter(Boolean);
+        let leaveTypeFallbackIdx = 0;
+        for (let attempt = 0; attempt < leaveTypeFallbacks.length; attempt++) {
             const insertRes = await supabase
                 .from('provider_leaves')
                 .insert([payload])
@@ -1448,8 +1938,14 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             if (isLeaveOverlapConstraintError(error)) {
                 return res.status(400).json({
                     status: 'error',
-                    message: 'providers.err_leave_overlap'
+                    message: 'You already have a leave request for these dates.',
+                    message_key: 'providers.err_leave_overlap'
                 });
+            }
+            if (String(error?.message || '').toLowerCase().includes('provider_leaves_leave_type_check')) {
+                payload.leave_type = leaveTypeFallbacks[leaveTypeFallbackIdx] || 'VACATION';
+                leaveTypeFallbackIdx += 1;
+                continue;
             }
             if (isMissingColumnError(error, 'approved_by')) {
                 delete payload.approved_by;
@@ -1468,6 +1964,7 @@ export const addProviderLeave = async (req: Request, res: Response) => {
         let notificationSent = false;
         let notifyDebug: any = null;
         let ownerNotifyTarget: string | null = null;
+        let ownerInAppNotified = false;
         if (!isAdminOrOwner) {
             const { data: biz } = await adminSupabase
                 .from('businesses')
@@ -1494,6 +1991,29 @@ export const addProviderLeave = async (req: Request, res: Response) => {
                 end_date,
                 note
             );
+
+            // Always create in-app owner notification so the owner sees it immediately
+            // in the dashboard bell, even if SMS/WhatsApp delivery fails.
+            try {
+                await adminSupabase
+                    .from('notifications')
+                    .insert([{
+                        business_id: provider.business_id,
+                        user_id: biz?.owner_id || null,
+                        type: 'leave_request',
+                        title: 'New leave request',
+                        message: `${employeeFullname} submitted a leave request (${String(start_date).slice(0, 10)} to ${String(end_date).slice(0, 10)}).`,
+                        meta: {
+                            provider_id: provider.id,
+                            leave_id: data?.id || null,
+                            start_date,
+                            end_date
+                        }
+                    }]);
+                ownerInAppNotified = true;
+            } catch {
+                // Non-blocking: leave request must still succeed.
+            }
 
             const { notificationService, toE164Phone } = require('../services/notificationService');
             const candidates: string[] = [];
@@ -1574,6 +2094,7 @@ export const addProviderLeave = async (req: Request, res: Response) => {
             data,
             notification_sent: isAdminOrOwner ? undefined : notificationSent,
             owner_phone_configured: isAdminOrOwner ? undefined : !!ownerNotifyTarget,
+            owner_in_app_notified: isAdminOrOwner ? undefined : ownerInAppNotified,
             notification_debug: isAdminOrOwner ? undefined : notifyDebug
         });
 
@@ -1649,10 +2170,36 @@ export const validateProviderLeaveImpact = async (req: Request, res: Response) =
             .gte('appointments.start_time', fromIso)
             .lte('appointments.start_time', toIso);
 
-        const appts = (apptSvc || [])
+        const resolvedEmployeeUserId = String(provider?.user_id || userId || '');
+        const { data: employeeMappedAppointments } = await adminSupabase
+            .from('appointments')
+            .select(`
+                id,
+                business_id,
+                user_id,
+                start_time,
+                end_time,
+                status,
+                profiles:user_id (id, full_name, phone)
+            `)
+            .eq('business_id', provider.business_id)
+            .eq('employee_id', resolvedEmployeeUserId)
+            .gte('start_time', fromIso)
+            .lte('start_time', toIso);
+
+        const apptsFromServices = (apptSvc || [])
             .map((r: any) => ({ appointment: r.appointments, service: r.services }))
             .filter((r: any) => !!r.appointment)
-            .filter((r: any) => !['cancelled', 'completed', 'no_show'].includes(String(r.appointment?.status || '').toLowerCase()));
+            .filter((r: any) => ['confirmed', 'checked_in', 'in_service', 'rescheduled'].includes(String(r.appointment?.status || '').toLowerCase()));
+        const apptsFromEmployeeMap = (employeeMappedAppointments || [])
+            .filter((a: any) => ['confirmed', 'checked_in', 'in_service', 'rescheduled'].includes(String(a.status || '').toLowerCase()))
+            .map((a: any) => ({ appointment: a, service: null }));
+        const mergedAppointmentMap = new Map<string, any>();
+        [...apptsFromServices, ...apptsFromEmployeeMap].forEach((row: any) => {
+            const id = String(row?.appointment?.id || "");
+            if (id) mergedAppointmentMap.set(id, row);
+        });
+        const appts = Array.from(mergedAppointmentMap.values());
 
         const timeOverlaps = (a: any) => {
             if (!isEmergency && !isHalfDay) return true;
@@ -1782,7 +2329,8 @@ export const validateProviderLeaveImpact = async (req: Request, res: Response) =
                 })),
                 policy: {
                     vip_requires_owner_approval: vipCount > 0,
-                    emergency_requires_handling: (isEmergency || isHalfDay) && (affected.length > 0 || queueTasks.length > 0)
+                    emergency_requires_handling: (isEmergency || isHalfDay) && (affected.length > 0 || queueTasks.length > 0),
+                    leave_conflict_warning: affected.length > 0
                 }
             }
         });
@@ -2240,6 +2788,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
 
         // 3. Notify Employee
         let recipientPhone = leave.service_providers?.phone;
+        let employeeUserId: string | null = leave.service_providers?.user_id ? String(leave.service_providers.user_id) : null;
         if (!recipientPhone && leave.service_providers?.user_id) {
             const { data: empProfile } = await adminSupabase
                 .from('profiles')
@@ -2247,6 +2796,37 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                 .eq('id', leave.service_providers.user_id)
                 .maybeSingle();
             recipientPhone = empProfile?.phone;
+        }
+        // Fallback for legacy rows where provider.user_id is not linked but provider phone exists.
+        if (!recipientPhone) {
+            const { data: providerRow } = await adminSupabase
+                .from('service_providers')
+                .select('phone, user_id')
+                .eq('id', leave.provider_id)
+                .maybeSingle();
+            if (providerRow?.phone) recipientPhone = providerRow.phone;
+            if (!employeeUserId && providerRow?.user_id) employeeUserId = String(providerRow.user_id);
+            if (!recipientPhone && providerRow?.user_id) {
+                const { data: p2 } = await adminSupabase
+                    .from('profiles')
+                    .select('phone')
+                    .eq('id', providerRow.user_id)
+                    .maybeSingle();
+                if (p2?.phone) recipientPhone = p2.phone;
+            }
+        }
+        if (!recipientPhone) {
+            const rawProviderPhone = String(leave.service_providers?.phone || '').replace(/[^\d]/g, '');
+            if (rawProviderPhone) {
+                const candidates = [rawProviderPhone, `+${rawProviderPhone}`, rawProviderPhone.slice(-10)]
+                    .filter((v) => !!v && v.length >= 8);
+                const { data: profilePool } = await adminSupabase
+                    .from('profiles')
+                    .select('phone, business_id')
+                    .in('phone', candidates);
+                const sameBusiness = (profilePool || []).find((p: any) => String(p?.business_id || '') === String(leave.business_id || ''));
+                recipientPhone = sameBusiness?.phone || (profilePool || [])[0]?.phone || null;
+            }
         }
 
         let notificationSent = false;
@@ -2280,6 +2860,29 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                 const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
                 const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
                 notificationSent = !!(waOk || smsOk);
+            }
+        }
+
+        // In-app employee notification fallback (guaranteed delivery inside app even if SMS/WhatsApp fails)
+        if (employeeUserId) {
+            try {
+                await adminSupabase
+                    .from('notifications')
+                    .insert([{
+                        business_id: leave.business_id,
+                        user_id: employeeUserId,
+                        type: 'leave_status_update',
+                        title: status === 'APPROVED' ? 'Leave approved' : 'Leave rejected',
+                        message: status === 'APPROVED'
+                            ? `Your leave request (${when}) was approved.`
+                            : `Your leave request (${when}) was rejected.${reasonRaw ? ` Reason: ${reasonRaw}` : ''}`,
+                        meta: {
+                            leave_id: leave.id,
+                            leave_status: status
+                        }
+                    }]);
+            } catch {
+                // non-blocking
             }
         }
 
@@ -2614,6 +3217,55 @@ export const submitResignation = async (req: Request, res: Response) => {
             return res.status(403).json({ status: 'error', message: 'Only employees can submit resignation' });
         }
 
+        // Some legacy employee profiles may miss business_id. Resolve it from provider mapping.
+        let resolvedBusinessId = employee.business_id as string | null;
+        if (!resolvedBusinessId) {
+            const { adminSupabase } = require('../config/supabaseClient');
+            let providerRow: any = null;
+
+            const byUser = await adminSupabase
+                .from('service_providers')
+                .select('id, business_id')
+                .eq('user_id', userId)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            providerRow = byUser.data;
+
+            if (!providerRow && employee.phone) {
+                const normalizedPhone = String(employee.phone).replace(/[^\d+]/g, '');
+                const byPhone = await adminSupabase
+                    .from('service_providers')
+                    .select('id, business_id, user_id')
+                    .eq('phone', normalizedPhone)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+                providerRow = byPhone.data;
+                if (providerRow?.id && !providerRow?.user_id) {
+                    await adminSupabase
+                        .from('service_providers')
+                        .update({ user_id: userId })
+                        .eq('id', providerRow.id);
+                }
+            }
+
+            if (providerRow?.business_id) {
+                resolvedBusinessId = String(providerRow.business_id);
+                await adminSupabase
+                    .from('profiles')
+                    .update({ business_id: resolvedBusinessId })
+                    .eq('id', userId);
+            }
+        }
+
+        if (!resolvedBusinessId) {
+            return res.status(400).json({
+                status: 'error',
+                message: 'Your account is not linked to a business yet. Ask the owner to re-invite or contact support.'
+            });
+        }
+
         // 1.5. Validate date and existing pending requests
         if (new Date(requested_last_date) < new Date()) {
             return res.status(400).json({ status: 'error', message: 'Requested last date cannot be in the past' });
@@ -2635,7 +3287,7 @@ export const submitResignation = async (req: Request, res: Response) => {
             .from('resignation_requests')
             .insert([{
                 employee_id: userId,
-                business_id: employee.business_id,
+                business_id: resolvedBusinessId,
                 reason,
                 requested_last_date,
                 status: 'PENDING'
@@ -2650,7 +3302,7 @@ export const submitResignation = async (req: Request, res: Response) => {
         const { data: business } = await supabase
             .from('businesses')
             .select('owner_id, phone, whatsapp_number')
-            .eq('id', employee.business_id)
+            .eq('id', resolvedBusinessId)
             .single();
         const { notificationService, toE164Phone } = require('../services/notificationService');
         let ownerNotificationSent = false;
@@ -2746,6 +3398,31 @@ export const getResignationRequests = async (req: Request, res: Response) => {
     }
 };
 
+export const getMyResignationRequests = async (req: Request, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        if (!userId) {
+            return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+        }
+
+        const { data, error } = await supabase
+            .from('resignation_requests')
+            .select('*')
+            .eq('employee_id', userId)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+
+        res.status(200).json({
+            status: 'success',
+            data: data || []
+        });
+    } catch (error: any) {
+        res.status(500).json({ status: 'error', message: error.message });
+    }
+};
+
 export const updateResignationStatus = async (req: Request, res: Response) => {
     try {
         const { requestId } = req.params;
@@ -2832,11 +3509,11 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
         if (updateReqError) throw updateReqError;
 
         const { adminSupabase } = require('../config/supabaseClient');
-        const { data: emp } = await supabase
+        const { data: emp } = await adminSupabase
             .from('profiles')
             .select('phone, full_name')
             .eq('id', request.employee_id)
-            .single();
+            .maybeSingle();
         const { data: empProvider } = await adminSupabase
             .from('service_providers')
             .select('phone, user_id')
@@ -2865,7 +3542,12 @@ export const updateResignationStatus = async (req: Request, res: Response) => {
             }
         }
 
-        const employeePhone = emp?.phone || empProvider?.phone || fallbackProviderPhone;
+        const employeePhoneCandidates = [
+            emp?.phone,
+            empProvider?.phone,
+            fallbackProviderPhone
+        ].filter(Boolean);
+        const employeePhone = employeePhoneCandidates.length > 0 ? String(employeePhoneCandidates[0]) : null;
         const { notificationService, toE164Phone } = require('../services/notificationService');
 
         let notificationSent = false;

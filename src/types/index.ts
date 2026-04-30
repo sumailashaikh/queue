@@ -15,6 +15,8 @@ export interface Business {
     whatsapp_number?: string | null;
     open_time: string; // HH:mm:ss
     close_time: string; // HH:mm:ss
+    staff_open_time?: string; // HH:mm:ss
+    staff_close_time?: string; // HH:mm:ss
     is_closed: boolean;
     currency: string;
     timezone: string;
