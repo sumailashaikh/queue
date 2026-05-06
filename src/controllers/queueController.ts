@@ -2921,6 +2921,15 @@ export const startTask = async (req: Request, res: Response) => {
       updatedTask = await tryPersistStart(adminSupabase);
     }
     if (!updatedTask) {
+      const { supabase: baseClient } = require("../config/supabaseClient");
+      const usingServiceRole = adminSupabase !== baseClient;
+      if (!usingServiceRole) {
+        return res.status(500).json({
+          status: "error",
+          message:
+            "Task start failed due to Supabase permission policy. Please set SUPABASE_SERVICE_ROLE_KEY on backend and redeploy.",
+        });
+      }
       return res.status(409).json({
         status: "error",
         message:
@@ -3157,6 +3166,15 @@ export const completeTask = async (req: Request, res: Response) => {
       updatedTask = await tryPersistCompletion(adminSupabase);
     }
     if (!updatedTask) {
+      const { supabase: baseClient } = require("../config/supabaseClient");
+      const usingServiceRole = adminSupabase !== baseClient;
+      if (!usingServiceRole) {
+        return res.status(500).json({
+          status: "error",
+          message:
+            "Task completion failed due to Supabase permission policy. Please set SUPABASE_SERVICE_ROLE_KEY on backend and redeploy.",
+        });
+      }
       return res.status(409).json({
         status: "error",
         message: "Task completion did not persist. Please refresh and try again.",

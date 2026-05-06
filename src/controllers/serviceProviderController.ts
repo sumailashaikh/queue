@@ -1039,7 +1039,16 @@ export const markProviderAttendance = async (req: Request, res: Response) => {
                 .insert([payload])
                 .select()
                 .maybeSingle();
-            if (insertErr) throw insertErr;
+            if (insertErr) {
+                const msg = String((insertErr as any)?.message || '').toLowerCase();
+                if (msg.includes('row-level security')) {
+                    return res.status(500).json({
+                        status: 'error',
+                        message: 'Clock-in failed due to Supabase permission policy. Please set SUPABASE_SERVICE_ROLE_KEY on backend and redeploy.'
+                    });
+                }
+                throw insertErr;
+            }
             return res.status(200).json({ status: 'success', data: created });
         }
 
@@ -1059,7 +1068,16 @@ export const markProviderAttendance = async (req: Request, res: Response) => {
             .eq('id', row.id)
             .select()
             .maybeSingle();
-        if (updateErr) throw updateErr;
+        if (updateErr) {
+            const msg = String((updateErr as any)?.message || '').toLowerCase();
+            if (msg.includes('row-level security')) {
+                return res.status(500).json({
+                    status: 'error',
+                    message: 'Clock-out failed due to Supabase permission policy. Please set SUPABASE_SERVICE_ROLE_KEY on backend and redeploy.'
+                });
+            }
+            throw updateErr;
+        }
         return res.status(200).json({ status: 'success', data: updated });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });

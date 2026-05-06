@@ -815,8 +815,8 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
         (leaveRows || []).forEach((l: any) => {
             const pid = String(l.provider_id || '');
             if (!pid) return;
-            const status = String(l.status || 'PENDING').toUpperCase();
-            if (status === 'REJECTED') return;
+            const status = String(l.status || '').toUpperCase();
+            if (status !== 'APPROVED') return;
             const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
             let onLeaveNow = false;
             let remaining = 0;
@@ -1007,8 +1007,8 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
 
         const leaveBlocks: Array<{ startM: number; endM: number }> = [];
         (dayLeaves || []).forEach((l: any) => {
-            const status = String(l.status || 'PENDING').toUpperCase();
-            if (status === 'REJECTED') return;
+            const status = String(l.status || '').toUpperCase();
+            if (status !== 'APPROVED') return;
             const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
             if (kind === 'FULL_DAY') {
                 leaveBlocks.push({ startM: 0, endM: 24 * 60 });
