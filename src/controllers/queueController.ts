@@ -889,9 +889,17 @@ export const joinQueue = async (req: Request, res: Response) => {
         new Date(),
       );
       if (!availability.available) {
+        const reason = String(availability.reason || "");
+        const leaveLike =
+          reason === "leave" ||
+          reason === "leave_partial" ||
+          reason === "day_off" ||
+          reason === "day_off_partial";
         return res.status(400).json({
           status: "error",
-          message: "The selected employee is currently unavailable. Please choose another available employee.",
+          message: leaveLike
+            ? "The selected employee is on leave for this day/time. Please choose another employee."
+            : "The selected employee is currently unavailable. Please choose another available employee.",
         });
       }
       assignedToUserId = providerRow?.user_id || null;

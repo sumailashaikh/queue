@@ -523,8 +523,14 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
             return res.status(404).json({ status: 'error', message: 'Business not found' });
         }
 
-        if (business.owner_id) {
-            const { data: owner } = await supabase.from('profiles').select('ui_language').eq('id', business.owner_id).single();
+        // Respect business-level language selection first for TV/public display.
+        // Fallback to owner profile language only when business.language is missing.
+        if (!business.language && business.owner_id) {
+            const { data: owner } = await supabase
+                .from('profiles')
+                .select('ui_language')
+                .eq('id', business.owner_id)
+                .single();
             if (owner?.ui_language) {
                 business.language = owner.ui_language;
             }

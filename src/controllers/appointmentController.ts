@@ -3,6 +3,7 @@ import { supabase } from '../config/supabaseClient';
 import { notificationService } from '../services/notificationService';
 import { isBusinessOpen, getLocalMinutes, getLocalDateString, resolveBusinessAvailability } from '../utils/timeUtils';
 import { recomputeProviderDelays } from '../utils/delayLogic';
+import { checkProviderAvailabilityAt } from '../utils/providerAvailability';
 
 async function resolveMyProviderForUser(userId: string, adminSupabase: any) {
     const byUser = await adminSupabase
@@ -1062,6 +1063,46 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
                 .eq('id', resolvedProviderId)
                 .maybeSingle();
             resolvedEmployeeId = pByProvider?.user_id || null;
+        }
+
+        if (resolvedProviderId) {
+            const { data: providerRow } = await supabase
+                .from('service_providers')
+                .select('id, business_id')
+                .eq('id', resolvedProviderId)
+                .maybeSingle();
+
+            if (!providerRow?.id) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Selected employee is not valid.'
+                });
+            }
+
+            const at = new Date(start_time);
+            const availabilityAtSlot = await checkProviderAvailabilityAt(
+                adminSupabase,
+                providerRow.id,
+                providerRow.business_id,
+                timezone,
+                at
+            );
+
+            if (!availabilityAtSlot.available) {
+                const reason = String(availabilityAtSlot.reason || '');
+                const leaveLike =
+                    reason === 'leave' ||
+                    reason === 'leave_partial' ||
+                    reason === 'day_off' ||
+                    reason === 'day_off_partial';
+
+                return res.status(400).json({
+                    status: 'error',
+                    message: leaveLike
+                        ? 'The selected employee is on leave for this day/time. Please choose another employee.'
+                        : 'The selected employee is currently unavailable for the selected date/time. Please choose another employee.'
+                });
+            }
         }
 
         let publicInsertPayload: any = {
