@@ -661,6 +661,7 @@ export const getBusinessDisplayData = async (req: Request, res: Response) => {
 export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
     try {
         const { slug } = req.params;
+        const requestedDate = String((req.query as any)?.date || '').trim();
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
 
         const { data: business } = await supabase
@@ -670,11 +671,13 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             .maybeSingle();
         if (!business) return res.status(404).json({ status: 'error', message: 'Business not found' });
 
+        const isIsoDate = /^\d{4}-\d{2}-\d{2}$/.test(requestedDate);
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: business.timezone || 'UTC' });
+        const targetDate = isIsoDate ? requestedDate : todayStr;
 
         const now = new Date();
         const nowIso = now.toISOString();
-        const todayIso = todayStr;
+        const todayIso = targetDate;
 
         const { data: providers, error: pErr } = await supabase
             .from('service_providers')
@@ -691,7 +694,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
         if (pErr) throw pErr;
 
         const providerIds = (providers || []).map((p: any) => p.id);
-        const currentDow = new Date(`${todayStr}T12:00:00`).getDay();
+        const currentDow = new Date(`${targetDate}T12:00:00`).getDay();
         const nowLocal = now.toLocaleTimeString('en-GB', {
             timeZone: business.timezone || 'UTC',
             hour12: false,
@@ -717,7 +720,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
                 .from('provider_day_offs')
                 .select('provider_id, day_off_type, start_time, end_time')
                 .in('provider_id', providerIds)
-                .eq('day_off_date', todayStr)
+                .eq('day_off_date', targetDate)
             : { data: [] as any[] };
 
         const { data: blockRows } = providerIds.length
@@ -725,7 +728,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
                 .from('provider_block_times')
                 .select('provider_id, start_time, end_time')
                 .in('provider_id', providerIds)
-                .eq('block_date', todayStr)
+                .eq('block_date', targetDate)
             : { data: [] as any[] };
         const { data: queueLoadRows } = providerIds.length
             ? await supabase
@@ -749,8 +752,8 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
                     appointments:appointment_id (start_time, end_time, status)
                 `)
                 .in('assigned_provider_id', providerIds)
-                .gte('appointments.start_time', `${todayStr}T00:00:00`)
-                .lte('appointments.start_time', `${todayStr}T23:59:59`)
+                .gte('appointments.start_time', `${targetDate}T00:00:00`)
+                .lte('appointments.start_time', `${targetDate}T23:59:59`)
             : { data: [] as any[] };
 
         const { data: leaveRows } = providerIds.length
@@ -769,7 +772,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             const pid = String(r.assigned_provider_id || '');
             if (!pid) return;
             const entry = Array.isArray(r.queue_entries) ? r.queue_entries[0] : r.queue_entries;
-            if (!entry || entry.entry_date !== todayStr || !['waiting', 'serving'].includes(String(entry.status || ''))) return;
+            if (!entry || entry.entry_date !== targetDate || !['waiting', 'serving'].includes(String(entry.status || ''))) return;
             queueAhead.set(pid, (queueAhead.get(pid) || 0) + 1);
             const status = String(r.task_status || '').toLowerCase();
             if (status === 'in_progress') queueInProgress.set(pid, true);

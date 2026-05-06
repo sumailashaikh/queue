@@ -49,6 +49,15 @@ function normalizeErrorMessage(error: unknown, fallback: string): string {
     return fallback;
 }
 
+function isOtpProviderAuthError(error: unknown): boolean {
+    const msg = String((error as any)?.message ?? '').toLowerCase();
+    const code = String((error as any)?.code ?? '').toLowerCase();
+    return (
+        code === 'sms_send_failed' &&
+        (msg.includes('authenticate') || msg.includes('twilio.com/docs/errors/20003') || msg.includes('error 20003'))
+    );
+}
+
 export const sendOtp = async (req: Request, res: Response) => {
     try {
         let { phone } = req.body;
@@ -91,10 +100,13 @@ export const sendOtp = async (req: Request, res: Response) => {
         const raw = String(error?.message || '').toLowerCase();
         const connectivity = userSafeConnectivityMessage(error);
         const templateError = userSafeOtpTemplateMessage(error);
+        const providerAuthError = isOtpProviderAuthError(error);
         const safeMessage = templateError
             ? templateError
             : connectivity
             ? connectivity
+            : providerAuthError
+            ? 'OTP provider authentication failed. Please contact support to refresh SMS provider credentials.'
             : (raw.includes('63038') || raw.includes('daily messages limit') || raw.includes('twilio'))
               ? 'OTP service is temporarily busy. Please try again after some time.'
               : normalizeErrorMessage(error, 'Failed to send OTP');

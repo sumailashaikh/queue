@@ -28,6 +28,15 @@ function baseLang(input?: string): 'en' | 'es' | 'hi' | 'ar' {
     return 'en';
 }
 
+function normalizeLeaveTypeForResponse(leaveType: any, leaveKind: any): string {
+    const rawType = String(leaveType || '').trim().toUpperCase();
+    const rawKind = String(leaveKind || '').trim().toUpperCase();
+    if (rawKind === 'EMERGENCY') return 'EMERGENCY';
+    if (rawType === 'EMERGENCY' && rawKind !== 'EMERGENCY') return 'VACATION';
+    if (!rawType) return 'VACATION';
+    return rawType;
+}
+
 function leaveRequestToOwnerMessage(language: string, employeeName: string, businessName: string, start: string, end: string, note?: string): string {
     const when = formatLeaveRangeForMessage(start, end);
     const noteText = String(note || '').trim();
@@ -780,9 +789,13 @@ export const getProviderAvailability = async (req: Request, res: Response) => {
 
         if (error) throw error;
 
+        const normalizedRows = (data || []).map((row: any) => ({
+            ...row,
+            leave_type: normalizeLeaveTypeForResponse(row?.leave_type, row?.leave_kind)
+        }));
         res.status(200).json({
             status: 'success',
-            data: data || []
+            data: normalizedRows
         });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
@@ -2787,7 +2800,14 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
         }
 
         // 3. Notify Employee
+        const recipientCandidates: string[] = [];
+        const pushRecipientCandidate = (value: any) => {
+            const raw = String(value || '').trim();
+            if (!raw) return;
+            recipientCandidates.push(raw);
+        };
         let recipientPhone = leave.service_providers?.phone;
+        pushRecipientCandidate(leave.service_providers?.phone);
         let employeeUserId: string | null = leave.service_providers?.user_id ? String(leave.service_providers.user_id) : null;
         if (!recipientPhone && leave.service_providers?.user_id) {
             const { data: empProfile } = await adminSupabase
@@ -2796,6 +2816,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                 .eq('id', leave.service_providers.user_id)
                 .maybeSingle();
             recipientPhone = empProfile?.phone;
+            pushRecipientCandidate(empProfile?.phone);
         }
         // Fallback for legacy rows where provider.user_id is not linked but provider phone exists.
         if (!recipientPhone) {
@@ -2805,6 +2826,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                 .eq('id', leave.provider_id)
                 .maybeSingle();
             if (providerRow?.phone) recipientPhone = providerRow.phone;
+            pushRecipientCandidate(providerRow?.phone);
             if (!employeeUserId && providerRow?.user_id) employeeUserId = String(providerRow.user_id);
             if (!recipientPhone && providerRow?.user_id) {
                 const { data: p2 } = await adminSupabase
@@ -2813,6 +2835,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                     .eq('id', providerRow.user_id)
                     .maybeSingle();
                 if (p2?.phone) recipientPhone = p2.phone;
+                pushRecipientCandidate(p2?.phone);
             }
         }
         if (!recipientPhone) {
@@ -2826,11 +2849,20 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                     .in('phone', candidates);
                 const sameBusiness = (profilePool || []).find((p: any) => String(p?.business_id || '') === String(leave.business_id || ''));
                 recipientPhone = sameBusiness?.phone || (profilePool || [])[0]?.phone || null;
+                pushRecipientCandidate(recipientPhone);
             }
         }
 
         let notificationSent = false;
         let ownerNotificationSent = false;
+        let employeeInAppNotified = false;
+        const deliveryLog: any = {
+            attempted_targets: [] as string[],
+            whatsapp_sent: false,
+            sms_sent: false,
+            whatsapp_error: null as string | null,
+            sms_error: null as string | null
+        };
         const { notificationService, toE164Phone } = require('../services/notificationService');
         const firstName = String(leave.service_providers?.name || 'there').trim().split(/\s+/)[0];
         const employeeName = String(leave.service_providers?.name || 'Employee').trim();
@@ -2848,22 +2880,63 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                 status === 'APPROVED',
                 reasonRaw
             );
-
-            const to = toE164Phone(String(recipientPhone));
-            if (!to) {
+            const normalizedTargets = [...new Set(
+                recipientCandidates
+                    .map((p) => toE164Phone(String(p)))
+                    .filter((p) => !!p)
+            )];
+            if (normalizedTargets.length === 0) {
                 notificationSent = false;
+                deliveryLog.whatsapp_error = 'No valid employee phone target found';
+                deliveryLog.sms_error = 'No valid employee phone target found';
             } else {
-                const [waRes, smsRes] = await Promise.allSettled([
-                    notificationService.sendWhatsApp(to, msg),
-                    notificationService.sendSMS(to, msg)
-                ]);
-                const waOk = waRes.status === 'fulfilled' ? waRes.value : false;
-                const smsOk = smsRes.status === 'fulfilled' ? smsRes.value : false;
-                notificationSent = !!(waOk || smsOk);
+                for (const to of normalizedTargets) {
+                    deliveryLog.attempted_targets.push(to);
+                    const result = await notificationService.sendMessageWithStatus(to, msg);
+                    deliveryLog.whatsapp_sent = deliveryLog.whatsapp_sent || result.whatsapp?.ok === true;
+                    deliveryLog.sms_sent = deliveryLog.sms_sent || result.sms?.ok === true;
+                    if (!deliveryLog.whatsapp_error && result.whatsapp?.error) {
+                        deliveryLog.whatsapp_error = String(result.whatsapp.error);
+                    }
+                    if (!deliveryLog.sms_error && result.sms?.error) {
+                        deliveryLog.sms_error = String(result.sms.error);
+                    }
+                    if (result.notified) {
+                        notificationSent = true;
+                        break;
+                    }
+                }
             }
         }
 
-        // In-app employee notification fallback (guaranteed delivery inside app even if SMS/WhatsApp fails)
+        // Resolve employee user by phone if provider row is not linked yet.
+        if (!employeeUserId && recipientCandidates.length > 0) {
+            const phoneVariants = [...new Set(
+                recipientCandidates
+                    .flatMap((raw) => {
+                        const s = String(raw || '').trim();
+                        const digits = s.replace(/[^\d]/g, '');
+                        const last10 = digits.length >= 10 ? digits.slice(-10) : '';
+                        return [s, digits, last10, digits ? `+${digits}` : ''].filter(Boolean);
+                    })
+            )];
+            if (phoneVariants.length > 0) {
+                const { data: matchedProfiles } = await adminSupabase
+                    .from('profiles')
+                    .select('id, business_id, phone')
+                    .in('phone', phoneVariants);
+                const sameBusinessProfile = (matchedProfiles || []).find(
+                    (p: any) => String(p?.business_id || '') === String(leave.business_id || '')
+                );
+                if (sameBusinessProfile?.id) {
+                    employeeUserId = String(sameBusinessProfile.id);
+                } else if ((matchedProfiles || [])[0]?.id) {
+                    employeeUserId = String((matchedProfiles || [])[0].id);
+                }
+            }
+        }
+
+        // In-app employee notification fallback (guaranteed delivery inside app when employee user is known)
         if (employeeUserId) {
             try {
                 await adminSupabase
@@ -2881,6 +2954,7 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
                             leave_status: status
                         }
                     }]);
+                employeeInAppNotified = true;
             } catch {
                 // non-blocking
             }
@@ -2917,7 +2991,10 @@ export const updateLeaveStatus = async (req: Request, res: Response) => {
             affected_tasks: impactSummary.affected_tasks,
             affected_appointments: impactSummary.affected_appointments,
             notification_sent: notificationSent,
-            owner_notification_sent: ownerNotificationSent
+            owner_notification_sent: ownerNotificationSent,
+            employee_in_app_notified: employeeInAppNotified,
+            employee_user_linked: !!employeeUserId,
+            delivery: deliveryLog
         });
 
     } catch (error: any) {
@@ -3122,15 +3199,16 @@ export const getLeaveAlerts = async (req: Request, res: Response) => {
                     .lte('appointments.start_time', `${endDate}T23:59:59.999Z`);
 
                 const appointmentIds = Array.from(new Set((apptRows || []).map((r: any) => String(r.appointment_id)).filter(Boolean)));
+                const normalizedLeaveType = normalizeLeaveTypeForResponse(lv.leave_type, lv.leave_kind);
                 return {
                     leave_id: lv.id,
                     provider_id: lv.provider_id,
                     employee_name: lv.service_providers?.name || 'Employee',
                     leave_date: lv.start_date === lv.end_date ? lv.start_date : `${lv.start_date} to ${lv.end_date}`,
-                    leave_type: lv.leave_type,
+                    leave_type: normalizedLeaveType,
                     leave_kind: lv.leave_kind,
                     leave_status: lv.status,
-                    high_priority: String(lv.leave_type || '').toLowerCase() === 'emergency' || String(lv.leave_kind || '').toUpperCase() === 'EMERGENCY',
+                    high_priority: String(normalizedLeaveType || '').toLowerCase() === 'emergency' || String(lv.leave_kind || '').toUpperCase() === 'EMERGENCY',
                     note: lv.note || null,
                     affected_tasks: (taskRows || []).length,
                     affected_appointments: appointmentIds.length

@@ -15,12 +15,18 @@ export function toE164Phone(input: string): string {
 }
 
 export type SendChannelResult = { ok: boolean; channel: 'sms' | 'whatsapp'; error?: string };
+export type SendDeliveryResult = {
+    notified: boolean;
+    sms: SendChannelResult;
+    whatsapp: SendChannelResult;
+};
 
 // Interface for Notification Service
 export interface NotificationService {
     isMock: boolean;
     sendSMS(to: string, message: string): Promise<boolean>;
     sendWhatsApp(to: string, message: string): Promise<boolean>;
+    sendMessageWithStatus(to: string, message: string): Promise<SendDeliveryResult>;
     sendInviteNotification(to: string, message: string): Promise<{
         notified: boolean;
         sms: SendChannelResult;
@@ -42,6 +48,10 @@ class MockNotificationService implements NotificationService {
     }
 
     async sendInviteNotification(to: string, message: string) {
+        return this.sendMessageWithStatus(to, message);
+    }
+
+    async sendMessageWithStatus(to: string, message: string): Promise<SendDeliveryResult> {
         await this.sendSMS(to, message);
         await this.sendWhatsApp(to, message);
         return {
@@ -67,14 +77,19 @@ class TwilioNotificationService implements NotificationService {
     private messagingServiceSid: string;
     private whatsappFrom: string;
 
+    private readEnvSmart(key: string): string {
+        if (process.env[key]) return String(process.env[key]);
+        const hit = Object.keys(process.env).find((k) => String(k || '').trim() === key);
+        return hit ? String(process.env[hit] || '') : '';
+    }
+
     constructor() {
-        const sid = process.env.TWILIO_ACCOUNT_SID;
-        const auth = process.env.TWILIO_AUTH_TOKEN;
-        this.fromNumber = process.env.TWILIO_PHONE_NUMBER || '';
-        this.messagingServiceSid = process.env.TWILIO_MESSAGING_SERVICE_SID || '';
+        const sid = this.readEnvSmart('TWILIO_ACCOUNT_SID');
+        const auth = this.readEnvSmart('TWILIO_AUTH_TOKEN');
+        this.fromNumber = this.readEnvSmart('TWILIO_PHONE_NUMBER');
+        this.messagingServiceSid = this.readEnvSmart('TWILIO_MESSAGING_SERVICE_SID');
         // Optional: dedicated WhatsApp-enabled sender (sandbox or approved WA number)
-        this.whatsappFrom =
-            process.env.TWILIO_WHATSAPP_FROM || process.env.TWILIO_PHONE_NUMBER || '';
+        this.whatsappFrom = this.readEnvSmart('TWILIO_WHATSAPP_FROM') || this.fromNumber || '';
 
         if (sid && sid.startsWith('AC') && auth) {
             this.client = twilio(sid, auth);
@@ -122,18 +137,25 @@ class TwilioNotificationService implements NotificationService {
             // WhatsApp requires 'whatsapp:' prefix
             const formattedTo = e164.startsWith('whatsapp:') ? e164 : `whatsapp:${e164}`;
             const baseFrom = this.whatsappFrom || this.fromNumber;
-            if (!baseFrom) {
-                console.error('[Twilio WhatsApp] Missing TWILIO_WHATSAPP_FROM / TWILIO_PHONE_NUMBER');
-                return false;
+            if (baseFrom) {
+                const formattedFrom = baseFrom.startsWith('whatsapp:') ? baseFrom : `whatsapp:${baseFrom}`;
+                await this.client.messages.create({
+                    body: message,
+                    from: formattedFrom,
+                    to: formattedTo
+                });
+                return true;
             }
-            const formattedFrom = baseFrom.startsWith('whatsapp:') ? baseFrom : `whatsapp:${baseFrom}`;
-
-            await this.client.messages.create({
-                body: message,
-                from: formattedFrom,
-                to: formattedTo
-            });
-            return true;
+            if (this.messagingServiceSid && this.messagingServiceSid.startsWith('MG')) {
+                await this.client.messages.create({
+                    body: message,
+                    messagingServiceSid: this.messagingServiceSid,
+                    to: formattedTo
+                });
+                return true;
+            }
+            console.error('[Twilio WhatsApp] Missing TWILIO_WHATSAPP_FROM / TWILIO_PHONE_NUMBER or WhatsApp-enabled messaging service');
+            return false;
         } catch (error) {
             console.error('[Twilio WhatsApp Error]', error);
             return false;
@@ -145,6 +167,10 @@ class TwilioNotificationService implements NotificationService {
      * then WhatsApp (needs WA-enabled sender / sandbox opt-in).
      */
     async sendInviteNotification(to: string, message: string) {
+        return this.sendMessageWithStatus(to, message);
+    }
+
+    async sendMessageWithStatus(to: string, message: string): Promise<SendDeliveryResult> {
         const e164 = toE164Phone(to);
         let smsOk = false;
         let whatsappOk = false;
