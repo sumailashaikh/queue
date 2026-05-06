@@ -2762,18 +2762,53 @@ export const startTask = async (req: Request, res: Response) => {
       .eq("id", businessId)
       .maybeSingle();
     const isOwner = business?.owner_id === userId;
-    const myProviderRes = await adminSupabase
+    const providerIdCandidates = new Set<string>();
+    const { data: myProviders } = await adminSupabase
       .from("service_providers")
       .select("id")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(1)
+      .eq("user_id", userId);
+    (myProviders || []).forEach((row: any) => {
+      if (row?.id) providerIdCandidates.add(String(row.id));
+    });
+
+    const normalizeDigits = (v: any) => String(v || "").replace(/[^\d]/g, "");
+    const { data: myProfile } = await adminSupabase
+      .from("profiles")
+      .select("phone")
+      .eq("id", userId)
       .maybeSingle();
-    const myProvider = myProviderRes.data;
+    const myPhone = normalizeDigits(myProfile?.phone);
+    if (myPhone) {
+      const { data: sameBizProviders } = await adminSupabase
+        .from("service_providers")
+        .select("id, phone, user_id")
+        .eq("business_id", businessId);
+      (sameBizProviders || []).forEach((row: any) => {
+        if (normalizeDigits(row?.phone) === myPhone && row?.id) {
+          providerIdCandidates.add(String(row.id));
+        }
+      });
+
+      // Auto-link the assigned provider row when phone matches but user_id is missing/mismatched.
+      if (task.assigned_provider_id && !providerIdCandidates.has(String(task.assigned_provider_id))) {
+        const assigned = (sameBizProviders || []).find(
+          (row: any) => String(row?.id) === String(task.assigned_provider_id),
+        );
+        if (assigned && normalizeDigits(assigned.phone) === myPhone) {
+          providerIdCandidates.add(String(task.assigned_provider_id));
+          if (!assigned.user_id || String(assigned.user_id) !== String(userId)) {
+            await adminSupabase
+              .from("service_providers")
+              .update({ user_id: userId })
+              .eq("id", task.assigned_provider_id);
+          }
+        }
+      }
+    }
+
     const isAssignedEmployee =
       !!task.assigned_provider_id &&
-      !!myProvider?.id &&
-      task.assigned_provider_id === myProvider.id;
+      providerIdCandidates.has(String(task.assigned_provider_id));
 
     if (!isOwner && !isAssignedEmployee) {
       return res.status(403).json({
@@ -2996,17 +3031,53 @@ export const completeTask = async (req: Request, res: Response) => {
     // PERMISSION CHECK: Must be the assigned provider (service_providers.id) OR the business owner
     const ownerId = task.queue_entries?.queues?.businesses?.owner_id;
     const isOwner = ownerId === userId;
-    const { data: myProvider } = await adminSupabase
+    const providerIdCandidates = new Set<string>();
+    const { data: myProviders } = await adminSupabase
       .from("service_providers")
       .select("id")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(1)
+      .eq("user_id", userId);
+    (myProviders || []).forEach((row: any) => {
+      if (row?.id) providerIdCandidates.add(String(row.id));
+    });
+
+    const normalizeDigits = (v: any) => String(v || "").replace(/[^\d]/g, "");
+    const { data: myProfile } = await adminSupabase
+      .from("profiles")
+      .select("phone")
+      .eq("id", userId)
       .maybeSingle();
+    const myPhone = normalizeDigits(myProfile?.phone);
+    const businessId = task.queue_entries?.queues?.business_id;
+    if (myPhone && businessId) {
+      const { data: sameBizProviders } = await adminSupabase
+        .from("service_providers")
+        .select("id, phone, user_id")
+        .eq("business_id", businessId);
+      (sameBizProviders || []).forEach((row: any) => {
+        if (normalizeDigits(row?.phone) === myPhone && row?.id) {
+          providerIdCandidates.add(String(row.id));
+        }
+      });
+
+      if (task.assigned_provider_id && !providerIdCandidates.has(String(task.assigned_provider_id))) {
+        const assigned = (sameBizProviders || []).find(
+          (row: any) => String(row?.id) === String(task.assigned_provider_id),
+        );
+        if (assigned && normalizeDigits(assigned.phone) === myPhone) {
+          providerIdCandidates.add(String(task.assigned_provider_id));
+          if (!assigned.user_id || String(assigned.user_id) !== String(userId)) {
+            await adminSupabase
+              .from("service_providers")
+              .update({ user_id: userId })
+              .eq("id", task.assigned_provider_id);
+          }
+        }
+      }
+    }
+
     const isAssignedEmployee =
       !!task.assigned_provider_id &&
-      !!myProvider?.id &&
-      task.assigned_provider_id === myProvider.id;
+      providerIdCandidates.has(String(task.assigned_provider_id));
 
     if (!isOwner && !isAssignedEmployee) {
       return res.status(403).json({

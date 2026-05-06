@@ -78,8 +78,9 @@ export async function checkProviderAvailabilityAt(
   }
 
   for (const l of leaves || []) {
-    const status = String(l.status || "PENDING").toUpperCase();
-    if (status === "REJECTED") continue;
+    const status = String(l.status || "").toUpperCase();
+    // Only APPROVED leave blocks queue/appointment flows.
+    if (status !== "APPROVED") continue;
     const kind = String(l.leave_kind || "FULL_DAY").toUpperCase();
     if (kind === "FULL_DAY") return { available: false, reason: "leave" };
     const s = toMinutes(String(l.start_time || "00:00").slice(0, 5));

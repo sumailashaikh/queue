@@ -867,12 +867,44 @@ export const getProviderAttendance = async (req: Request, res: Response) => {
         const { adminSupabase } = require('../config/supabaseClient');
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
 
-        const { data: provider } = await adminSupabase
+        let { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, business_id, user_id')
             .eq('id', id)
             .maybeSingle();
         if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        // Auto-link fallback: old providers may exist without user_id linkage.
+        if (!provider.user_id || provider.user_id !== userId) {
+            const { data: myProfile } = await adminSupabase
+                .from('profiles')
+                .select('phone')
+                .eq('id', userId)
+                .maybeSingle();
+            const normalizedPhone = String(myProfile?.phone || '').replace(/[^\d+]/g, '');
+            if (normalizedPhone) {
+                const { data: samePhoneProvider } = await adminSupabase
+                    .from('service_providers')
+                    .select('id, user_id, business_id')
+                    .eq('phone', normalizedPhone)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+                if (samePhoneProvider?.id && String(samePhoneProvider.id) === String(provider.id)) {
+                    if (!samePhoneProvider.user_id || String(samePhoneProvider.user_id) !== String(userId)) {
+                        await adminSupabase
+                            .from('service_providers')
+                            .update({ user_id: userId })
+                            .eq('id', samePhoneProvider.id);
+                    }
+                    provider = {
+                        id: samePhoneProvider.id,
+                        business_id: samePhoneProvider.business_id,
+                        user_id: userId
+                    } as any;
+                }
+            }
+        }
 
         const { data: biz } = await adminSupabase
             .from('businesses')
@@ -920,12 +952,45 @@ export const markProviderAttendance = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'Invalid action' });
         }
 
-        const { data: provider } = await adminSupabase
+        let { data: provider } = await adminSupabase
             .from('service_providers')
             .select('id, business_id, user_id')
             .eq('id', id)
             .maybeSingle();
         if (!provider) return res.status(404).json({ status: 'error', message: 'Provider not found' });
+
+        // Auto-link fallback: old providers may exist without user_id linkage.
+        if (!provider.user_id || provider.user_id !== userId) {
+            const { data: myProfile } = await adminSupabase
+                .from('profiles')
+                .select('phone')
+                .eq('id', userId)
+                .maybeSingle();
+            const normalizedPhone = String(myProfile?.phone || '').replace(/[^\d+]/g, '');
+            if (normalizedPhone) {
+                const { data: samePhoneProvider } = await adminSupabase
+                    .from('service_providers')
+                    .select('id, user_id, business_id')
+                    .eq('phone', normalizedPhone)
+                    .order('created_at', { ascending: false })
+                    .limit(1)
+                    .maybeSingle();
+                if (samePhoneProvider?.id && String(samePhoneProvider.id) === String(provider.id)) {
+                    if (!samePhoneProvider.user_id || String(samePhoneProvider.user_id) !== String(userId)) {
+                        await adminSupabase
+                            .from('service_providers')
+                            .update({ user_id: userId })
+                            .eq('id', samePhoneProvider.id);
+                    }
+                    provider = {
+                        id: samePhoneProvider.id,
+                        business_id: samePhoneProvider.business_id,
+                        user_id: userId
+                    } as any;
+                }
+            }
+        }
+
         const isSelf = provider?.user_id === userId;
         if (!isSelf) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
