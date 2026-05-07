@@ -159,6 +159,10 @@ const normalizeBlockoutReason = (input: any): string => {
     return map[raw] || 'other';
 };
 
+const isBlockoutFallbackLeave = (row: any): boolean => {
+    return String(row?.note || '').trim().startsWith('[BLOCK_OUT]');
+};
+
 async function syncEmployeeBlockoutFromProviderBlock(
     adminSupabase: any,
     providerId: string,
@@ -544,7 +548,9 @@ export const getServiceProviders = async (req: Request, res: Response) => {
 
             // Compute leave status (time-aware for partial-day leaves)
             const providerLeaves = allRecentLeaves.filter((l: any) => l.provider_id === p.id);
-            const currentLeave = providerLeaves.find((l: any) => {
+            const providerRealLeaves = providerLeaves.filter((l: any) => !isBlockoutFallbackLeave(l));
+            const providerBlockoutFallbackLeaves = providerLeaves.filter((l: any) => isBlockoutFallbackLeave(l));
+            const currentLeave = providerRealLeaves.find((l: any) => {
                 if (!(l.start_date <= targetDateStr && l.end_date >= targetDateStr)) return false;
                 const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
                 if (kind === 'FULL_DAY') return true;
@@ -554,7 +560,7 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 const n = toMinutes(nowLocalTime);
                 return n >= s && n < e;
             });
-            const upcomingLeave = providerLeaves
+            const upcomingLeave = providerRealLeaves
                 .filter((l: any) => {
                     const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
                     if (l.start_date > targetDateStr && l.start_date <= tomorrowStr) return true;
@@ -573,11 +579,28 @@ export const getServiceProviders = async (req: Request, res: Response) => {
             const providerBlocks = allTodayBlockTimes
                 .filter((b: any) => b.provider_id === p.id)
                 .sort((a: any, b: any) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
-            const activeBlock = providerBlocks.find((b: any) => {
+            const providerFallbackBlocks = providerBlockoutFallbackLeaves
+                .filter((l: any) => String(l.start_date || '') === targetDateStr)
+                .map((l: any) => ({
+                    provider_id: l.provider_id,
+                    start_time: String(l.start_time || '00:00').slice(0, 5),
+                    end_time: String(l.end_time || '23:59').slice(0, 5),
+                    reason: String(l.note || '').replace(/^\[BLOCK_OUT\]\s*/, '').trim() || 'other'
+                }))
+                .sort((a: any, b: any) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
+            const combinedBlocks = [...providerBlocks, ...providerFallbackBlocks].sort((a: any, b: any) =>
+                String(a.start_time || '').localeCompare(String(b.start_time || ''))
+            );
+            const activeBlock = combinedBlocks.find((b: any) => {
                 const s = toMinutes(String(b.start_time || '').slice(0, 5));
                 const e = toMinutes(String(b.end_time || '').slice(0, 5));
                 const n = toMinutes(nowLocalTime);
                 return n >= s && n < e;
+            });
+            const upcomingBlock = combinedBlocks.find((b: any) => {
+                const s = toMinutes(String(b.start_time || '').slice(0, 5));
+                const n = toMinutes(nowLocalTime);
+                return n < s;
             });
 
             let leave_status = 'available';
@@ -587,6 +610,8 @@ export const getServiceProviders = async (req: Request, res: Response) => {
             let temporary_unavailable_reason = null;
             let temporary_unavailable_until = null;
             let temporary_unavailable_remaining_minutes = 0;
+            let temporary_unavailable_scheduled = false;
+            let temporary_unavailable_starts_at = null;
             if (activeBlock) {
                 const nowM = toMinutes(nowLocalTime);
                 const endM = toMinutes(String(activeBlock.end_time || '').slice(0, 5));
@@ -594,6 +619,11 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 temporary_unavailable_reason = normalizeBlockoutReason(activeBlock.reason);
                 temporary_unavailable_until = String(activeBlock.end_time || '').slice(0, 5);
                 temporary_unavailable_remaining_minutes = Math.max(0, endM - nowM);
+            } else if (upcomingBlock) {
+                temporary_unavailable_scheduled = true;
+                temporary_unavailable_reason = normalizeBlockoutReason(upcomingBlock.reason);
+                temporary_unavailable_starts_at = `${targetDateStr} ${String(upcomingBlock.start_time || '').slice(0, 5)}`;
+                temporary_unavailable_until = String(upcomingBlock.end_time || '').slice(0, 5);
             }
 
             if (currentLeave) {
@@ -617,6 +647,8 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 temporary_unavailable_reason,
                 temporary_unavailable_until,
                 temporary_unavailable_remaining_minutes,
+                temporary_unavailable_scheduled,
+                temporary_unavailable_starts_at,
                 current_tasks_count: currentTasksCount,
                 services: p.services?.map((ps: any) => ps.services).filter(Boolean) || []
             };
