@@ -3239,7 +3239,19 @@ export const getLeaveAlerts = async (req: Request, res: Response) => {
             .eq('id', business_id)
             .eq('owner_id', userId)
             .maybeSingle();
-        if (!business) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+        if (!business) {
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('business_id, role')
+                .eq('id', userId)
+                .maybeSingle();
+            const isOwnerLike = ['owner', 'admin', 'manager', 'business_owner']
+                .includes(String(profile?.role || '').toLowerCase());
+            const sameBusiness = String(profile?.business_id || '') === String(business_id || '');
+            if (!(isOwnerLike && sameBusiness)) {
+                return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+            }
+        }
 
         const { data: leaves } = await adminSupabase
             .from('provider_leaves')
@@ -3325,10 +3337,20 @@ export const getPendingLeaveRequestsCount = async (req: Request, res: Response) 
             .select('id')
             .eq('id', business_id)
             .eq('owner_id', userId)
-            .single();
+            .maybeSingle();
 
         if (!business) {
-            return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+            const { data: profile } = await supabase
+                .from('profiles')
+                .select('business_id, role')
+                .eq('id', userId)
+                .maybeSingle();
+            const isOwnerLike = ['owner', 'admin', 'manager', 'business_owner']
+                .includes(String(profile?.role || '').toLowerCase());
+            const sameBusiness = String(profile?.business_id || '') === String(business_id || '');
+            if (!(isOwnerLike && sameBusiness)) {
+                return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+            }
         }
 
         const { count, error } = await adminSupabase
