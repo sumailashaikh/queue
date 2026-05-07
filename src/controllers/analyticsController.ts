@@ -112,6 +112,10 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
                 on_leave_today: false,
                 upcoming_leave_count: 0,
                 past_leave_count: 0,
+                block_out_total_count: 0,
+                block_out_today: 0,
+                block_out_upcoming_count: 0,
+                block_out_past_count: 0,
                 service_breakdown: {},
                 daily_work_log: [] as any[],
                 task_active_dates: new Set<string>()
@@ -167,6 +171,10 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
                     on_leave_today: false,
                     upcoming_leave_count: 0,
                     past_leave_count: 0,
+                    block_out_total_count: 0,
+                    block_out_today: 0,
+                    block_out_upcoming_count: 0,
+                    block_out_past_count: 0,
                     service_breakdown: {},
                     daily_work_log: [] as any[],
                     task_active_dates: new Set<string>()
@@ -220,7 +228,7 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
         let leaveRows: any[] = [];
         const leavesBase = await supabase
             .from('provider_leaves')
-            .select('provider_id, start_date, end_date, leave_kind, status')
+            .select('provider_id, start_date, end_date, leave_kind, status, note')
             .eq('business_id', businessId)
             .lte('start_date', endDate)
             .gte('end_date', startDate)
@@ -230,7 +238,7 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
             if (msg.includes('status') && msg.includes('column')) {
                 const fallbackLeaves = await supabase
                     .from('provider_leaves')
-                    .select('provider_id, start_date, end_date, leave_kind')
+                    .select('provider_id, start_date, end_date, leave_kind, note')
                     .eq('business_id', businessId)
                     .lte('start_date', endDate)
                     .gte('end_date', startDate);
@@ -246,6 +254,7 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
         const leaveByProviderDate = new Map<string, 'full' | 'half'>();
         (leaveRows || []).forEach((lv: any) => {
             if (!lv?.provider_id || !lv?.start_date || !lv?.end_date) return;
+            if (String(lv?.note || '').startsWith('[BLOCK_OUT]')) return;
             const clamped = clampDateRange(String(lv.start_date).slice(0, 10), String(lv.end_date).slice(0, 10));
             if (!clamped) return;
             const leaveKind = String(lv.leave_kind || '').toUpperCase();
@@ -266,7 +275,7 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
         let leaveTrackerRows: any[] = [];
         const leaveTrackerBase = await supabase
             .from('provider_leaves')
-            .select('provider_id, start_date, end_date, leave_kind, status')
+            .select('provider_id, start_date, end_date, leave_kind, status, note')
             .eq('business_id', businessId)
             .lte('start_date', leaveWindowEnd)
             .gte('end_date', leaveWindowStart)
@@ -277,7 +286,7 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
             if (msg.includes('status') && msg.includes('column')) {
                 const fallbackLeaveTracker = await supabase
                     .from('provider_leaves')
-                    .select('provider_id, start_date, end_date, leave_kind')
+                    .select('provider_id, start_date, end_date, leave_kind, note')
                     .eq('business_id', businessId)
                     .lte('start_date', leaveWindowEnd)
                     .gte('end_date', leaveWindowStart)
@@ -294,6 +303,7 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
         (leaveTrackerRows || []).forEach((lv: any) => {
             const providerId = String(lv?.provider_id || '');
             if (!providerId || !providerStats[providerId]) return;
+            if (String(lv?.note || '').startsWith('[BLOCK_OUT]')) return;
 
             const startDateKey = String(lv?.start_date || '').slice(0, 10);
             const endDateKey = String(lv?.end_date || '').slice(0, 10);
@@ -325,6 +335,90 @@ export const getProviderAnalytics = async (req: Request, res: Response) => {
             if (startDateKey <= todayDate && endDateKey >= todayDate) p.on_leave_today = true;
             else if (startDateKey > todayDate) p.upcoming_leave_count += 1;
             else if (endDateKey < todayDate) p.past_leave_count += 1;
+        });
+
+        // --- Block-out tracker data (from block table, day-offs fallback, or tagged leave fallback) ---
+        const blockOutByProvider = new Map<string, Array<{ date: string; start_time: string | null; end_time: string | null; reason?: string | null }>>();
+        const pushBlockOut = (providerId: string, row: { date: string; start_time: string | null; end_time: string | null; reason?: string | null }) => {
+            const list = blockOutByProvider.get(providerId) || [];
+            list.push(row);
+            blockOutByProvider.set(providerId, list);
+        };
+
+        const blockRowsRes = await supabase
+            .from('provider_block_times')
+            .select('provider_id, block_date, start_time, end_time, reason')
+            .in('provider_id', Object.keys(providerStats))
+            .gte('block_date', leaveWindowStart)
+            .lte('block_date', leaveWindowEnd);
+        if (!blockRowsRes.error) {
+            (blockRowsRes.data || []).forEach((r: any) => {
+                const providerId = String(r.provider_id || '');
+                if (!providerStats[providerId]) return;
+                pushBlockOut(providerId, { date: String(r.block_date || '').slice(0, 10), start_time: r.start_time || null, end_time: r.end_time || null, reason: r.reason || null });
+            });
+        }
+
+        if (blockRowsRes.error) {
+            const dayOffRes = await supabase
+                .from('provider_day_offs')
+                .select('provider_id, day_off_date, start_time, end_time, reason, day_off_type')
+                .in('provider_id', Object.keys(providerStats))
+                .eq('day_off_type', 'partial')
+                .gte('day_off_date', leaveWindowStart)
+                .lte('day_off_date', leaveWindowEnd);
+            if (!dayOffRes.error) {
+                (dayOffRes.data || []).forEach((r: any) => {
+                    const providerId = String(r.provider_id || '');
+                    if (!providerStats[providerId]) return;
+                    pushBlockOut(providerId, { date: String(r.day_off_date || '').slice(0, 10), start_time: r.start_time || null, end_time: r.end_time || null, reason: r.reason || null });
+                });
+            } else {
+                const leaveBlockRes = await supabase
+                    .from('provider_leaves')
+                    .select('provider_id, start_date, end_date, start_time, end_time, note')
+                    .in('provider_id', Object.keys(providerStats))
+                    .eq('status', 'APPROVED')
+                    .eq('leave_kind', 'HALF_DAY')
+                    .gte('start_date', leaveWindowStart)
+                    .lte('start_date', leaveWindowEnd);
+                if (!leaveBlockRes.error) {
+                    (leaveBlockRes.data || [])
+                        .filter((r: any) => String(r.note || '').startsWith('[BLOCK_OUT]'))
+                        .forEach((r: any) => {
+                            const providerId = String(r.provider_id || '');
+                            if (!providerStats[providerId]) return;
+                            pushBlockOut(providerId, {
+                                date: String(r.start_date || '').slice(0, 10),
+                                start_time: r.start_time || null,
+                                end_time: r.end_time || null,
+                                reason: String(r.note || '').replace(/^\[BLOCK_OUT\]\s*/, '') || null
+                            });
+                        });
+                }
+            }
+        }
+
+        blockOutByProvider.forEach((rows, providerId) => {
+            const p = providerStats[providerId];
+            if (!p) return;
+            rows.forEach((row) => {
+                const dateKey = String(row.date || '').slice(0, 10);
+                if (!dateKey) return;
+                p.leave_records.push({
+                    type: 'block_out',
+                    startDate: dateKey,
+                    endDate: dateKey,
+                    status: 'approved',
+                    start_time: row.start_time || null,
+                    end_time: row.end_time || null,
+                    reason: row.reason || null
+                });
+                p.block_out_total_count += 1;
+                if (dateKey === todayDate) p.block_out_today += 1;
+                else if (dateKey > todayDate) p.block_out_upcoming_count += 1;
+                else p.block_out_past_count += 1;
+            });
         });
 
         // --- Build daily work logs + leave/day counters ---

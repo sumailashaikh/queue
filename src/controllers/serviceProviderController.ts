@@ -1274,6 +1274,7 @@ export const getProviderBlockTimes = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
         const { data, error } = await supabase
             .from('provider_block_times')
             .select('*')
@@ -1281,10 +1282,57 @@ export const getProviderBlockTimes = async (req: Request, res: Response) => {
             .order('block_date', { ascending: true })
             .order('start_time', { ascending: true });
         if (error) {
-            const msg = String((error as any)?.message || '');
-            if (msg.includes("Could not find the table 'public.provider_block_times'")) {
-                console.warn('[getProviderBlockTimes] provider_block_times table missing in DB schema; returning empty list.');
-                return res.status(200).json({ status: 'success', data: [] });
+            if (isMissingTableError(error, 'provider_block_times')) {
+                const { data: dayOffRows, error: dayOffErr } = await adminSupabase
+                    .from('provider_day_offs')
+                    .select('id, provider_id, business_id, day_off_date, start_time, end_time, reason')
+                    .eq('provider_id', id)
+                    .eq('day_off_type', 'partial')
+                    .order('day_off_date', { ascending: true })
+                    .order('start_time', { ascending: true });
+
+                if (dayOffErr && !isMissingTableError(dayOffErr, 'provider_day_offs')) {
+                    throw dayOffErr;
+                }
+                if ((dayOffRows || []).length > 0) {
+                    return res.status(200).json({
+                        status: 'success',
+                        data: (dayOffRows || []).map((r: any) => ({
+                            id: `dayoff:${r.id}`,
+                            provider_id: r.provider_id,
+                            business_id: r.business_id,
+                            block_date: r.day_off_date,
+                            start_time: r.start_time,
+                            end_time: r.end_time,
+                            reason: r.reason || null,
+                            source: 'provider_day_offs_fallback'
+                        }))
+                    });
+                }
+
+                const { data: leaveRows, error: leaveErr } = await adminSupabase
+                    .from('provider_leaves')
+                    .select('id, provider_id, business_id, start_date, end_date, start_time, end_time, note, leave_kind, status')
+                    .eq('provider_id', id)
+                    .eq('status', 'APPROVED')
+                    .eq('leave_kind', 'HALF_DAY')
+                    .order('start_date', { ascending: true });
+                if (leaveErr) throw leaveErr;
+
+                const fallbackRows = (leaveRows || [])
+                    .filter((r: any) => String(r.start_date || '') === String(r.end_date || ''))
+                    .filter((r: any) => String(r.note || '').startsWith('[BLOCK_OUT]'))
+                    .map((r: any) => ({
+                        id: `leave:${r.id}`,
+                        provider_id: r.provider_id,
+                        business_id: r.business_id,
+                        block_date: r.start_date,
+                        start_time: r.start_time,
+                        end_time: r.end_time,
+                        reason: String(r.note || '').replace(/^\[BLOCK_OUT\]\s*/, '') || null,
+                        source: 'provider_leaves_fallback'
+                    }));
+                return res.status(200).json({ status: 'success', data: fallbackRows });
             }
             throw error;
         }
@@ -1363,7 +1411,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                         leave_kind: 'HALF_DAY',
                         start_time: String(start_time).slice(0, 5),
                         end_time: String(end_time).slice(0, 5),
-                        note: reason || null,
+                        note: reason ? `[BLOCK_OUT] ${reason}` : '[BLOCK_OUT]',
                         status: 'APPROVED',
                         approved_by: userId
                     };
@@ -1432,6 +1480,51 @@ export const deleteProviderBlockTime = async (req: Request, res: Response) => {
         const userId = req.user?.id;
         const { adminSupabase } = require('../config/supabaseClient');
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
+
+        if (String(blockId).startsWith('dayoff:')) {
+            const targetId = String(blockId).replace('dayoff:', '');
+            const rowRes = await adminSupabase
+                .from('provider_day_offs')
+                .select('id, business_id, provider_id')
+                .eq('id', targetId)
+                .maybeSingle();
+            if (rowRes.error) throw rowRes.error;
+            const row = rowRes.data;
+            if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
+
+            const { data: biz } = await adminSupabase.from('businesses').select('id, owner_id').eq('id', row.business_id).maybeSingle();
+            const { data: provider } = await adminSupabase.from('service_providers').select('id, user_id').eq('id', row.provider_id).maybeSingle();
+            const isOwner = biz?.owner_id === userId;
+            const isSelf = provider?.user_id === userId;
+            if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+            await adminSupabase.from('provider_day_offs').delete().eq('id', targetId);
+            return res.status(200).json({ status: 'success', message: 'Block time removed' });
+        }
+
+        if (String(blockId).startsWith('leave:')) {
+            const targetId = String(blockId).replace('leave:', '');
+            const rowRes = await adminSupabase
+                .from('provider_leaves')
+                .select('id, business_id, provider_id, note')
+                .eq('id', targetId)
+                .maybeSingle();
+            if (rowRes.error) throw rowRes.error;
+            const row = rowRes.data;
+            if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
+            if (!String(row.note || '').startsWith('[BLOCK_OUT]')) {
+                return res.status(400).json({ status: 'error', message: 'Not a block-out fallback row' });
+            }
+
+            const { data: biz } = await adminSupabase.from('businesses').select('id, owner_id').eq('id', row.business_id).maybeSingle();
+            const { data: provider } = await adminSupabase.from('service_providers').select('id, user_id').eq('id', row.provider_id).maybeSingle();
+            const isOwner = biz?.owner_id === userId;
+            const isSelf = provider?.user_id === userId;
+            if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
+
+            await adminSupabase.from('provider_leaves').delete().eq('id', targetId);
+            return res.status(200).json({ status: 'success', message: 'Block time removed' });
+        }
 
         const { data: row } = await adminSupabase
             .from('provider_block_times')
