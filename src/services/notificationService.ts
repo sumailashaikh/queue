@@ -27,7 +27,9 @@ export interface NotificationService {
     sendSMS(to: string, message: string): Promise<boolean>;
     sendWhatsApp(to: string, message: string): Promise<boolean>;
     sendMessageWithStatus(to: string, message: string): Promise<SendDeliveryResult>;
-    sendInviteNotification(to: string, message: string): Promise<{
+    sendInviteNotification(to: string, message: string, options?: {
+        allowWhatsappFallback?: boolean;
+    }): Promise<{
         notified: boolean;
         sms: SendChannelResult;
         whatsapp: SendChannelResult;
@@ -48,6 +50,7 @@ class MockNotificationService implements NotificationService {
     }
 
     async sendInviteNotification(to: string, message: string) {
+        // In mock mode keep behavior simple and successful.
         return this.sendMessageWithStatus(to, message);
     }
 
@@ -76,6 +79,8 @@ class TwilioNotificationService implements NotificationService {
     private fromNumber: string;
     private messagingServiceSid: string;
     private whatsappFrom: string;
+    private inviteCooldownMs: number;
+    private inviteLastAttemptByPhone: Map<string, number>;
 
     private readEnvSmart(key: string): string {
         if (process.env[key]) return String(process.env[key]);
@@ -90,6 +95,8 @@ class TwilioNotificationService implements NotificationService {
         this.messagingServiceSid = this.readEnvSmart('TWILIO_MESSAGING_SERVICE_SID');
         // Optional: dedicated WhatsApp-enabled sender (sandbox or approved WA number)
         this.whatsappFrom = this.readEnvSmart('TWILIO_WHATSAPP_FROM') || this.fromNumber || '';
+        this.inviteCooldownMs = Number(this.readEnvSmart('INVITE_NOTIFY_COOLDOWN_MS') || 120000);
+        this.inviteLastAttemptByPhone = new Map();
 
         if (sid && sid.startsWith('AC') && auth) {
             this.client = twilio(sid, auth);
@@ -166,8 +173,94 @@ class TwilioNotificationService implements NotificationService {
      * Employee invites: try SMS first (usually works with standard numbers),
      * then WhatsApp (needs WA-enabled sender / sandbox opt-in).
      */
-    async sendInviteNotification(to: string, message: string) {
-        return this.sendMessageWithStatus(to, message);
+    async sendInviteNotification(
+        to: string,
+        message: string,
+        options?: { allowWhatsappFallback?: boolean }
+    ) {
+        const e164 = toE164Phone(to);
+        const now = Date.now();
+        const lastAttempt = this.inviteLastAttemptByPhone.get(e164) || 0;
+        if (lastAttempt && now - lastAttempt < this.inviteCooldownMs) {
+            return {
+                notified: false,
+                sms: {
+                    ok: false,
+                    channel: 'sms' as const,
+                    error: `Invite cooldown active. Please retry after ${Math.ceil((this.inviteCooldownMs - (now - lastAttempt)) / 1000)}s.`
+                },
+                whatsapp: { ok: false, channel: 'whatsapp' as const, error: 'Invite cooldown active' }
+            };
+        }
+        this.inviteLastAttemptByPhone.set(e164, now);
+
+        const allowWhatsappFallback = options?.allowWhatsappFallback === true;
+        let smsOk = false;
+        let whatsappOk = false;
+        let smsErr: string | undefined;
+        let waErr: string | undefined;
+
+        if (!this.client) {
+            return {
+                notified: false,
+                sms: { ok: false, channel: 'sms' as const, error: 'Twilio client not initialized' },
+                whatsapp: { ok: false, channel: 'whatsapp' as const, error: 'Twilio client not initialized' }
+            };
+        }
+
+        try {
+            const payload: Record<string, string> = { body: message, to: e164 };
+            if (this.messagingServiceSid && this.messagingServiceSid.startsWith('MG')) {
+                payload.messagingServiceSid = this.messagingServiceSid;
+            } else if (this.fromNumber) {
+                payload.from = this.fromNumber;
+            } else {
+                smsErr = 'Missing TWILIO_PHONE_NUMBER or TWILIO_MESSAGING_SERVICE_SID';
+            }
+            if (!smsErr) {
+                await this.client.messages.create(payload);
+                smsOk = true;
+            }
+        } catch (err) {
+            smsErr = twilioErrorMessage(err);
+            console.error('[Twilio SMS invite]', smsErr);
+        }
+
+        // Default invite policy: SMS only. WhatsApp fallback is opt-in.
+        if (!smsOk && allowWhatsappFallback) {
+            const smsErrBlob = String(smsErr || '').toLowerCase();
+            // If daily limit is already hit, avoid spending another attempt.
+            if (/63038|daily messages limit|maximum amount of messages per 24 hours/i.test(smsErrBlob)) {
+                waErr = 'Skipped WhatsApp fallback because Twilio daily limit is already hit.';
+            } else {
+                try {
+                    const formattedTo = `whatsapp:${e164}`;
+                    const baseFrom = this.whatsappFrom || this.fromNumber;
+                    if (!baseFrom) {
+                        waErr = 'Missing TWILIO_WHATSAPP_FROM / TWILIO_PHONE_NUMBER';
+                    } else {
+                        const formattedFrom = baseFrom.startsWith('whatsapp:') ? baseFrom : `whatsapp:${baseFrom}`;
+                        await this.client.messages.create({
+                            body: message,
+                            from: formattedFrom,
+                            to: formattedTo
+                        });
+                        whatsappOk = true;
+                    }
+                } catch (err) {
+                    waErr = twilioErrorMessage(err);
+                    console.error('[Twilio WhatsApp invite]', waErr);
+                }
+            }
+        } else if (!smsOk) {
+            waErr = 'WhatsApp fallback disabled for invite notifications.';
+        }
+
+        return {
+            notified: smsOk || whatsappOk,
+            sms: { ok: smsOk, channel: 'sms' as const, error: smsErr },
+            whatsapp: { ok: whatsappOk, channel: 'whatsapp' as const, error: waErr }
+        };
     }
 
     async sendMessageWithStatus(to: string, message: string): Promise<SendDeliveryResult> {

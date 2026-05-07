@@ -663,7 +663,9 @@ export const inviteEmployee = async (req: any, res: Response) => {
         
         const { notificationService } = require('../services/notificationService');
 
-        const notifyResult = await notificationService.sendInviteNotification(normalizedPhone, msg);
+        const notifyResult = await notificationService.sendInviteNotification(normalizedPhone, msg, {
+            allowWhatsappFallback: String(process.env.INVITE_WHATSAPP_FALLBACK || '').toLowerCase() === 'true'
+        });
         const notified = notifyResult.notified;
         const smsErr = String(notifyResult.sms?.error || '');
         const waErr = String(notifyResult.whatsapp?.error || '');
@@ -672,8 +674,10 @@ export const inviteEmployee = async (req: any, res: Response) => {
         if (!notified) {
             if (/21608|21211|unverified|not verified|verify.*caller|trial.*number/i.test(errBlob)) {
                 notify_hint = 'twilio_trial_destination_not_verified';
-            } else if (/63038|daily messages limit|exceeded the 50 daily/i.test(errBlob)) {
+            } else if (/63038|daily messages limit|maximum amount of messages per 24 hours|exceeded the 50 daily/i.test(errBlob)) {
                 notify_hint = 'twilio_daily_limit';
+            } else if (/invite cooldown active|cooldown/i.test(errBlob)) {
+                notify_hint = 'twilio_cooldown_active';
             } else if (/20003|20001|authenticate|invalid.*sid|invalid.*token|permission denied/i.test(errBlob)) {
                 notify_hint = 'twilio_auth_mismatch';
             }
