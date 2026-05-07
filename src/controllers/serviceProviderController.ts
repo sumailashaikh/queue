@@ -3268,12 +3268,16 @@ export const getLeaveAlerts = async (req: Request, res: Response) => {
                 service_providers(id, name)
             `)
             .eq('business_id', business_id)
-            .in('status', ['PENDING', 'APPROVED'])
             .order('start_date', { ascending: true })
             .limit(25);
 
+        const normalizedLeaves = (leaves || []).filter((lv: any) => {
+            const status = String(lv?.status || '').toUpperCase().replace(/\s+/g, '_');
+            return status === 'APPROVED' || status.startsWith('PENDING');
+        });
+
         const alerts = await Promise.all(
-            (leaves || []).map(async (lv: any) => {
+            normalizedLeaves.map(async (lv: any) => {
                 const providerId = String(lv.provider_id || '');
                 const startDate = String(lv.start_date || '').slice(0, 10);
                 const endDate = String(lv.end_date || '').slice(0, 10);
@@ -3353,11 +3357,12 @@ export const getPendingLeaveRequestsCount = async (req: Request, res: Response) 
             }
         }
 
-        const { count, error } = await adminSupabase
+        const { data: leaveRows, error } = await adminSupabase
             .from('provider_leaves')
-            .select('id', { count: 'exact', head: true })
+            .select('status')
             .eq('business_id', business_id)
-            .eq('status', 'PENDING');
+            .order('created_at', { ascending: false })
+            .limit(200);
         if (error && isMissingColumnError(error, 'status')) {
             return res.status(200).json({
                 status: 'success',
@@ -3365,10 +3370,13 @@ export const getPendingLeaveRequestsCount = async (req: Request, res: Response) 
             });
         }
         if (error) throw error;
+        const pendingCount = (leaveRows || []).filter((row: any) =>
+            String(row?.status || '').toUpperCase().replace(/\s+/g, '_').startsWith('PENDING')
+        ).length;
 
         res.status(200).json({
             status: 'success',
-            data: { pending_count: count || 0 }
+            data: { pending_count: pendingCount }
         });
     } catch (error: any) {
         res.status(500).json({ status: 'error', message: error.message });
