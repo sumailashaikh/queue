@@ -1538,7 +1538,16 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                             break;
                         }
                     }
-                    if (leaveIns.error) throw leaveIns.error;
+                    if (leaveIns.error) {
+                        if (isLeaveOverlapConstraintError(leaveIns.error)) {
+                            return res.status(400).json({
+                                status: 'error',
+                                message: 'Block time overlaps an existing approved leave or block-out',
+                                message_key: 'providers.err_leave_overlap'
+                            });
+                        }
+                        throw leaveIns.error;
+                    }
                     return res.status(201).json({
                         status: 'success',
                         data: {
@@ -1594,7 +1603,16 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             created_by: userId
         };
         const { data, error } = await adminSupabase.from('provider_block_times').insert([payload]).select().maybeSingle();
-        if (error) throw error;
+        if (error) {
+            if (isLeaveOverlapConstraintError(error)) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Block time overlaps an existing approved leave or block-out',
+                    message_key: 'providers.err_leave_overlap'
+                });
+            }
+            throw error;
+        }
         try {
             const startIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00`;
             const endIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00`;
