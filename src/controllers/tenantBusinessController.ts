@@ -669,6 +669,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
         const { slug } = req.params;
         const requestedDate = String((req.query as any)?.date || '').trim();
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         const { data: business } = await supabase
             .from('businesses')
@@ -714,7 +715,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
         const nowMins = toMins(nowLocal);
 
         const { data: availabilityRows } = providerIds.length
-            ? await supabase
+            ? await adminSupabase
                 .from('provider_availability')
                 .select('provider_id, day_of_week, start_time, end_time, is_available')
                 .in('provider_id', providerIds)
@@ -722,7 +723,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             : { data: [] as any[] };
 
         const { data: dayOffRows } = providerIds.length
-            ? await supabase
+            ? await adminSupabase
                 .from('provider_day_offs')
                 .select('provider_id, day_off_type, start_time, end_time')
                 .in('provider_id', providerIds)
@@ -730,7 +731,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             : { data: [] as any[] };
 
         const { data: blockRows } = providerIds.length
-            ? await supabase
+            ? await adminSupabase
                 .from('provider_block_times')
                 .select('provider_id, start_time, end_time')
                 .in('provider_id', providerIds)
@@ -763,7 +764,7 @@ export const getPublicProvidersBySlug = async (req: Request, res: Response) => {
             : { data: [] as any[] };
 
         const { data: leaveRows } = providerIds.length
-            ? await supabase
+            ? await adminSupabase
                 .from('provider_leaves')
                 .select('provider_id, start_date, end_date, leave_kind, start_time, end_time, status')
                 .in('provider_id', providerIds)
@@ -908,6 +909,7 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
         const { slug, providerId } = req.params as any;
         const { date, duration_minutes } = req.query as any;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!date) return res.status(400).json({ status: 'error', message: 'date is required' });
         const duration = Math.max(5, Number(duration_minutes || 30));
@@ -937,7 +939,7 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
         const openM = parseMins(effectiveOpen);
         const closeM = parseMins(effectiveClose);
         const dayOfWeek = new Date(`${String(date).slice(0, 10)}T12:00:00`).getDay();
-        const { data: providerAvailability } = await supabase
+        const { data: providerAvailability } = await adminSupabase
             .from('provider_availability')
             .select('is_available, start_time, end_time')
             .eq('provider_id', providerId)
@@ -998,7 +1000,7 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             busy.push({ start: st, end });
         });
 
-        const { data: dayLeaves } = await supabase
+        const { data: dayLeaves } = await adminSupabase
             .from('provider_leaves')
             .select('start_date, end_date, leave_kind, start_time, end_time, status')
             .eq('provider_id', providerId)
@@ -1021,7 +1023,7 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             leaveBlocks.push({ startM: parse(l.start_time || '00:00'), endM: parse(l.end_time || '23:59') });
         });
 
-        const { data: dayOffRows, error: dayOffErr } = await supabase
+        const { data: dayOffRows, error: dayOffErr } = await adminSupabase
             .from('provider_day_offs')
             .select('day_off_type, start_time, end_time')
             .eq('provider_id', providerId)
@@ -1041,7 +1043,7 @@ export const getPublicProviderSlots = async (req: Request, res: Response) => {
             leaveBlocks.push({ startM: parseMins(String(d.start_time || '00:00').slice(0, 5)), endM: parseMins(String(d.end_time || '23:59').slice(0, 5)) });
         }
 
-        const { data: blockTimeRows, error: blockTimeErr } = await supabase
+        const { data: blockTimeRows, error: blockTimeErr } = await adminSupabase
             .from('provider_block_times')
             .select('start_time, end_time')
             .eq('provider_id', providerId)
