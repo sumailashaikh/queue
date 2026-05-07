@@ -1275,10 +1275,18 @@ export const getProviderBlockTimes = async (req: Request, res: Response) => {
         const { id } = req.params;
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
         const { adminSupabase } = require('../config/supabaseClient');
+        const { data: providerRow } = await adminSupabase
+            .from('service_providers')
+            .select('id, business_id, businesses!service_providers_business_id_fkey(timezone)')
+            .eq('id', id)
+            .maybeSingle();
+        const timezone = (providerRow as any)?.businesses?.timezone || 'UTC';
+        const todayDate = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
         const { data, error } = await supabase
             .from('provider_block_times')
             .select('*')
             .eq('provider_id', id)
+            .eq('block_date', todayDate)
             .order('block_date', { ascending: true })
             .order('start_time', { ascending: true });
         if (error) {
@@ -1288,6 +1296,7 @@ export const getProviderBlockTimes = async (req: Request, res: Response) => {
                     .select('id, provider_id, business_id, day_off_date, start_time, end_time, reason')
                     .eq('provider_id', id)
                     .eq('day_off_type', 'partial')
+                    .eq('day_off_date', todayDate)
                     .order('day_off_date', { ascending: true })
                     .order('start_time', { ascending: true });
 
@@ -1316,6 +1325,8 @@ export const getProviderBlockTimes = async (req: Request, res: Response) => {
                     .eq('provider_id', id)
                     .eq('status', 'APPROVED')
                     .eq('leave_kind', 'HALF_DAY')
+                    .eq('start_date', todayDate)
+                    .eq('end_date', todayDate)
                     .order('start_date', { ascending: true });
                 if (leaveErr) throw leaveErr;
 
@@ -1360,7 +1371,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
 
         const { data: biz } = await adminSupabase
             .from('businesses')
-            .select('id, owner_id')
+            .select('id, owner_id, timezone')
             .eq('id', provider.business_id)
             .maybeSingle();
         const isOwner = biz?.owner_id === userId;
@@ -1377,6 +1388,10 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'End time must be after start time' });
         }
         const normalizedDate = String(block_date).slice(0, 10);
+        const todayDate = new Date().toLocaleDateString('en-CA', { timeZone: biz?.timezone || 'UTC' });
+        if (normalizedDate !== todayDate) {
+            return res.status(400).json({ status: 'error', message: 'Only current-day block out is allowed.' });
+        }
         const { data: existing, error: existingErr } = await adminSupabase
             .from('provider_block_times')
             .select('id, start_time, end_time')
