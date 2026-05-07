@@ -1367,7 +1367,17 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                         status: 'APPROVED',
                         approved_by: userId
                     };
-                    const leaveIns = await adminSupabase.from('provider_leaves').insert([leavePayload]).select().maybeSingle();
+                    const fallbackTypeCandidates = ['EMERGENCY', 'emergency', 'OTHER', 'other', 'SICK', 'sick', 'HOLIDAY', 'holiday'];
+                    let leaveIns: { data: any; error: any } = { data: null, error: null };
+                    for (const candidate of fallbackTypeCandidates) {
+                        const attemptPayload = { ...leavePayload, leave_type: candidate };
+                        leaveIns = await adminSupabase.from('provider_leaves').insert([attemptPayload]).select().maybeSingle();
+                        if (!leaveIns.error) break;
+                        const msg = String(leaveIns.error?.message || '');
+                        if (!/leave_type/i.test(msg) && !/check constraint/i.test(msg)) {
+                            break;
+                        }
+                    }
                     if (leaveIns.error) throw leaveIns.error;
                     return res.status(201).json({
                         status: 'success',

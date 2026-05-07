@@ -1103,6 +1103,44 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
                         : 'The selected employee is currently unavailable for the selected date/time. Please choose another employee.'
                 });
             }
+
+            // Extra hard-check for approved leave overlap at the exact appointment slot.
+            // This protects public booking even if provider availability tables are inconsistent.
+            const slotStartDate = new Date(start_time);
+            const slotEndDate = new Date(calculatedEndTime);
+            const slotDate = slotStartDate.toLocaleDateString('en-CA', { timeZone: timezone });
+            const toMins = (d: Date) => getLocalMinutes(timezone, d);
+            const slotStartM = toMins(slotStartDate);
+            const slotEndM = toMins(slotEndDate);
+
+            const { data: providerLeaves } = await adminSupabase
+                .from('provider_leaves')
+                .select('leave_kind, start_time, end_time, status')
+                .eq('provider_id', providerRow.id)
+                .eq('business_id', providerRow.business_id)
+                .lte('start_date', slotDate)
+                .gte('end_date', slotDate);
+
+            const leaveOverlap = (providerLeaves || []).some((l: any) => {
+                const status = String(l.status || '').toUpperCase().replace(/\s+/g, '_');
+                if (!status.startsWith('APPROVED')) return false;
+                const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
+                if (kind === 'FULL_DAY') return true;
+                const parse = (t: string) => {
+                    const [hh, mm] = String(t || '00:00').split(':').map(Number);
+                    return (Number(hh) || 0) * 60 + (Number(mm) || 0);
+                };
+                const leaveStart = parse(String(l.start_time || '00:00').slice(0, 5));
+                const leaveEnd = parse(String(l.end_time || '23:59').slice(0, 5));
+                return slotStartM < leaveEnd && leaveStart < slotEndM;
+            });
+
+            if (leaveOverlap) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'The selected employee is on leave for this day/time. Please choose another employee.'
+                });
+            }
         }
 
         let publicInsertPayload: any = {
