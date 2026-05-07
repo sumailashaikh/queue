@@ -140,6 +140,50 @@ const isMissingTableError = (error: any, tableName: string): boolean => {
     );
 };
 
+const normalizeBlockoutReason = (input: any): string => {
+    const raw = String(input || '').trim().toLowerCase().replace(/[_-]+/g, ' ');
+    if (!raw) return 'other';
+    const map: Record<string, string> = {
+        lunch: 'lunch_break',
+        'lunch break': 'lunch_break',
+        tea: 'tea_break',
+        'tea break': 'tea_break',
+        outside: 'outside_work',
+        'outside work': 'outside_work',
+        emergency: 'emergency',
+        meeting: 'meeting',
+        personal: 'personal_work',
+        'personal work': 'personal_work',
+        other: 'other',
+    };
+    return map[raw] || 'other';
+};
+
+async function syncEmployeeBlockoutFromProviderBlock(
+    adminSupabase: any,
+    providerId: string,
+    businessId: string,
+    startIso: string,
+    endIso: string,
+    reason: string,
+    note: string | null
+) {
+    const ins = await adminSupabase
+        .from('employee_blockouts')
+        .insert([{
+            employee_id: providerId,
+            business_id: businessId,
+            reason,
+            note,
+            start_time: startIso,
+            end_time: endIso,
+            status: 'active'
+        }])
+        .select('id')
+        .maybeSingle();
+    if (ins.error && !isMissingTableError(ins.error, 'employee_blockouts')) throw ins.error;
+}
+
 const validateTextByLanguage = (text: string, language: string): boolean => {
     if (!text || !text.trim()) return true;
     const baseLang = (language || 'en').split('-')[0].toLowerCase();
@@ -431,9 +475,21 @@ export const getServiceProviders = async (req: Request, res: Response) => {
 
         // Determine the target date for availability
         const targetDateStr = date ? String(date) : new Date().toLocaleDateString('en-CA', { timeZone: timezone });
+        // Auto-expire active employee blockouts
+        try {
+            await adminSupabase
+                .from('employee_blockouts')
+                .update({ status: 'completed' })
+                .eq('business_id', targetBusinessId as string)
+                .eq('status', 'active')
+                .lte('end_time', new Date().toISOString());
+        } catch {
+            // Ignore on environments where the table does not exist yet.
+        }
 
         // Enhancement: Fetch leaves for these providers to compute "upcoming" / on-leave (approved only)
         let allRecentLeaves: any[] = [];
+        let allTodayBlockTimes: any[] = [];
         if (providers && providers.length > 0) {
             const providerIds = providers.map((p: any) => p.id);
             const { data: recentLeaves } = await adminSupabase
@@ -442,13 +498,29 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 .in('provider_id', providerIds)
                 .gte('end_date', targetDateStr);
             if (recentLeaves) allRecentLeaves = recentLeaves.filter(isBlockingApprovedLeave);
+            const { data: blockRows, error: blockErr } = await adminSupabase
+                .from('provider_block_times')
+                .select('id, provider_id, block_date, start_time, end_time, reason')
+                .in('provider_id', providerIds)
+                .eq('block_date', targetDateStr);
+            if (!blockErr) allTodayBlockTimes = blockRows || [];
         }
 
         // Enhance with current task count and availability
         const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: timezone });
         const now = new Date();
+        const nowLocalTime = now.toLocaleTimeString('en-GB', {
+            timeZone: timezone,
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit'
+        }).slice(0, 5);
         const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
         const tomorrowStr = tomorrow.toLocaleDateString('en-CA', { timeZone: timezone });
+        const toMinutes = (value: string) => {
+            const [h, m] = String(value || '00:00').slice(0, 5).split(':').map(Number);
+            return (Number(h) || 0) * 60 + (Number(m) || 0);
+        };
 
         const enhancedProviders = await Promise.all((providers || []).map(async (p: any) => {
             let currentTasksCount = 0;
@@ -474,10 +546,31 @@ export const getServiceProviders = async (req: Request, res: Response) => {
             const providerLeaves = allRecentLeaves.filter((l: any) => l.provider_id === p.id);
             const currentLeave = providerLeaves.find((l: any) => l.start_date <= targetDateStr && l.end_date >= targetDateStr);
             const upcomingLeave = providerLeaves.find((l: any) => l.start_date > targetDateStr && l.start_date <= tomorrowStr);
+            const providerBlocks = allTodayBlockTimes
+                .filter((b: any) => b.provider_id === p.id)
+                .sort((a: any, b: any) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
+            const activeBlock = providerBlocks.find((b: any) => {
+                const s = toMinutes(String(b.start_time || '').slice(0, 5));
+                const e = toMinutes(String(b.end_time || '').slice(0, 5));
+                const n = toMinutes(nowLocalTime);
+                return n >= s && n < e;
+            });
 
             let leave_status = 'available';
             let leave_until = null;
             let leave_starts_at = null;
+            let temporary_unavailable = false;
+            let temporary_unavailable_reason = null;
+            let temporary_unavailable_until = null;
+            let temporary_unavailable_remaining_minutes = 0;
+            if (activeBlock) {
+                const nowM = toMinutes(nowLocalTime);
+                const endM = toMinutes(String(activeBlock.end_time || '').slice(0, 5));
+                temporary_unavailable = true;
+                temporary_unavailable_reason = normalizeBlockoutReason(activeBlock.reason);
+                temporary_unavailable_until = String(activeBlock.end_time || '').slice(0, 5);
+                temporary_unavailable_remaining_minutes = Math.max(0, endM - nowM);
+            }
 
             if (currentLeave) {
                 leave_status = 'on_leave';
@@ -489,10 +582,14 @@ export const getServiceProviders = async (req: Request, res: Response) => {
 
             return {
                 ...p,
-                is_available: leave_status === 'available' && p.is_active !== false,
+                is_available: leave_status === 'available' && !temporary_unavailable && p.is_active !== false,
                 leave_status,
                 leave_until,
                 leave_starts_at,
+                temporary_unavailable,
+                temporary_unavailable_reason,
+                temporary_unavailable_until,
+                temporary_unavailable_remaining_minutes,
                 current_tasks_count: currentTasksCount,
                 services: p.services?.map((ps: any) => ps.services).filter(Boolean) || []
             };
@@ -1357,7 +1454,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
     try {
         const { id } = req.params;
         const userId = req.user?.id;
-        const { block_date, start_time, end_time, reason } = req.body || {};
+        const { block_date, start_time, end_time, reason, note } = req.body || {};
         const { adminSupabase } = require('../config/supabaseClient');
         if (!userId) return res.status(401).json({ status: 'error', message: 'Unauthorized' });
         if (!block_date || !start_time || !end_time) return res.status(400).json({ status: 'error', message: 'block_date, start_time, end_time are required' });
@@ -1471,6 +1568,21 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
         if (hasOverlap) {
             return res.status(400).json({ status: 'error', message: 'Block time overlaps an existing slot' });
         }
+        const nowTime = new Date().toLocaleTimeString('en-GB', {
+            timeZone: biz?.timezone || 'UTC',
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit'
+        }).slice(0, 5);
+        const hasActiveBlock = (existing || []).some((r: any) => {
+            const es = toMinutes(String(r.start_time || '').slice(0, 5));
+            const ee = toMinutes(String(r.end_time || '').slice(0, 5));
+            const n = toMinutes(nowTime);
+            return n >= es && n < ee;
+        });
+        if (hasActiveBlock) {
+            return res.status(400).json({ status: 'error', message: 'An active temporary unavailability already exists.' });
+        }
 
         const payload = {
             provider_id: id,
@@ -1478,11 +1590,54 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             block_date: normalizedDate,
             start_time: String(start_time).slice(0, 5),
             end_time: String(end_time).slice(0, 5),
-            reason: reason || null,
+            reason: normalizeBlockoutReason(reason),
             created_by: userId
         };
         const { data, error } = await adminSupabase.from('provider_block_times').insert([payload]).select().maybeSingle();
         if (error) throw error;
+        try {
+            const startIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00`;
+            const endIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00`;
+            await syncEmployeeBlockoutFromProviderBlock(
+                adminSupabase,
+                id,
+                provider.business_id,
+                startIso,
+                endIso,
+                normalizeBlockoutReason(reason),
+                note || null
+            );
+            const { data: impacted } = await adminSupabase
+                .from('appointment_services')
+                .select(`
+                    appointment_id,
+                    appointments:appointment_id(
+                        id,
+                        user_id,
+                        guest_phone,
+                        start_time,
+                        status,
+                        profiles:user_id(phone)
+                    )
+                `)
+                .eq('assigned_provider_id', id)
+                .gte('appointments.start_time', startIso)
+                .lte('appointments.start_time', endIso)
+                .in('appointments.status', ['confirmed', 'checked_in', 'in_service', 'rescheduled']);
+            const { notificationService } = require('../services/notificationService');
+            for (const row of impacted || []) {
+                const appt = (row as any).appointments;
+                const to = appt?.guest_phone || appt?.profiles?.phone;
+                if (!to) continue;
+                const message = `Your assigned employee is temporarily unavailable until ${String(end_time).slice(0, 5)}. Please wait or reschedule.`;
+                await Promise.allSettled([
+                    notificationService.sendWhatsApp(String(to), message),
+                    notificationService.sendSMS(String(to), message)
+                ]);
+            }
+        } catch {
+            // Backward-compatible: keep provider_block_times success even if employee_blockouts table is absent.
+        }
         return res.status(201).json({ status: 'success', data });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
@@ -1543,7 +1698,7 @@ export const deleteProviderBlockTime = async (req: Request, res: Response) => {
 
         const { data: row } = await adminSupabase
             .from('provider_block_times')
-            .select('id, business_id, provider_id')
+            .select('id, business_id, provider_id, block_date, start_time, end_time')
             .eq('id', blockId)
             .maybeSingle();
         if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
@@ -1562,7 +1717,22 @@ export const deleteProviderBlockTime = async (req: Request, res: Response) => {
         const isSelf = provider?.user_id === userId;
         if (!biz || (!isOwner && !isSelf)) return res.status(403).json({ status: 'error', message: 'Unauthorized' });
 
+        const blockRow = row;
         await adminSupabase.from('provider_block_times').delete().eq('id', blockId);
+        try {
+            const startIso = `${String(blockRow.block_date || '').slice(0, 10)}T${String(blockRow.start_time || '').slice(0, 5)}:00`;
+            const endIso = `${String(blockRow.block_date || '').slice(0, 10)}T${String(blockRow.end_time || '').slice(0, 5)}:00`;
+            await adminSupabase
+                .from('employee_blockouts')
+                .update({ status: 'cancelled' })
+                .eq('employee_id', row.provider_id)
+                .eq('business_id', row.business_id)
+                .eq('start_time', startIso)
+                .eq('end_time', endIso)
+                .eq('status', 'active');
+        } catch {
+            // Ignore if employee_blockouts table is unavailable.
+        }
         return res.status(200).json({ status: 'success', message: 'Block time removed' });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
@@ -1639,7 +1809,7 @@ export const updateProviderBlockTime = async (req: Request, res: Response) => {
 
         const { data: row } = await adminSupabase
             .from('provider_block_times')
-            .select('id, business_id, provider_id')
+            .select('id, business_id, provider_id, block_date, start_time, end_time')
             .eq('id', blockId)
             .maybeSingle();
         if (!row) return res.status(404).json({ status: 'error', message: 'Block time not found' });
@@ -1693,12 +1863,33 @@ export const updateProviderBlockTime = async (req: Request, res: Response) => {
                 block_date: dateValue,
                 start_time: startValue,
                 end_time: endValue,
-                reason: reason ?? null
+                reason: normalizeBlockoutReason(reason)
             })
             .eq('id', blockId)
             .select()
             .maybeSingle();
         if (error) throw error;
+        try {
+            const oldStartIso = `${String(row.block_date || '').slice(0, 10)}T${String(row.start_time || '').slice(0, 5)}:00`;
+            const oldEndIso = `${String(row.block_date || '').slice(0, 10)}T${String(row.end_time || '').slice(0, 5)}:00`;
+            const newStartIso = `${dateValue}T${startValue}:00`;
+            const newEndIso = `${dateValue}T${endValue}:00`;
+            await adminSupabase
+                .from('employee_blockouts')
+                .update({
+                    start_time: newStartIso,
+                    end_time: newEndIso,
+                    reason: normalizeBlockoutReason(reason),
+                    note: reason ?? null
+                })
+                .eq('employee_id', row.provider_id)
+                .eq('business_id', row.business_id)
+                .eq('start_time', oldStartIso)
+                .eq('end_time', oldEndIso)
+                .eq('status', 'active');
+        } catch {
+            // Ignore if employee_blockouts is unavailable.
+        }
         return res.status(200).json({ status: 'success', data });
     } catch (error: any) {
         return res.status(500).json({ status: 'error', message: error.message });
@@ -1759,7 +1950,11 @@ export const assignProviderToEntry = async (req: Request, res: Response) => {
                 new Date()
             );
             if (!availability.available) {
-                return res.status(400).json({ status: 'error', message: `Provider unavailable: ${availability.reason}` });
+                const untilText = availability.unavailable_until ? ` until ${availability.unavailable_until}` : '';
+                return res.status(400).json({
+                    status: 'error',
+                    message: `Employee is temporarily unavailable${untilText}. Please choose another employee or another time slot.`
+                });
             }
         }
 

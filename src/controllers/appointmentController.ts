@@ -112,8 +112,9 @@ async function notifyOwnerForNewAppointment(
 export const createAppointment = async (req: Request, res: Response) => {
     try {
         const userId = req.user?.id;
-        const { business_id, service_ids, start_time, end_time, employee_id } = req.body; // service_ids is now an array
+        const { business_id, service_ids, start_time, end_time, employee_id, allow_override } = req.body; // service_ids is now an array
         const supabase = req.supabase || require('../config/supabaseClient').supabase;
+        const { adminSupabase } = require('../config/supabaseClient');
 
         if (!userId) {
             return res.status(401).json({
@@ -132,7 +133,7 @@ export const createAppointment = async (req: Request, res: Response) => {
         // Check business hours
         const { data: business, error: bizError } = await supabase
             .from('businesses')
-            .select('name, open_time, close_time, staff_open_time, staff_close_time, is_closed, timezone')
+            .select('name, owner_id, open_time, close_time, staff_open_time, staff_close_time, is_closed, timezone')
             .eq('id', business_id)
             .single();
 
@@ -200,6 +201,17 @@ export const createAppointment = async (req: Request, res: Response) => {
         }
 
         const calculatedEndTime = end_time || new Date(new Date(start_time).getTime() + totalDuration * 60000).toISOString();
+        let canOverrideAvailability = false;
+        if (allow_override) {
+            const { data: myProfile } = await supabase
+                .from('profiles')
+                .select('role, business_id')
+                .eq('id', userId)
+                .maybeSingle();
+            const role = String(myProfile?.role || '').toLowerCase();
+            canOverrideAvailability = String((business as any)?.owner_id || '') === String(userId)
+                || (myProfile?.business_id === business_id && role === 'admin');
+        }
 
         let employeeProviderId: string | null = null;
         if (employee_id) {
@@ -210,6 +222,28 @@ export const createAppointment = async (req: Request, res: Response) => {
                 .eq('business_id', business_id)
                 .maybeSingle();
             employeeProviderId = providerRow?.id || null;
+            if (employeeProviderId) {
+                const availabilityAtSlot = await checkProviderAvailabilityAt(
+                    adminSupabase,
+                    employeeProviderId,
+                    business_id,
+                    timezone,
+                    new Date(start_time)
+                );
+                if (!availabilityAtSlot.available) {
+                    if (canOverrideAvailability) {
+                        // Allow owner/admin override explicitly.
+                    } else {
+                    const untilText = availabilityAtSlot.unavailable_until
+                        ? ` until ${availabilityAtSlot.unavailable_until}`
+                        : '';
+                    return res.status(400).json({
+                        status: 'error',
+                        message: `Employee is temporarily unavailable${untilText}. Please choose another employee or another time slot.`
+                    });
+                    }
+                }
+            }
         }
 
         let insertPayload: any = {
@@ -1095,12 +1129,15 @@ export const bookPublicAppointment = async (req: Request, res: Response) => {
                     reason === 'leave_partial' ||
                     reason === 'day_off' ||
                     reason === 'day_off_partial';
+                const untilText = availabilityAtSlot.unavailable_until
+                    ? ` until ${availabilityAtSlot.unavailable_until}`
+                    : '';
 
                 return res.status(400).json({
                     status: 'error',
                     message: leaveLike
                         ? 'The selected employee is on leave for this day/time. Please choose another employee.'
-                        : 'The selected employee is currently unavailable for the selected date/time. Please choose another employee.'
+                        : `Employee is temporarily unavailable${untilText}. Please choose another employee or another time slot.`
                 });
             }
 

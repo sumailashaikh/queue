@@ -9,7 +9,7 @@ export async function checkProviderAvailabilityAt(
   businessId: string,
   businessTimezone: string = "UTC",
   at: Date = new Date(),
-): Promise<{ available: boolean; reason?: string }> {
+): Promise<{ available: boolean; reason?: string; unavailable_until?: string; blockout_reason?: string }> {
   const dateStr = at.toLocaleDateString("en-CA", { timeZone: businessTimezone });
   const dayOfWeek = new Date(`${dateStr}T12:00:00`).getDay();
   const nowLocal = at.toLocaleTimeString("en-GB", {
@@ -20,7 +20,7 @@ export async function checkProviderAvailabilityAt(
   });
   const nowMins = toMinutes(nowLocal);
 
-  const [{ data: weekly }, { data: dayOffs }, { data: blockTimes }, { data: leaves }] = await Promise.all([
+  const [{ data: weekly }, { data: dayOffs }, { data: blockTimes }, { data: leaves }, employeeBlockoutsResult] = await Promise.all([
     adminSupabase
       .from("provider_availability")
       .select("day_of_week, start_time, end_time, is_available")
@@ -47,7 +47,16 @@ export async function checkProviderAvailabilityAt(
       .eq("business_id", businessId)
       .lte("start_date", dateStr)
       .gte("end_date", dateStr),
+    adminSupabase
+      .from("employee_blockouts")
+      .select("start_time, end_time, reason, status")
+      .eq("employee_id", providerId)
+      .eq("business_id", businessId)
+      .eq("status", "active")
+      .lte("start_time", at.toISOString())
+      .gt("end_time", at.toISOString()),
   ]);
+  const employeeBlockouts = !employeeBlockoutsResult?.error ? (employeeBlockoutsResult?.data || []) : [];
 
   // Backward-compatible behavior:
   // if weekly hours are not configured yet, treat provider as available
@@ -74,7 +83,28 @@ export async function checkProviderAvailabilityAt(
   for (const b of blockTimes || []) {
     const s = toMinutes(String(b.start_time || "00:00").slice(0, 5));
     const e = toMinutes(String(b.end_time || "23:59").slice(0, 5));
-    if (nowMins >= s && nowMins < e) return { available: false, reason: "blocked_time" };
+    if (nowMins >= s && nowMins < e) {
+      return {
+        available: false,
+        reason: "blocked_time",
+        unavailable_until: String(b.end_time || "").slice(0, 5),
+      };
+    }
+  }
+
+  if ((employeeBlockouts || []).length > 0) {
+    const activeBlock = employeeBlockouts[0];
+    return {
+      available: false,
+      reason: "temporarily_unavailable",
+      unavailable_until: new Date(activeBlock.end_time).toLocaleTimeString("en-GB", {
+        timeZone: businessTimezone,
+        hour12: false,
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+      blockout_reason: activeBlock.reason || null,
+    };
   }
 
   for (const l of leaves || []) {
