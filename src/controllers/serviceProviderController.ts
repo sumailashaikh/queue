@@ -1329,11 +1329,39 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'End time must be after start time' });
         }
         const normalizedDate = String(block_date).slice(0, 10);
-        const { data: existing } = await adminSupabase
+        const { data: existing, error: existingErr } = await adminSupabase
             .from('provider_block_times')
             .select('id, start_time, end_time')
             .eq('provider_id', id)
             .eq('block_date', normalizedDate);
+        if (existingErr && isMissingTableError(existingErr, 'provider_block_times')) {
+            // Fallback path for deployments where provider_block_times table is not present yet.
+            const fallbackPayload = {
+                provider_id: id,
+                business_id: provider.business_id,
+                day_off_date: normalizedDate,
+                day_off_type: 'partial',
+                start_time: String(start_time).slice(0, 5),
+                end_time: String(end_time).slice(0, 5),
+                reason: reason || null,
+                created_by: userId
+            };
+            const { data: fallbackRow, error: fallbackErr } = await adminSupabase
+                .from('provider_day_offs')
+                .insert([fallbackPayload])
+                .select()
+                .maybeSingle();
+            if (fallbackErr) throw fallbackErr;
+            return res.status(201).json({
+                status: 'success',
+                data: {
+                    ...(fallbackRow || {}),
+                    source: 'provider_day_offs_fallback',
+                    block_date: normalizedDate
+                }
+            });
+        }
+        if (existingErr) throw existingErr;
         const hasOverlap = (existing || []).some((r: any) => {
             const es = toMinutes(String(r.start_time || '').slice(0, 5));
             const ee = toMinutes(String(r.end_time || '').slice(0, 5));
