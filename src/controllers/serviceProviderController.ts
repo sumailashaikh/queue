@@ -1351,7 +1351,35 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 .insert([fallbackPayload])
                 .select()
                 .maybeSingle();
-            if (fallbackErr) throw fallbackErr;
+            if (fallbackErr) {
+                if (isMissingTableError(fallbackErr, 'provider_day_offs')) {
+                    // Final fallback for older schemas: write to provider_leaves directly.
+                    const leavePayload: any = {
+                        provider_id: id,
+                        business_id: provider.business_id,
+                        start_date: normalizedDate,
+                        end_date: normalizedDate,
+                        leave_type: 'EMERGENCY',
+                        leave_kind: 'HALF_DAY',
+                        start_time: String(start_time).slice(0, 5),
+                        end_time: String(end_time).slice(0, 5),
+                        note: reason || null,
+                        status: 'APPROVED',
+                        approved_by: userId
+                    };
+                    const leaveIns = await adminSupabase.from('provider_leaves').insert([leavePayload]).select().maybeSingle();
+                    if (leaveIns.error) throw leaveIns.error;
+                    return res.status(201).json({
+                        status: 'success',
+                        data: {
+                            ...(leaveIns.data || {}),
+                            source: 'provider_leaves_fallback',
+                            block_date: normalizedDate
+                        }
+                    });
+                }
+                throw fallbackErr;
+            }
             return res.status(201).json({
                 status: 'success',
                 data: {
@@ -3293,19 +3321,28 @@ export const getLeaveAlerts = async (req: Request, res: Response) => {
                 leave_kind,
                 status,
                 note,
+                created_at,
                 service_providers(id, name)
             `)
             .eq('business_id', business_id)
-            .order('start_date', { ascending: true })
-            .limit(25);
+            .order('created_at', { ascending: false })
+            .limit(200);
 
         const normalizedLeaves = (leaves || []).filter((lv: any) => {
             const status = String(lv?.status || '').toUpperCase().replace(/\s+/g, '_');
             return status === 'APPROVED' || status.startsWith('PENDING');
         });
+        normalizedLeaves.sort((a: any, b: any) => {
+            const aStatus = String(a?.status || '').toUpperCase().replace(/\s+/g, '_');
+            const bStatus = String(b?.status || '').toUpperCase().replace(/\s+/g, '_');
+            const aPending = aStatus.startsWith('PENDING');
+            const bPending = bStatus.startsWith('PENDING');
+            if (aPending !== bPending) return aPending ? -1 : 1;
+            return String(b?.created_at || '').localeCompare(String(a?.created_at || ''));
+        });
 
         const alerts = await Promise.all(
-            normalizedLeaves.map(async (lv: any) => {
+            normalizedLeaves.slice(0, 50).map(async (lv: any) => {
                 const providerId = String(lv.provider_id || '');
                 const startDate = String(lv.start_date || '').slice(0, 10);
                 const endDate = String(lv.end_date || '').slice(0, 10);

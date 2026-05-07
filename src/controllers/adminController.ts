@@ -515,7 +515,7 @@ export const createUser = async (req: any, res: Response) => {
  */
 export const inviteEmployee = async (req: any, res: Response) => {
     try {
-        const { phone, full_name, business_id, role, custom_message } = req.body;
+        const { phone, full_name, business_id, role, custom_message, ui_language } = req.body;
         const supabase = req.supabase;
         const userId = req.user?.id;
         const normalizedPhone = String(phone || '').replace(/[^\d+]/g, '');
@@ -541,7 +541,7 @@ export const inviteEmployee = async (req: any, res: Response) => {
         // 2. Check if user already exists
         const { data: profile } = await adminSupabase
             .from('profiles')
-            .select('id, full_name')
+            .select('id, full_name, ui_language')
             .eq('phone', normalizedPhone)
             .maybeSingle();
 
@@ -657,8 +657,8 @@ export const inviteEmployee = async (req: any, res: Response) => {
             .select('ui_language')
             .eq('id', userId)
             .maybeSingle();
-        const ownerLang = String((business as any)?.language || ownerProfile?.ui_language || 'en');
-        const defaultMsg = getInviteDefaultMessage(ownerLang, full_name || 'there', business.name, inviteUrl);
+        const inviteLang = String(profile?.ui_language || ui_language || (business as any)?.language || ownerProfile?.ui_language || 'en');
+        const defaultMsg = getInviteDefaultMessage(inviteLang, full_name || 'there', business.name, inviteUrl);
         const msg = custom_message ? `${custom_message}\n\n${inviteUrl}` : defaultMsg;
         
         const { notificationService } = require('../services/notificationService');
