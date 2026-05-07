@@ -542,10 +542,34 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 currentTasksCount = busyTasks?.length || 0;
             }
 
-            // Compute leave status
+            // Compute leave status (time-aware for partial-day leaves)
             const providerLeaves = allRecentLeaves.filter((l: any) => l.provider_id === p.id);
-            const currentLeave = providerLeaves.find((l: any) => l.start_date <= targetDateStr && l.end_date >= targetDateStr);
-            const upcomingLeave = providerLeaves.find((l: any) => l.start_date > targetDateStr && l.start_date <= tomorrowStr);
+            const currentLeave = providerLeaves.find((l: any) => {
+                if (!(l.start_date <= targetDateStr && l.end_date >= targetDateStr)) return false;
+                const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
+                if (kind === 'FULL_DAY') return true;
+                if (targetDateStr !== todayStr) return true;
+                const s = toMinutes(String(l.start_time || '00:00').slice(0, 5));
+                const e = toMinutes(String(l.end_time || '23:59').slice(0, 5));
+                const n = toMinutes(nowLocalTime);
+                return n >= s && n < e;
+            });
+            const upcomingLeave = providerLeaves
+                .filter((l: any) => {
+                    const kind = String(l.leave_kind || 'FULL_DAY').toUpperCase();
+                    if (l.start_date > targetDateStr && l.start_date <= tomorrowStr) return true;
+                    if (targetDateStr === todayStr && l.start_date === targetDateStr && kind !== 'FULL_DAY') {
+                        const s = toMinutes(String(l.start_time || '00:00').slice(0, 5));
+                        const n = toMinutes(nowLocalTime);
+                        return n < s;
+                    }
+                    return false;
+                })
+                .sort((a: any, b: any) => {
+                    const ad = `${String(a.start_date || '')} ${String(a.start_time || '00:00')}`;
+                    const bd = `${String(b.start_date || '')} ${String(b.start_time || '00:00')}`;
+                    return ad.localeCompare(bd);
+                })[0];
             const providerBlocks = allTodayBlockTimes
                 .filter((b: any) => b.provider_id === p.id)
                 .sort((a: any, b: any) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
@@ -577,7 +601,10 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 leave_until = currentLeave.end_date;
             } else if (upcomingLeave) {
                 leave_status = 'upcoming';
-                leave_starts_at = upcomingLeave.start_date;
+                const kind = String(upcomingLeave.leave_kind || 'FULL_DAY').toUpperCase();
+                leave_starts_at = kind === 'FULL_DAY' || !upcomingLeave.start_time
+                    ? upcomingLeave.start_date
+                    : `${upcomingLeave.start_date} ${String(upcomingLeave.start_time).slice(0, 5)}`;
             }
 
             return {
