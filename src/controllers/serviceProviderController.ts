@@ -1572,8 +1572,8 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'End time must be after start time' });
         }
         const normalizedDate = String(block_date).slice(0, 10);
-        const requestedStartIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00Z`;
-        const requestedEndIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00Z`;
+        const requestedStartIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00`;
+        const requestedEndIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00`;
         // Auto-clean stale active rows before validating overlaps.
         await adminSupabase
             .from('employee_blockouts')
@@ -1724,12 +1724,8 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             .gte('end_date', normalizedDate)
             .in('status', ['APPROVED', 'approved']);
         if (leaveOverlapRowsRes.error && isMissingColumnError(leaveOverlapRowsRes.error, 'status')) {
-            leaveOverlapRowsRes = await adminSupabase
-                .from('provider_leaves')
-                .select('id, start_date, end_date, start_time, end_time, leave_kind')
-                .eq('provider_id', id)
-                .lte('start_date', normalizedDate)
-                .gte('end_date', normalizedDate);
+            // Strict approved-only behavior: if status column is unavailable, do not block by leave.
+            leaveOverlapRowsRes = { data: [], error: null } as any;
         }
         if (!leaveOverlapRowsRes.error) {
             const leaveOverlapRows = (leaveOverlapRowsRes.data || []).filter((lv: any) => !isBlockoutFallbackLeave(lv));
