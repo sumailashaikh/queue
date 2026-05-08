@@ -1706,7 +1706,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 .gte('end_date', normalizedDate);
         }
         if (!leaveOverlapRowsRes.error) {
-            const leaveOverlapRows = leaveOverlapRowsRes.data || [];
+            const leaveOverlapRows = (leaveOverlapRowsRes.data || []).filter((lv: any) => !isBlockoutFallbackLeave(lv));
             hasLeaveOverlap = leaveOverlapRows.some((lv: any) => {
                 const kind = String(lv?.leave_kind || 'FULL_DAY').toUpperCase();
                 if (kind === 'FULL_DAY') return true;
