@@ -494,6 +494,7 @@ export const getServiceProviders = async (req: Request, res: Response) => {
         // Enhancement: Fetch leaves for these providers to compute "upcoming" / on-leave (approved only)
         let allRecentLeaves: any[] = [];
         let allTodayBlockTimes: any[] = [];
+        let employeeBlockoutsToday: any[] = [];
         if (providers && providers.length > 0) {
             const providerIds = providers.map((p: any) => p.id);
             const { data: recentLeaves } = await adminSupabase
@@ -508,6 +509,16 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                 .in('provider_id', providerIds)
                 .eq('block_date', targetDateStr);
             if (!blockErr) allTodayBlockTimes = blockRows || [];
+            const { data: employeeBlocks, error: empBlockErr } = await adminSupabase
+                .from('employee_blockouts')
+                .select('id, employee_id, start_time, end_time, reason, status')
+                .in('employee_id', providerIds)
+                .eq('status', 'active');
+            if (!empBlockErr) {
+                employeeBlockoutsToday = (employeeBlocks || []).filter((b: any) =>
+                    String(b?.start_time || '').slice(0, 10) === targetDateStr
+                );
+            }
         }
 
         // Enhance with current task count and availability
@@ -579,6 +590,15 @@ export const getServiceProviders = async (req: Request, res: Response) => {
             const providerBlocks = allTodayBlockTimes
                 .filter((b: any) => b.provider_id === p.id)
                 .sort((a: any, b: any) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
+            const providerEmployeeBlocks = employeeBlockoutsToday
+                .filter((b: any) => String(b.employee_id || '') === String(p.id))
+                .map((b: any) => ({
+                    provider_id: p.id,
+                    start_time: String(b.start_time || '').slice(11, 16),
+                    end_time: String(b.end_time || '').slice(11, 16),
+                    reason: String(b.reason || 'other')
+                }))
+                .sort((a: any, b: any) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
             const providerFallbackBlocks = providerBlockoutFallbackLeaves
                 .filter((l: any) => String(l.start_date || '') === targetDateStr)
                 .map((l: any) => ({
@@ -588,16 +608,24 @@ export const getServiceProviders = async (req: Request, res: Response) => {
                     reason: String(l.note || '').replace(/^\[BLOCK_OUT\]\s*/, '').trim() || 'other'
                 }))
                 .sort((a: any, b: any) => String(a.start_time || '').localeCompare(String(b.start_time || '')));
-            const combinedBlocks = [...providerBlocks, ...providerFallbackBlocks].sort((a: any, b: any) =>
+            const combinedBlocks = [...providerBlocks, ...providerEmployeeBlocks, ...providerFallbackBlocks].sort((a: any, b: any) =>
                 String(a.start_time || '').localeCompare(String(b.start_time || ''))
             );
-            const activeBlock = combinedBlocks.find((b: any) => {
+            // Ignore already-finished blocks for today's "live availability" view.
+            const effectiveBlocks = targetDateStr === todayStr
+                ? combinedBlocks.filter((b: any) => {
+                    const e = toMinutes(String(b.end_time || '').slice(0, 5));
+                    const n = toMinutes(nowLocalTime);
+                    return e > n;
+                })
+                : combinedBlocks;
+            const activeBlock = effectiveBlocks.find((b: any) => {
                 const s = toMinutes(String(b.start_time || '').slice(0, 5));
                 const e = toMinutes(String(b.end_time || '').slice(0, 5));
                 const n = toMinutes(nowLocalTime);
                 return n >= s && n < e;
             });
-            const upcomingBlock = combinedBlocks.find((b: any) => {
+            const upcomingBlock = effectiveBlocks.find((b: any) => {
                 const s = toMinutes(String(b.start_time || '').slice(0, 5));
                 const n = toMinutes(nowLocalTime);
                 return n < s;
@@ -1710,6 +1738,30 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 // If DB says overlap but app-level checks found no same-provider overlap,
                 // schema-level constraint may be scoped too broadly (cross-employee clash).
                 if (!hasOverlap && !hasLeaveOverlap) {
+                    const startIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00`;
+                    const endIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00`;
+                    const { data: blockFallback, error: blockFallbackErr } = await adminSupabase
+                        .from('employee_blockouts')
+                        .insert([{
+                            employee_id: id,
+                            business_id: provider.business_id,
+                            reason: normalizeBlockoutReason(reason),
+                            note: note || null,
+                            start_time: startIso,
+                            end_time: endIso,
+                            status: 'active'
+                        }])
+                        .select()
+                        .maybeSingle();
+                    if (!blockFallbackErr && blockFallback) {
+                        return res.status(201).json({
+                            status: 'success',
+                            data: {
+                                ...blockFallback,
+                                source: 'employee_blockouts_fallback'
+                            }
+                        });
+                    }
                     return res.status(400).json({
                         status: 'error',
                         message: 'Block out conflict configuration issue. Please ask admin to run the latest overlap constraint migration.',
