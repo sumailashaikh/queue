@@ -1602,7 +1602,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                             return res.status(400).json({
                                 status: 'error',
                                 message: 'Block time overlaps an existing approved leave or block-out',
-                                message_key: 'providers.err_leave_overlap'
+                                message_key: 'providers.err_blockout_overlap'
                             });
                         }
                         throw leaveIns.error;
@@ -1634,7 +1634,11 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             return startMins < ee && endMins > es;
         });
         if (hasOverlap) {
-            return res.status(400).json({ status: 'error', message: 'Block time overlaps an existing slot' });
+            return res.status(400).json({
+                status: 'error',
+                message: 'Block time overlaps an existing approved leave or block-out',
+                message_key: 'providers.err_blockout_overlap'
+            });
         }
         const nowTime = new Date().toLocaleTimeString('en-GB', {
             timeZone: biz?.timezone || 'UTC',
@@ -1649,7 +1653,11 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             return n >= es && n < ee;
         });
         if (hasActiveBlock) {
-            return res.status(400).json({ status: 'error', message: 'An active temporary unavailability already exists.' });
+            return res.status(400).json({
+                status: 'error',
+                message: 'An active temporary unavailability already exists.',
+                message_key: 'providers.err_blockout_active_exists'
+            });
         }
 
         const payload = {
@@ -1667,7 +1675,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 return res.status(400).json({
                     status: 'error',
                     message: 'Block time overlaps an existing approved leave or block-out',
-                    message_key: 'providers.err_leave_overlap'
+                    message_key: 'providers.err_blockout_overlap'
                 });
             }
             throw error;
