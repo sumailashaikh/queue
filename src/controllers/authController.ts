@@ -58,6 +58,20 @@ function isOtpProviderAuthError(error: unknown): boolean {
     );
 }
 
+/** Align user-visible errors with Twilio Console → Messaging (e.g. 63038 daily cap). */
+function userSafeSmsProviderMessage(error: unknown): string | null {
+    const raw = String((error as any)?.message ?? '').toLowerCase();
+    if (
+        raw.includes('63038') ||
+        raw.includes('daily messages limit') ||
+        raw.includes('maximum amount of messages per 24') ||
+        raw.includes('exceeded the maximum amount of messages')
+    ) {
+        return 'SMS failed (Twilio error 63038): This account exceeded its daily SMS limit. Wait for the 24-hour window to reset, or raise the quota / upgrade the Twilio project — same issue shown under Twilio → Messaging logs.';
+    }
+    return null;
+}
+
 export const sendOtp = async (req: Request, res: Response) => {
     try {
         let { phone } = req.body;
@@ -100,15 +114,18 @@ export const sendOtp = async (req: Request, res: Response) => {
         const raw = String(error?.message || '').toLowerCase();
         const connectivity = userSafeConnectivityMessage(error);
         const templateError = userSafeOtpTemplateMessage(error);
+        const smsProvider = userSafeSmsProviderMessage(error);
         const providerAuthError = isOtpProviderAuthError(error);
         const safeMessage = templateError
             ? templateError
             : connectivity
             ? connectivity
+            : smsProvider
+            ? smsProvider
             : providerAuthError
             ? 'OTP provider authentication failed. Please contact support to refresh SMS provider credentials.'
-            : (raw.includes('63038') || raw.includes('daily messages limit') || raw.includes('twilio'))
-              ? 'OTP service is temporarily busy. Please try again after some time.'
+            : raw.includes('twilio')
+              ? 'SMS could not be sent. Open Twilio Console → Messaging → Logs to see the exact error code and fix (matches what you see on failed messages there).'
               : normalizeErrorMessage(error, 'Failed to send OTP');
         res.status(400).json({
             status: 'error',
