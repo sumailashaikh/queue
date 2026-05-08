@@ -1605,6 +1605,53 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 .maybeSingle();
             if (fallbackErr) {
                 if (isMissingTableError(fallbackErr, 'provider_day_offs')) {
+                    // Prefer employee_blockouts fallback first (more reliable overlap behavior than provider_leaves constraints).
+                    const startIso = requestedStartIso;
+                    const endIso = requestedEndIso;
+                    const { data: blockFallbackEarly, error: blockFallbackEarlyErr } = await adminSupabase
+                        .from('employee_blockouts')
+                        .insert([{
+                            employee_id: id,
+                            business_id: provider.business_id,
+                            reason: normalizeBlockoutReason(reason),
+                            note: note || null,
+                            start_time: startIso,
+                            end_time: endIso,
+                            status: 'active'
+                        }])
+                        .select()
+                        .maybeSingle();
+                    if (!blockFallbackEarlyErr && blockFallbackEarly) {
+                        return res.status(201).json({
+                            status: 'success',
+                            data: {
+                                ...blockFallbackEarly,
+                                source: 'employee_blockouts_fallback'
+                            }
+                        });
+                    }
+                    if (blockFallbackEarlyErr && !isMissingTableError(blockFallbackEarlyErr, 'employee_blockouts')) {
+                        const { data: overlapEmpRows } = await adminSupabase
+                            .from('employee_blockouts')
+                            .select('start_time, end_time')
+                            .eq('employee_id', id)
+                            .eq('status', 'active')
+                            .lt('start_time', endIso)
+                            .gt('end_time', startIso)
+                            .order('start_time', { ascending: true })
+                            .limit(1);
+                        const overlapEmp = (overlapEmpRows || [])[0];
+                        if (overlapEmp) {
+                            return res.status(400).json({
+                                status: 'error',
+                                message: 'Employee already has an active leave or temporary unavailable period during this time.',
+                                message_key: 'providers.err_blockout_overlap',
+                                overlap_type: 'blockout',
+                                existing_start: overlapEmp.start_time,
+                                existing_end: overlapEmp.end_time
+                            });
+                        }
+                    }
                     // Final fallback for older schemas: write to provider_leaves directly.
                     const leavePayload: any = {
                         provider_id: id,
