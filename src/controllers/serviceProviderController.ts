@@ -1659,6 +1659,40 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 message_key: 'providers.err_blockout_active_exists'
             });
         }
+        // Pre-check overlap against this SAME provider's approved leave rows.
+        // This avoids ambiguous DB constraint errors and keeps validation deterministic per employee.
+        let leaveOverlapRowsRes = await adminSupabase
+            .from('provider_leaves')
+            .select('id, start_date, end_date, start_time, end_time, leave_kind, status')
+            .eq('provider_id', id)
+            .lte('start_date', normalizedDate)
+            .gte('end_date', normalizedDate)
+            .in('status', ['APPROVED', 'approved']);
+        if (leaveOverlapRowsRes.error && isMissingColumnError(leaveOverlapRowsRes.error, 'status')) {
+            leaveOverlapRowsRes = await adminSupabase
+                .from('provider_leaves')
+                .select('id, start_date, end_date, start_time, end_time, leave_kind')
+                .eq('provider_id', id)
+                .lte('start_date', normalizedDate)
+                .gte('end_date', normalizedDate);
+        }
+        if (!leaveOverlapRowsRes.error) {
+            const leaveOverlapRows = leaveOverlapRowsRes.data || [];
+            const hasLeaveOverlap = leaveOverlapRows.some((lv: any) => {
+                const kind = String(lv?.leave_kind || 'FULL_DAY').toUpperCase();
+                if (kind === 'FULL_DAY') return true;
+                const ls = toMinutes(String(lv?.start_time || '00:00').slice(0, 5));
+                const le = toMinutes(String(lv?.end_time || '23:59').slice(0, 5));
+                return startMins < le && endMins > ls;
+            });
+            if (hasLeaveOverlap) {
+                return res.status(400).json({
+                    status: 'error',
+                    message: 'Block time overlaps an existing approved leave or block-out',
+                    message_key: 'providers.err_blockout_overlap'
+                });
+            }
+        }
 
         const payload = {
             provider_id: id,
