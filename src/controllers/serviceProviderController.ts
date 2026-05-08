@@ -1661,6 +1661,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
         }
         // Pre-check overlap against this SAME provider's approved leave rows.
         // This avoids ambiguous DB constraint errors and keeps validation deterministic per employee.
+        let hasLeaveOverlap = false;
         let leaveOverlapRowsRes = await adminSupabase
             .from('provider_leaves')
             .select('id, start_date, end_date, start_time, end_time, leave_kind, status')
@@ -1678,7 +1679,7 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
         }
         if (!leaveOverlapRowsRes.error) {
             const leaveOverlapRows = leaveOverlapRowsRes.data || [];
-            const hasLeaveOverlap = leaveOverlapRows.some((lv: any) => {
+            hasLeaveOverlap = leaveOverlapRows.some((lv: any) => {
                 const kind = String(lv?.leave_kind || 'FULL_DAY').toUpperCase();
                 if (kind === 'FULL_DAY') return true;
                 const ls = toMinutes(String(lv?.start_time || '00:00').slice(0, 5));
@@ -1706,6 +1707,15 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
         const { data, error } = await adminSupabase.from('provider_block_times').insert([payload]).select().maybeSingle();
         if (error) {
             if (isLeaveOverlapConstraintError(error)) {
+                // If DB says overlap but app-level checks found no same-provider overlap,
+                // schema-level constraint may be scoped too broadly (cross-employee clash).
+                if (!hasOverlap && !hasLeaveOverlap) {
+                    return res.status(400).json({
+                        status: 'error',
+                        message: 'Block out conflict configuration issue. Please ask admin to run the latest overlap constraint migration.',
+                        message_key: 'providers.err_blockout_overlap_global'
+                    });
+                }
                 return res.status(400).json({
                     status: 'error',
                     message: 'Block time overlaps an existing approved leave or block-out',
