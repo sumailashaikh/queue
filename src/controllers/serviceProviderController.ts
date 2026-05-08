@@ -1572,10 +1572,15 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             return res.status(400).json({ status: 'error', message: 'End time must be after start time' });
         }
         const normalizedDate = String(block_date).slice(0, 10);
-        const todayDate = new Date().toLocaleDateString('en-CA', { timeZone: biz?.timezone || 'UTC' });
-        if (normalizedDate !== todayDate) {
-            return res.status(400).json({ status: 'error', message: 'Only current-day block out is allowed.' });
-        }
+        const requestedStartIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00Z`;
+        const requestedEndIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00Z`;
+        // Auto-clean stale active rows before validating overlaps.
+        await adminSupabase
+            .from('employee_blockouts')
+            .update({ status: 'completed' })
+            .eq('employee_id', id)
+            .eq('status', 'active')
+            .lte('end_time', new Date().toISOString());
         const { data: existing, error: existingErr } = await adminSupabase
             .from('provider_block_times')
             .select('id, start_time, end_time')
@@ -1629,8 +1634,9 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                         if (isLeaveOverlapConstraintError(leaveIns.error)) {
                             return res.status(400).json({
                                 status: 'error',
-                                message: 'Block time overlaps an existing approved leave or block-out',
-                                message_key: 'providers.err_blockout_overlap'
+                                message: 'Employee already has an active leave or temporary unavailable period during this time.',
+                                message_key: 'providers.err_blockout_overlap',
+                                overlap_type: 'leave'
                             });
                         }
                         throw leaveIns.error;
@@ -1656,40 +1662,60 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
             });
         }
         if (existingErr) throw existingErr;
-        const hasOverlap = (existing || []).some((r: any) => {
+        const firstOverlapBlock = (existing || []).find((r: any) => {
             const es = toMinutes(String(r.start_time || '').slice(0, 5));
             const ee = toMinutes(String(r.end_time || '').slice(0, 5));
             return startMins < ee && endMins > es;
         });
+        const hasOverlap = !!firstOverlapBlock;
         if (hasOverlap) {
+            console.warn('[BLOCKOUT] Overlap with existing provider_block_times', {
+                employee_id: id,
+                requested_start: requestedStartIso,
+                requested_end: requestedEndIso,
+                overlap_source: 'blockout',
+                conflict: firstOverlapBlock
+            });
             return res.status(400).json({
                 status: 'error',
-                message: 'Block time overlaps an existing approved leave or block-out',
-                message_key: 'providers.err_blockout_overlap'
+                message: 'Employee already has an active leave or temporary unavailable period during this time.',
+                message_key: 'providers.err_blockout_overlap',
+                overlap_type: 'blockout',
+                existing_start: `${normalizedDate}T${String(firstOverlapBlock.start_time || '').slice(0, 5)}:00`,
+                existing_end: `${normalizedDate}T${String(firstOverlapBlock.end_time || '').slice(0, 5)}:00`
             });
         }
-        const nowTime = new Date().toLocaleTimeString('en-GB', {
-            timeZone: biz?.timezone || 'UTC',
-            hour12: false,
-            hour: '2-digit',
-            minute: '2-digit'
-        }).slice(0, 5);
-        const hasActiveBlock = (existing || []).some((r: any) => {
-            const es = toMinutes(String(r.start_time || '').slice(0, 5));
-            const ee = toMinutes(String(r.end_time || '').slice(0, 5));
-            const n = toMinutes(nowTime);
-            return n >= es && n < ee;
-        });
-        if (hasActiveBlock) {
+        const { data: activeEmployeeBlockoutRows, error: activeEmployeeBlockoutErr } = await adminSupabase
+            .from('employee_blockouts')
+            .select('id, start_time, end_time, status')
+            .eq('employee_id', id)
+            .eq('status', 'active')
+            .lt('start_time', requestedEndIso)
+            .gt('end_time', requestedStartIso)
+            .order('start_time', { ascending: true })
+            .limit(1);
+        if (!activeEmployeeBlockoutErr && (activeEmployeeBlockoutRows || []).length > 0) {
+            const conflict = activeEmployeeBlockoutRows?.[0];
+            console.warn('[BLOCKOUT] Overlap with active employee_blockouts', {
+                employee_id: id,
+                requested_start: requestedStartIso,
+                requested_end: requestedEndIso,
+                overlap_source: 'blockout',
+                conflict
+            });
             return res.status(400).json({
                 status: 'error',
-                message: 'An active temporary unavailability already exists.',
-                message_key: 'providers.err_blockout_active_exists'
+                message: 'Employee already has an active leave or temporary unavailable period during this time.',
+                message_key: 'providers.err_blockout_overlap',
+                overlap_type: 'blockout',
+                existing_start: conflict?.start_time || requestedStartIso,
+                existing_end: conflict?.end_time || requestedEndIso
             });
         }
         // Pre-check overlap against this SAME provider's approved leave rows.
         // This avoids ambiguous DB constraint errors and keeps validation deterministic per employee.
         let hasLeaveOverlap = false;
+        let leaveConflictRow: any = null;
         let leaveOverlapRowsRes = await adminSupabase
             .from('provider_leaves')
             .select('id, start_date, end_date, start_time, end_time, leave_kind, status')
@@ -1714,11 +1740,30 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 const le = toMinutes(String(lv?.end_time || '23:59').slice(0, 5));
                 return startMins < le && endMins > ls;
             });
+            leaveConflictRow = leaveOverlapRows.find((lv: any) => {
+                const kind = String(lv?.leave_kind || 'FULL_DAY').toUpperCase();
+                if (kind === 'FULL_DAY') return true;
+                const ls = toMinutes(String(lv?.start_time || '00:00').slice(0, 5));
+                const le = toMinutes(String(lv?.end_time || '23:59').slice(0, 5));
+                return startMins < le && endMins > ls;
+            }) || null;
             if (hasLeaveOverlap) {
+                console.warn('[BLOCKOUT] Overlap with approved leave', {
+                    employee_id: id,
+                    requested_start: requestedStartIso,
+                    requested_end: requestedEndIso,
+                    overlap_source: 'leave',
+                    conflict: leaveConflictRow
+                });
+                const conflictStart = String(leaveConflictRow?.start_time || '00:00').slice(0, 5);
+                const conflictEnd = String(leaveConflictRow?.end_time || '23:59').slice(0, 5);
                 return res.status(400).json({
                     status: 'error',
-                    message: 'Block time overlaps an existing approved leave or block-out',
-                    message_key: 'providers.err_blockout_overlap'
+                    message: 'Employee already has an active leave or temporary unavailable period during this time.',
+                    message_key: 'providers.err_blockout_overlap',
+                    overlap_type: 'leave',
+                    existing_start: `${String(leaveConflictRow?.start_date || normalizedDate)}T${conflictStart}:00`,
+                    existing_end: `${String(leaveConflictRow?.end_date || normalizedDate)}T${conflictEnd}:00`
                 });
             }
         }
@@ -1738,8 +1783,8 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 // If DB says overlap but app-level checks found no same-provider overlap,
                 // schema-level constraint may be scoped too broadly (cross-employee clash).
                 if (!hasOverlap && !hasLeaveOverlap) {
-                    const startIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00`;
-                    const endIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00`;
+                    const startIso = requestedStartIso;
+                    const endIso = requestedEndIso;
                     const { data: blockFallback, error: blockFallbackErr } = await adminSupabase
                         .from('employee_blockouts')
                         .insert([{
@@ -1770,15 +1815,15 @@ export const addProviderBlockTime = async (req: Request, res: Response) => {
                 }
                 return res.status(400).json({
                     status: 'error',
-                    message: 'Block time overlaps an existing approved leave or block-out',
+                    message: 'Employee already has an active leave or temporary unavailable period during this time.',
                     message_key: 'providers.err_blockout_overlap'
                 });
             }
             throw error;
         }
         try {
-            const startIso = `${normalizedDate}T${String(start_time).slice(0, 5)}:00`;
-            const endIso = `${normalizedDate}T${String(end_time).slice(0, 5)}:00`;
+            const startIso = requestedStartIso;
+            const endIso = requestedEndIso;
             await syncEmployeeBlockoutFromProviderBlock(
                 adminSupabase,
                 id,
